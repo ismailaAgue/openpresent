@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-multipart
+pypdf
+python-pptx
+pytest
+psycopg2-binary
