@@ -296,4 +296,22 @@ Checked against, in order, before any implementation: **Constitution → Technic
 
 ---
 
-*Next entry: ADR-019.*
+## ADR-019 — Connection Pooling for Postgres Adapters (Fixes "Failed to Fetch" Regression)
+
+**Context:** After ADR-018's Postgres migration was confirmed live (via the `/health` diagnostic fields), the founder reported "Failed to fetch" when trying to register with a real email — a regression of the earlier CORS symptom, but CORS itself was unchanged and already verified working. Root cause: each Postgres adapter held a single, long-lived database connection shared across every caller. The API now serves concurrent web requests (handled in worker threads by Starlette for plain `def` routes) *and* the in-process background worker thread (ADR-015) simultaneously — a raw psycopg2 connection is not safe for concurrent multi-threaded use. Under the wrong timing, this could corrupt connection state mid-request, causing an unhandled failure that skips normal exception handling and CORS header attachment — which a browser reports generically as "Failed to fetch," masking the real cause.
+
+**Decision:** All four Postgres adapters (Auth, Storage, Queue, Analytics) now use a `psycopg2.pool.ThreadedConnectionPool` (min 1, max 5 connections) instead of a single shared connection. Each method borrows a connection for the duration of its operation and returns it immediately after, via try/finally. `PostgresQueueAdapter.dequeue()` — the one method that genuinely needs a real transaction, not just autocommit, for `FOR UPDATE SKIP LOCKED` to provide real protection — explicitly toggles autocommit off for that operation and resets it to on before returning the connection to the pool, so every other method can assume a clean, simple autocommit connection.
+
+**Why:** This is the correct, standard fix for exactly this class of problem — a connection pool is the textbook solution when multiple threads need database access concurrently. It also directly protects the in-process worker design from ADR-015: that decision was made specifically to avoid a paid second Render service, but it necessarily means the worker thread and request-handling threads coexist in one process, which this fix now correctly accounts for.
+
+**Cost Impact:** None — a small in-memory connection pool has negligible overhead at Stage 0-1 traffic levels, and Render's free Postgres tier's own connection limit comfortably accommodates a max-5 pool.
+
+**Alternatives Considered:** Adding a manual `threading.Lock` around each shared connection (rejected — serializes all database access into a single queue, defeating the purpose of concurrent request handling, whereas a pool allows genuine concurrency up to its size); reverting to a genuinely separate worker service to avoid the shared-process threading issue entirely (rejected — reopens the $7/month cost ADR-015 was specifically written to avoid, and doesn't fix the underlying problem, since concurrent web requests alone could already trigger it even without the worker thread).
+
+**Known limitation, stated plainly:** as with ADR-018, this sandbox has no real Postgres server to load-test the pool against directly. The fix is verified as logically correct (imports cleanly, matches the standard psycopg2 pooling pattern, existing test suite unaffected) but not verified under real concurrent load — that verification happens on the next live deployment.
+
+**Status:** Accepted, pending live verification.
+
+---
+
+*Next entry: ADR-020.*
