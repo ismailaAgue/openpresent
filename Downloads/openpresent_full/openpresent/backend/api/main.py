@@ -103,12 +103,20 @@ class LoginRequest(BaseModel):
 def health():
     ai = registry.get_ai_adapter()
     queue = registry.get_queue_adapter()
+    auth = registry.get_auth_adapter()
+    storage = registry.get_storage_adapter()
     return {
         "status": "ok",
         "phase": 3,
         "ai_adapter": type(ai).__name__,
         "ai_available": ai.is_available(),
         "queue_depth": queue.depth(),
+        # Diagnostic fields (ADR-018 verification): confirms whether
+        # DATABASE_URL is actually being picked up server-side, rather
+        # than inferring it indirectly through login behavior.
+        "auth_adapter": type(auth).__name__,
+        "storage_adapter": type(storage).__name__,
+        "database_url_present": bool(registry._database_url()),
     }
 
 
