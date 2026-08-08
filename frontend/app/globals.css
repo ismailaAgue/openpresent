@@ -1,0 +1,191 @@
+/*
+  Design identity: "the desk lamp is on, your notes are covered in
+  highlighter, the deadline is tomorrow." Not the generic cream+terracotta
+  AI-tool look — this is built around the actual subject: a student
+  turning messy notes into something presentable, at 11pm, for free.
+
+  Signature element: a rough highlighter-marker underline (see .highlight
+  utility and the SVG texture below) used sparingly on key phrases —
+  the one thing this page should be remembered by.
+*/
+
+:root {
+  /* Color: deep "desk lamp at night" navy, warm paper, one amber
+     highlighter accent. Deliberately not the cream/terracotta or
+     black/acid-green defaults. */
+  --ink: #12213B;
+  --ink-soft: #1C3253;
+  --paper: #EDEAE0;
+  --paper-bright: #F7F4EC;
+  --pencil: #22201A;
+  --muted: #6B6558;
+  --highlighter: #F2B705;
+  --highlighter-soft: #FBE49B;
+  --accent-teal: #2F6F5E;
+  --border: #DAD4C4;
+  --danger: #B3402A;
+
+  /* Type: a characterful serif for display (textbook energy without
+     being a cliché), a clean humanist sans for body, a mono for
+     "handwritten annotation" labels. */
+  --font-display: "Fraunces", Georgia, serif;
+  --font-body: "IBM Plex Sans", system-ui, sans-serif;
+  --font-label: "Space Mono", ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  padding: 0;
+  margin: 0;
+  background: var(--ink);
+  color: var(--paper-bright);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: inherit; }
+
+.container {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+.eyebrow {
+  font-family: var(--font-label);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--highlighter);
+}
+
+h1, h2, h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: var(--paper-bright);
+  line-height: 1.1;
+  margin: 0;
+}
+
+h1 { font-size: clamp(2.2rem, 5vw, 3.4rem); }
+h2 { font-size: clamp(1.5rem, 3vw, 2.1rem); }
+
+p { line-height: 1.6; color: var(--paper); }
+
+/* Signature element: a rough marker-stroke underline, not a clean
+   box or border-radius pill. Used on ONE key phrase per section,
+   never decoratively scattered. */
+.highlight {
+  position: relative;
+  color: var(--pencil);
+  background: var(--highlighter);
+  padding: 0 0.15em;
+  border-radius: 2px 6px 3px 7px / 4px 2px 5px 3px;
+  box-decoration-break: clone;
+}
+
+.btn {
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 15px;
+  padding: 12px 22px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+
+.btn-primary {
+  background: var(--highlighter);
+  color: var(--pencil);
+}
+.btn-primary:hover { transform: translateY(-1px); }
+
+.btn-secondary {
+  background: transparent;
+  color: var(--paper-bright);
+  border: 1px solid var(--border);
+}
+.btn-secondary:hover { border-color: var(--highlighter); }
+
+.card {
+  background: var(--paper-bright);
+  color: var(--pencil);
+  border-radius: 10px;
+  padding: 24px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+}
+
+/* Index-card motif for the project dashboard — evokes a physical
+   stack of note cards, ties directly to the subject (Section: page.tsx
+   dashboard). Slight rotation on alternating cards, not a perfect grid. */
+.index-card {
+  background: var(--paper-bright);
+  color: var(--pencil);
+  border-radius: 4px;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 10px rgba(0,0,0,0.18);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.index-card:nth-child(odd) { transform: rotate(-0.6deg); }
+.index-card:nth-child(even) { transform: rotate(0.5deg); }
+.index-card:hover {
+  transform: rotate(0deg) translateY(-2px);
+  box-shadow: 0 10px 20px rgba(0,0,0,0.28);
+}
+
+input, textarea, select {
+  font-family: var(--font-body);
+  font-size: 15px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--paper-bright);
+  color: var(--pencil);
+  width: 100%;
+}
+
+input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
+  outline: 2px solid var(--highlighter);
+  outline-offset: 2px;
+}
+
+/* Mode toggle (topic vs. document generation) — a simple two-tab
+   switch styled as an underline, not a boxed pill, to match the
+   "index card / notebook" motif rather than a generic SaaS tab bar. */
+.mode-tabs { display: flex; gap: 24px; margin-bottom: 24px; }
+.mode-tab {
+  background: none;
+  border: none;
+  padding: 0 0 8px 0;
+  font-family: var(--font-label);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.mode-tab.active {
+  color: var(--paper-bright);
+  border-bottom-color: var(--highlighter);
+}
+
+.error-text {
+  color: #F4A895;
+  font-size: 14px;
+}
+
+.field-label {
+  font-family: var(--font-label);
+  font-size: 12px;
+  color: var(--muted);
+  display: block;
+  margin-bottom: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
