@@ -154,6 +154,10 @@ export async function getJobStatus(jobId: string) {
     job_id: string; status: string; structure_source?: string;
     slide_count?: number; project_id?: string; error?: string;
     quality_score?: number; quality_issues?: string[];
+    // ADR-040 — best-effort live progress; present only while status is
+    // "running", and only for topic generation (not document upload) as
+    // of this backend version.
+    stage?: string;
   }>;
 }
 

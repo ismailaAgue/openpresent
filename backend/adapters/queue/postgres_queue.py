@@ -43,6 +43,8 @@ class PostgresQueueAdapter(QueuePort):
                         created_at DOUBLE PRECISION NOT NULL
                     )
                 """)
+                # ADR-040 — additive column, safe on a pre-existing prod table.
+                cur.execute("ALTER TABLE op_jobs ADD COLUMN IF NOT EXISTS stage TEXT")
         finally:
             self._pool.putconn(conn)
 
@@ -126,7 +128,7 @@ class PostgresQueueAdapter(QueuePort):
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, job_type, payload, status, result, error, attempts "
+                    "SELECT id, job_type, payload, status, result, error, attempts, stage "
                     "FROM op_jobs WHERE id = %s",
                     (job_id,),
                 )
@@ -138,8 +140,19 @@ class PostgresQueueAdapter(QueuePort):
         return Job(
             id=row[0], job_type=row[1], payload=json.loads(row[2]),
             status=JobStatus(row[3]), result=json.loads(row[4]) if row[4] else None,
-            error=row[5], attempts=row[6],
+            error=row[5], attempts=row[6], stage=row[7],
         )
+
+    def update_stage(self, job_id: str, stage: str) -> None:
+        conn = self._pool.getconn()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("UPDATE op_jobs SET stage = %s WHERE id = %s", (stage, job_id))
+        except Exception:
+            pass  # best-effort — never let a progress update break generation
+        finally:
+            self._pool.putconn(conn)
 
     def depth(self) -> int:
         conn = self._pool.getconn()

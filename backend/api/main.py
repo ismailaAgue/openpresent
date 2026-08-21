@@ -404,6 +404,8 @@ def get_job(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     response = {"job_id": job.id, "status": job.status.value}
+    if job.status == JobStatus.RUNNING and job.stage:
+        response["stage"] = job.stage  # ADR-040 — best-effort, topic generation only
     if job.status == JobStatus.DONE and job.result:
         response["structure_source"] = job.result.get("structure_source")
         response["slide_count"] = job.result.get("slide_count")

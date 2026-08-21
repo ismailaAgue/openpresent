@@ -706,4 +706,69 @@ Added a `MediaPort` (parallel structure to `AIPort`: `is_available()` / `search_
 
 **Status:** Accepted. 4 new HTTP-level tests: sync document generation saves a project when authenticated (and the project is genuinely re-fetchable afterward, not just a header check), sync generation saves nothing when anonymous, sync topic generation saves a project when authenticated, and a direct assertion that all three custom headers are actually present in `CORSMiddleware`'s `expose_headers` config (not inferred from behavior — read directly off the middleware's registered kwargs). Full suite: 283/283 passing. Frontend typechecks and builds clean.
 
-*Next entry: ADR-040.*
+## ADR-040 — v3 Studio Frontend, and Real Per-Stage Job Progress
+
+**Context:** Kicking off OpenPresent v3 (the pivot from a presentation
+generator to a broader AI creation platform, per the vision doc). First
+concrete deliverable: a new Claude Code–style frontend (`/studio` —
+sidebar, chat thread, live preview panel) as the v3 entry point,
+without touching or breaking any existing v2 page. The new chat UI's
+mid-generation step indicators initially had no real backend data to
+draw from — `GET /jobs/{id}` only ever returned
+`pending/running/done/failed`, nothing about which of the 5 real
+pipeline stages (Strategy → Outline → Content → Layout → Quality
+Review, `ai_generate.py`'s own module docstring) was actually running.
+
+**Decision (frontend):** `/studio` is a fully separate layout
+(`components/AppShell.tsx` swaps in `Sidebar.tsx` instead of the v2
+`NavBar` based on route, client-side), so every v2 page — `/`,
+`/dashboard`, `/login`, `/register`, `/projects/[id]` — is byte-for-byte
+unchanged. New `--op-*` CSS tokens (violet→blue gradient, matching the
+new logo) are additive alongside the existing v2 "desk lamp" tokens in
+`globals.css`, not a replacement. `/studio` calls the real
+`generateFromTopicAsync` / `generateAsync` / `getJobStatus` /
+`getProject` — there is no mock or simulated backend behind it.
+
+**Decision (backend):** rather than leave the step indicators as a
+pure cosmetic timer indefinitely, `QueuePort` gained a `stage: str |
+None` field on `Job` and an `update_stage(job_id, stage)` method
+(implemented in both `SqliteQueueAdapter` and `PostgresQueueAdapter` —
+the latter via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, safe on the
+existing prod table with no manual migration step). `generate_
+presentation_from_topic()` takes an optional `on_stage` callback and
+reports 6 coarse labels as it runs (`understanding_request →
+building_outline → generating_content → designing_slides →
+selecting_visuals → applying_design` — deliberately fewer than the
+full internal stage list, chosen for what's meaningful to show a user,
+not every internal function call). The worker wires this to
+`queue.update_stage`. `GET /jobs/{id}` now includes `stage` in its
+response, but only while `status == "running"` — redundant once done,
+and deliberately never fabricated for a state that isn't actually
+running.
+
+**Scope limits, stated plainly:**
+1. Only `generate_presentation_from_topic` (topic mode) reports real
+   stages. `generate_presentation` (document-upload mode, `engines/
+   generate.py`) does not yet — the studio frontend's document-mode
+   step indicators are still the cosmetic timer. Flagged, not silently
+   left inconsistent.
+2. `on_stage` is explicitly best-effort: every call site wraps it in a
+   try/except that reports to Sentry/Bugsink and swallows the error —
+   a broken progress sink must never break or slow an otherwise-
+   successful generation. Covered by a dedicated test (see below).
+3. No new database tables, no brand memory, no document/infographic/
+   diagram generation yet — see `V3_ROADMAP.md` (delivered alongside
+   this ADR) for the full phased plan. This entry is Phase 1 + a slice
+   of Phase 2 from that roadmap, not the whole thing.
+
+**Status:** Accepted. 9 new tests: 4 on `SqliteQueueAdapter.
+update_stage` (sets/reads correctly, silent no-op on an unknown job
+id, survives into a completed job's record), 3 on the engine's
+`on_stage` orchestration (full 6-stage order on the AI path, correct
+2-stage-fewer sequence on deterministic fallback, and a callback that
+raises never breaks generation), 2 HTTP-level (`stage` present and
+correct while running, absent once done). Full suite: 292/292 passing.
+Frontend typechecks and builds clean (`/studio` route confirmed in
+build output).
+
+*Next entry: ADR-041.*

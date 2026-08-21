@@ -32,6 +32,7 @@ fully-deterministic fallback.
 import os
 import random
 import uuid
+from typing import Callable
 from backend.adapters import registry
 from backend.models.recipe import Recipe, Theme
 from backend.ports.ai_pipeline import GenerationRequest, QualityReport
@@ -44,6 +45,28 @@ from backend.monitoring.sentry_setup import capture_exception, add_breadcrumb
 
 MAX_REVISION_PASSES = 1  # bounded — spec Section 13: "allow AN automatic improvement pass"
 
+# ADR-040 — coarse stage labels reported to QueuePort.update_stage() as the
+# pipeline runs, so the frontend can show real progress instead of a timer.
+# Kept to 6 labels (not the full internal stage list) to match what's
+# actually meaningful to show a user, not every internal function call.
+STAGE_UNDERSTANDING = "understanding_request"
+STAGE_OUTLINE = "building_outline"
+STAGE_CONTENT = "generating_content"
+STAGE_LAYOUT = "designing_slides"
+STAGE_VISUALS = "selecting_visuals"
+STAGE_DESIGN = "applying_design"
+
+
+def _report(on_stage: Callable[[str], None] | None, stage: str) -> None:
+    if on_stage is None:
+        return
+    try:
+        on_stage(stage)
+    except Exception as e:
+        # Progress reporting is best-effort only — must never break or
+        # slow down an otherwise-successful generation.
+        capture_exception(e, tags={"stage": "progress_report"})
+
 
 def generate_presentation_from_topic(
     topic: str,
@@ -53,6 +76,7 @@ def generate_presentation_from_topic(
     tone: str = "professional",
     export_format: str = "pptx",
     project_id: str | None = None,
+    on_stage: Callable[[str], None] | None = None,
 ) -> tuple[Recipe, bytes, QualityReport]:
     if not topic or not topic.strip():
         raise ValueError("topic must not be empty")
@@ -63,12 +87,14 @@ def generate_presentation_from_topic(
         audience_type=audience_type, language=language, tone=tone,
     )
 
-    outline = _run_ai_pipeline(request)
+    _report(on_stage, STAGE_UNDERSTANDING)
+    outline = _run_ai_pipeline(request, on_stage)
     ai_layout_planned = outline is not None
 
     if outline is None:
         outline = build_deterministic_outline(request)
 
+    _report(on_stage, STAGE_VISUALS)
     outline, quality_report = validate_and_fix(outline)
 
     pipeline = registry.get_ai_pipeline_adapter()
@@ -97,6 +123,7 @@ def generate_presentation_from_topic(
     # explicit choice rather than silently falling back to its own
     # document-type-based default (a real bug caught in testing: a
     # Theme() with only color_set_id set was being ignored entirely).
+    _report(on_stage, STAGE_DESIGN)
     theme = get_theme_variant(pick_theme_variant())
     recipe = design.apply_theme(
         project_id=project_id,
@@ -121,7 +148,7 @@ def generate_presentation_from_topic(
     return recipe, output_bytes, quality_report
 
 
-def _run_ai_pipeline(request: GenerationRequest):
+def _run_ai_pipeline(request: GenerationRequest, on_stage: Callable[[str], None] | None = None):
     """Runs Research (optional) -> Strategy -> Outline Structure ->
     Slide Content -> Layout Planning as one all-or-nothing attempt.
     Returns a fully-formed Outline with layout_type/image_query already
@@ -146,12 +173,15 @@ def _run_ai_pipeline(request: GenerationRequest):
         add_breadcrumb("ai_pipeline", "strategy generated",
                         data={"narrative_style": strategy.narrative_style})
 
+        _report(on_stage, STAGE_OUTLINE)
         structure = pipeline.generate_outline_structure(request, strategy)
         add_breadcrumb("ai_pipeline", "outline structure generated", data={"slides": len(structure)})
 
+        _report(on_stage, STAGE_CONTENT)
         outline = pipeline.generate_slide_content(request, strategy, structure)
         add_breadcrumb("ai_pipeline", "slide content generated")
 
+        _report(on_stage, STAGE_LAYOUT)
         outline = pipeline.plan_layout(outline, request)
         add_breadcrumb("ai_pipeline", "layout planned")
 

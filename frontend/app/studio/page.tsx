@@ -27,6 +27,17 @@ const STAGE_LABELS = [
   "Applying design",
 ];
 
+// Must match the stage strings the backend reports via GET /jobs/{id}
+// (backend/engines/ai_generate.py's STAGE_* constants, ADR-040), in order.
+const STAGE_KEYS = [
+  "understanding_request",
+  "building_outline",
+  "generating_content",
+  "designing_slides",
+  "selecting_visuals",
+  "applying_design",
+];
+
 function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
@@ -44,14 +55,16 @@ function JobBubble({ jobId }: { jobId: string }) {
 
   useEffect(() => {
     let cancelled = false;
+    let usingRealStage = false;
     let stageTimer: ReturnType<typeof setInterval> | null = null;
 
-    // Cosmetic stage progression while the job runs — the backend only
-    // reports pending/running/done/failed, not which of the five real
-    // pipeline stages is active, so this advances on a timer rather than
-    // live telemetry (the real 5-stage pipeline is documented in
-    // ARCHITECTURE_DECISIONS.md).
+    // Cosmetic fallback progression, only used until (if ever) the
+    // backend reports a real stage for this job. Document-upload jobs
+    // don't report a stage as of this backend version, so this timer is
+    // what they'll see for the whole run — topic-generation jobs switch
+    // to real data (ADR-040) as soon as the first stage arrives below.
     stageTimer = setInterval(() => {
+      if (usingRealStage) return;
       setStageIdx((i) => (i < STAGE_LABELS.length - 1 ? i + 1 : i));
     }, 1600);
 
@@ -80,8 +93,15 @@ function JobBubble({ jobId }: { jobId: string }) {
           if (stageTimer) clearInterval(stageTimer);
           return;
         }
+        if (s.stage) {
+          const idx = STAGE_KEYS.indexOf(s.stage);
+          if (idx >= 0) {
+            usingRealStage = true;
+            setStageIdx(idx);
+          }
+        }
         setStatus(s.status as "pending" | "running");
-        setTimeout(poll, 1500);
+        setTimeout(poll, 1200);
       } catch (e) {
         if (!cancelled) {
           setStatus("failed");

@@ -68,3 +68,38 @@ def test_depth_reflects_pending_count():
     assert q.depth() == 2
     q.dequeue()
     assert q.depth() == 1  # one moved to RUNNING, no longer PENDING
+
+
+# -- update_stage (ADR-040) ----------------------------------------------
+
+def test_new_job_has_no_stage_by_default():
+    q = make_queue()
+    job_id = q.enqueue("generate_topic", {})
+    job = q.get_status(job_id)
+    assert job.stage is None
+
+
+def test_update_stage_is_reflected_in_get_status():
+    q = make_queue()
+    job_id = q.enqueue("generate_topic", {})
+    q.dequeue()
+    q.update_stage(job_id, "building_outline")
+    assert q.get_status(job_id).stage == "building_outline"
+    q.update_stage(job_id, "generating_content")
+    assert q.get_status(job_id).stage == "generating_content"
+
+
+def test_update_stage_on_unknown_job_id_does_not_raise():
+    q = make_queue()
+    q.update_stage("not-a-real-job-id", "building_outline")  # must be a silent no-op
+
+
+def test_complete_leaves_stage_readable_on_the_finished_job():
+    q = make_queue()
+    job_id = q.enqueue("generate_topic", {})
+    q.dequeue()
+    q.update_stage(job_id, "applying_design")
+    q.complete(job_id, {"slide_count": 5})
+    job = q.get_status(job_id)
+    assert job.status == JobStatus.DONE
+    assert job.stage == "applying_design"
