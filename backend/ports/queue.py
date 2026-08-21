@@ -28,6 +28,11 @@ class Job:
     result: dict[str, Any] | None = None
     error: str | None = None
     attempts: int = 0
+    stage: str | None = None
+    """Coarse-grained progress label set by the engine mid-run (ADR-040),
+    e.g. "building_outline" — best-effort, informational only. None
+    while PENDING, and not guaranteed fresh for every job_type (only
+    generate_presentation_from_topic reports it as of ADR-040)."""
 
 
 class QueuePort(Protocol):
@@ -51,6 +56,13 @@ class QueuePort(Protocol):
         ...
 
     def get_status(self, job_id: str) -> Job | None:
+        ...
+
+    def update_stage(self, job_id: str, stage: str) -> None:
+        """Best-effort progress update while a job is RUNNING (ADR-040).
+        Must never raise on an unknown/already-terminal job_id — this is
+        called from deep inside the generation engine and a stage-update
+        failure must not abort or corrupt the actual generation."""
         ...
 
     def depth(self) -> int:

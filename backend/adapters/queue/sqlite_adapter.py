@@ -30,10 +30,18 @@ class SqliteQueueAdapter(QueuePort):
                 result TEXT,
                 error TEXT,
                 attempts INTEGER DEFAULT 0,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                stage TEXT
             )
         """)
         self._conn.commit()
+        self._ensure_stage_column()  # ADR-040 — safe on pre-existing dev DBs too
+
+    def _ensure_stage_column(self):
+        cols = [row[1] for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()]
+        if "stage" not in cols:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
+            self._conn.commit()
 
     def enqueue(self, job_type: str, payload: dict[str, Any]) -> str:
         job_id = str(uuid.uuid4())
@@ -87,7 +95,7 @@ class SqliteQueueAdapter(QueuePort):
 
     def get_status(self, job_id: str) -> Job | None:
         row = self._conn.execute(
-            "SELECT id, job_type, payload, status, result, error, attempts FROM jobs WHERE id = ?",
+            "SELECT id, job_type, payload, status, result, error, attempts, stage FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
         if row is None:
@@ -95,8 +103,15 @@ class SqliteQueueAdapter(QueuePort):
         return Job(
             id=row[0], job_type=row[1], payload=json.loads(row[2]),
             status=JobStatus(row[3]), result=json.loads(row[4]) if row[4] else None,
-            error=row[5], attempts=row[6],
+            error=row[5], attempts=row[6], stage=row[7],
         )
+
+    def update_stage(self, job_id: str, stage: str) -> None:
+        try:
+            self._conn.execute("UPDATE jobs SET stage = ? WHERE id = ?", (stage, job_id))
+            self._conn.commit()
+        except sqlite3.Error:
+            pass  # best-effort — never let a progress update break generation
 
     def depth(self) -> int:
         cur = self._conn.execute(

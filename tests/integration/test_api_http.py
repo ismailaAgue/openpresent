@@ -241,6 +241,31 @@ def test_generate_topic_async_full_round_trip(client):
     assert "presentation.pptx" in zf.namelist()
 
 
+def test_jobs_endpoint_surfaces_stage_while_running(client):
+    # Deterministic generation completes too fast to reliably observe an
+    # intermediate stage via the real async race, so the RUNNING state is
+    # set up directly through the same QueuePort the API route itself
+    # reads from — this is testing the /jobs/{id} route's own response
+    # shape (ADR-040), not the worker's timing.
+    queue = registry.get_queue_adapter()
+    job_id = queue.enqueue("generate_topic", {"topic": "Volcanoes", "slide_count": 4})
+    queue.dequeue()  # PENDING -> RUNNING; the in-process worker only ever pulls PENDING jobs
+    queue.update_stage(job_id, "building_outline")
+
+    resp = client.get(f"/jobs/{job_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "running"
+    assert body["stage"] == "building_outline"
+
+
+def test_jobs_endpoint_omits_stage_once_done(client):
+    enqueue_resp = client.post("/generate/topic/async", json={"topic": "Volcanoes", "slide_count": 4})
+    job_id = enqueue_resp.json()["job_id"]
+    result = _poll_job_until_done(client, job_id)
+    assert "stage" not in result  # stage is a running-only signal, redundant once complete
+
+
 def test_jobs_unknown_id_returns_404(client):
     resp = client.get("/jobs/not-a-real-job-id")
     assert resp.status_code == 404

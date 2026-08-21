@@ -41,6 +41,8 @@ def process_one_job() -> bool:
                 language=job.payload.get("language", "en"),
                 tone=job.payload.get("tone", "professional"),
                 export_format=job.payload.get("export_format", "pptx"),
+                # ADR-040 — best-effort live progress for the studio UI.
+                on_stage=lambda stage: queue.update_stage(job.id, stage),
             )
         else:
             file_bytes = base64.b64decode(job.payload["file_b64"])

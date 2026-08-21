@@ -168,6 +168,55 @@ def test_engine_falls_back_to_deterministic_when_ai_pipeline_raises(monkeypatch)
     assert len(output_bytes) > 0
 
 
+# -- on_stage progress reporting (ADR-040) ------------------------------
+
+def test_on_stage_reports_all_six_stages_in_order_on_full_ai_path(monkeypatch):
+    fake = FakeFullPipelineAdapter()
+    monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: fake)
+    monkeypatch.setattr(registry, "get_research_adapter", lambda: registry.NullResearchAdapter())
+
+    reported = []
+    generate_presentation_from_topic(
+        topic="Machine Learning Basics", slide_count=4, export_format="pptx",
+        on_stage=reported.append,
+    )
+
+    assert reported == [
+        "understanding_request", "building_outline", "generating_content",
+        "designing_slides", "selecting_visuals", "applying_design",
+    ]
+
+
+def test_on_stage_still_reports_bookend_stages_on_deterministic_fallback(monkeypatch):
+    monkeypatch.setenv("OPENPRESENT_AI_ADAPTER", "null")
+    registry._ai_adapter_instance = None
+
+    reported = []
+    generate_presentation_from_topic(
+        topic="Volcanoes", slide_count=4, export_format="pptx",
+        on_stage=reported.append,
+    )
+
+    # No AI adapter available -> the 3 mid-pipeline AI-only stages never
+    # fire, but the bookend stages (set unconditionally by the engine,
+    # not from inside _run_ai_pipeline) still report, in order.
+    assert reported == ["understanding_request", "selecting_visuals", "applying_design"]
+
+
+def test_on_stage_callback_raising_never_breaks_generation(monkeypatch):
+    monkeypatch.setenv("OPENPRESENT_AI_ADAPTER", "null")
+    registry._ai_adapter_instance = None
+
+    def broken_callback(stage):
+        raise RuntimeError("simulated broken progress sink")
+
+    recipe, output_bytes, quality = generate_presentation_from_topic(
+        topic="Volcanoes", slide_count=4, export_format="pptx",
+        on_stage=broken_callback,
+    )
+    assert len(output_bytes) > 0
+
+
 def test_engine_uses_ai_layout_when_pipeline_succeeds_not_rule_based(monkeypatch):
     """Confirms ai_layout_planned=True actually suppresses the
     rule-based classifier — every slide keeps the layout_type the fake

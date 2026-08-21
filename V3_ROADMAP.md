@@ -38,15 +38,21 @@ touched), then `npm install && npm run build` and deploy as usual.
 
 ---
 
-## Phase 2 — make the chat interface tell the truth in real time
+## Phase 2 — make the chat interface tell the truth in real time ✅ shipped
 
-Small, high-leverage backend change: have the worker write a
-`current_stage` field onto the job record as it moves through
-Strategy → Outline → Content → Layout → Review, and return it from
-`GET /jobs/{id}`. This turns the studio's step chips from
-"plausible timer animation" into an accurate live status, and is a
-prerequisite for a real chat-style multi-turn interface later (see
-Phase 5).
+Done, in this delivery. `QueuePort` gained a `stage` field + `update_
+stage()`, both queue adapters implement it, `generate_presentation_
+from_topic()` reports 6 real stages via an `on_stage` callback, the
+worker wires it through, and `GET /jobs/{id}` returns `stage` while
+`status == "running"`. Full detail: ADR-040 in `ARCHITECTURE_DECISIONS.md`.
+9 new tests, 292/292 passing.
+
+**Known gap, left honest rather than silently inconsistent:** only
+topic-mode generation (`ai_generate.py`) reports real stages.
+Document-upload mode (`engines/generate.py`, the other `job_type` in
+`generation_worker.py`) still shows the studio's cosmetic timer
+fallback. Same pattern (an `on_stage` param threaded through its
+pipeline) would close this — small, not yet done.
 
 ## Phase 3 — Documents, as a second output type
 
