@@ -132,6 +132,20 @@ def client():
         yield c
 
 
+@pytest.fixture
+def client_no_worker(monkeypatch):
+    """Same as `client`, but with the in-process background worker
+    disabled entirely. Use this for any test that manually drives a
+    job through QueuePort (enqueue/dequeue/update_stage) to check the
+    API's response shape — the real worker thread `client` starts
+    polls the SAME shared queue continuously, and will race to
+    dequeue and fully process ANY enqueued job it can see, including
+    ones a test only meant to control by hand."""
+    monkeypatch.setenv("OPENPRESENT_INPROCESS_WORKER", "false")
+    from backend.api.main import app
+    with TestClient(app) as c:
+        yield c
+
 def _poll_job_until_done(client, job_id, timeout_seconds=10):
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -954,23 +968,24 @@ def test_generate_document_upload_as_poster_svg(client):
     assert resp.headers["content-type"] == "image/svg+xml"
 
 
-def test_jobs_endpoint_surfaces_stage_while_running(client):
+def test_jobs_endpoint_surfaces_stage_while_running(client_no_worker):
     # Deterministic generation completes too fast to reliably observe an
     # intermediate stage via the real async race, so the RUNNING state is
     # set up directly through the same QueuePort the API route itself
     # reads from — this is testing the /jobs/{id} route's own response
-    # shape (ADR-040), not the worker's timing.
+    # shape, not the worker's timing. Uses client_no_worker (not client)
+    # specifically so there's no real background worker thread racing to
+    # actually process this job out from under the test's manual state.
     queue = registry.get_queue_adapter()
     job_id = queue.enqueue("generate_topic", {"topic": "Volcanoes", "slide_count": 4})
-    queue.dequeue()  # PENDING -> RUNNING; the in-process worker only ever pulls PENDING jobs
+    queue.dequeue()  # PENDING -> RUNNING; no worker running to race this
     queue.update_stage(job_id, "building_outline")
 
-    resp = client.get(f"/jobs/{job_id}")
+    resp = client_no_worker.get(f"/jobs/{job_id}")
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "running"
     assert body["stage"] == "building_outline"
-
 
 def test_jobs_endpoint_omits_stage_once_done(client):
     enqueue_resp = client.post("/generate/topic/async", json={"topic": "Volcanoes", "slide_count": 4})
