@@ -11,11 +11,11 @@ import {
 } from "@/lib/api-client";
 
 const NAV_ITEMS = [
-  { href: "/studio", label: "Home", icon: "home" },
+  { href: "/", label: "Home", icon: "home" },
   { href: "/dashboard", label: "Recent presentations", icon: "clock" },
-  { href: "/studio/templates", label: "Templates", icon: "grid", comingSoon: true },
-  { href: "/studio/brand", label: "Brand kits", icon: "palette", comingSoon: true },
-  { href: "/studio/assets", label: "Assets", icon: "image", comingSoon: true },
+  { href: "/templates", label: "Templates", icon: "grid", comingSoon: true },
+  { href: "/brand", label: "Brand kits", icon: "palette", comingSoon: true },
+  { href: "/assets", label: "Assets", icon: "image", comingSoon: true },
 ];
 
 function Icon({ name }: { name: string }) {
@@ -210,12 +210,12 @@ export default function Sidebar() {
   return (
     <aside className="op-sidebar">
       <div className="op-sidebar-top">
-        <Link href="/studio" className="op-brand">
+        <Link href="/" className="op-brand">
           <Image src="/logo.png" alt="OpenPresent" width={28} height={28} className="op-brand-mark" />
           <span>OpenPresent</span>
         </Link>
 
-        <Link href="/studio?new=1" className="op-new-btn">
+        <Link href="/?new=1" className="op-new-btn">
           <Icon name="plus" />
           New presentation
         </Link>
@@ -304,7 +304,7 @@ export default function Sidebar() {
       </div>
 
       <div className="op-sidebar-bottom">
-        <Link href="/studio/settings" className="op-nav-item disabled" title="Coming soon in v3" onClick={(e) => e.preventDefault()}>
+        <Link href="/settings" className="op-nav-item disabled" title="Coming soon in v3" onClick={(e) => e.preventDefault()}>
           <Icon name="settings" />
           <span>Settings</span>
         </Link>

@@ -1715,3 +1715,209 @@ Phases 1 through 7 are now all shipped, each with its honest, stated
 partial gaps documented in `V3_ROADMAP.md` rather than glossed over.
 
 *Next entry: ADR-051.*
+
+## ADR-051 — Closing the MVP: Document Q&A Frontend
+
+**Context:** ADR-050 shipped the Q&A backend, but explicitly flagged
+(in its own delivery notes) that there was no frontend for it — a
+user could not actually use the feature without `curl`. When asked to
+"finish the final MVP so all the features mentioned can be deployed,"
+this was the single most significant gap: a fully-built, fully-tested
+backend feature with zero way for a real user to reach it. Closed
+this session, no backend changes needed (confirmed by simulating the
+exact request shape the new frontend code sends against the real
+`/documents/ask` endpoint before considering this done — same
+verify-before-trusting discipline as every prior delivery).
+
+**Decision:** `askDocument(file, question)` added to `api-client.ts`,
+following the same multipart-with-query-param pattern
+`generateAsync` already established (file in `FormData`, `question`
+as a URL query param — matching the convention every other upload
+endpoint already uses, the exact same convention ADR-050 confirmed by
+checking existing passing tests before assuming). Studio composer
+gained a third input mode, "Ask a question about a document" —
+distinct from the existing "Describe a topic" / "Upload a source
+document" modes, since Q&A is a fundamentally different interaction
+(question in, answer out; no job, no export format, no workspace
+assignment) rather than another way to trigger generation. Its
+composer UI is a two-part stacked layout (file picker row, then a
+question textarea) rather than reusing the single-row composer box,
+since ask mode is the one mode needing both a file AND free text at
+once.
+
+**Deliberately synchronous on the frontend, matching the backend's
+actual contract** — no job creation, no polling, unlike every
+generation mode. The answer appears as a normal assistant chat bubble
+the moment the request resolves, since `POST /documents/ask` itself
+is synchronous (one AI call, not 6+, per ADR-050's own reasoning for
+why it has a separate, lighter quota bucket).
+
+**Format toggles and the workspace selector are hidden in ask
+mode** — both are meaningless for a feature that doesn't produce a
+file or save a project, and showing them would silently invite a user
+to wonder why picking "→ Poster" before asking a question does
+nothing.
+
+**One deliberate non-addition, reasoned through rather than defaulted
+into:** the original vision doc listed "Summarize PDFs" as a distinct
+capability alongside "Ask questions about PDFs." No separate
+summarize button or endpoint was built — asking "Summarize this
+document" as an ordinary question through the Q&A feature already
+built produces exactly that outcome, since `answer_question`'s prompt
+is generic Q&A grounded in the document, not restricted to narrow
+factual lookups. A dedicated summarize affordance would duplicate a
+capability that already exists under a more general one, not add a
+missing one.
+
+**Status:** Accepted. No new backend code, so no new backend tests —
+verified instead by directly simulating the frontend's exact request
+(file + `question` as a query param, matching `askDocument`'s real
+implementation) against the live `/documents/ask` endpoint and
+confirming a real `200` with the expected `NullAdapter` degradation
+message, before considering the integration correct. Frontend:
+`npx tsc --noEmit` clean, `npm run build` clean, `/studio`'s bundle
+size increased modestly as expected for the new UI. Full backend
+suite re-confirmed unaffected: 458/458 passing.
+
+**This closes every user-facing gap called out across Phases 1-7.**
+Every feature documented as shipped in `V3_ROADMAP.md` is now also
+reachable by an actual person using the product, not just provable
+via the API. Remaining stated gaps (brand-color-to-theme-token
+mapping, workspace-level file storage) are deliberate, bounded scope
+decisions, not missing UI on top of a finished backend.
+
+*Next entry: ADR-052.*
+
+## ADR-052 — A Real, Platform-Dependent Test Race Found on Windows
+
+**Context:** you ran the full suite on your actual Windows deployment
+machine (not this development sandbox, which is Linux) as part of
+verifying the final MVP zip before deploying. `test_jobs_endpoint_
+surfaces_stage_while_running` failed there — `assert body["stage"] ==
+"building_outline"` got `"applying_design"` instead. This exact test
+had passed on every run in this session's Linux sandbox, including
+multiple explicit 3-5x repeated full-suite runs done specifically to
+catch flakiness (the same discipline ADR-042 established after a
+similar-shaped bug). It never reproduced there. It reproduced
+immediately on your machine. Treated as a real bug to find and fix
+properly, not dismissed as "just Windows being weird."
+
+**Root cause, found by reading the actual code rather than guessing:**
+the test's own comment claimed it was *"testing the /jobs/{id}
+route's own response shape... not the worker's timing"* — true in
+intent, false in what the code actually did. Every test using the
+`client` fixture gets a real `TestClient(app)` with FastAPI's
+lifespan-triggered in-process worker thread genuinely running in the
+background (required for the many OTHER tests in this file that poll
+real async jobs to completion). This test manually drove a job
+through `QueuePort` by hand (`enqueue` → `dequeue` → `update_stage`)
+to control its state directly — but that real background worker
+thread, polling the exact same shared queue continuously, could also
+see the freshly-enqueued job and race to dequeue and fully process it
+for real before the test's own manual `dequeue()`/`update_stage()`
+calls landed. When the worker won that race, it ran the actual
+deterministic generation pipeline end to end, progressing the job's
+`stage` through all 6 real values and landing on `"applying_design"`
+(the last one before completion) by the time the test's HTTP request
+fired — overwriting the test's manually-set `"building_outline"`
+entirely. A genuine race, not corrupted state or a flaky assertion;
+different OS thread-scheduling behavior between Linux and Windows is
+a completely plausible, unremarkable reason the timing window that
+makes the real worker win the race is far more reachable on one
+platform than the other — not a reason to suspect the failure itself
+was spurious.
+
+**Decision:** new `client_no_worker` fixture in `tests/integration/
+test_api_http.py` — identical to `client`, except it sets
+`OPENPRESENT_INPROCESS_WORKER=false` before constructing the
+`TestClient`, so no real background thread exists to race against a
+test's manual queue manipulation. Scope checked before writing the
+fix: `grep` confirmed exactly one test in the entire integration
+suite manually drives `QueuePort` by hand
+(`registry.get_queue_adapter()` + `enqueue`/`dequeue`/`update_stage`
+all in the same test body) — so this fixture has exactly one
+consumer, `test_jobs_endpoint_surfaces_stage_while_running`, switched
+over to it. No other test needed touching; the other 457 either use
+the real worker deliberately (polling real async jobs to completion)
+or never touch the queue directly at all.
+
+**Verification, not just "added a fixture and hoped":** ran the
+fixed test in a **tight 15-iteration loop** before considering this
+resolved (`for i in 1..15: pytest test_jobs_endpoint_surfaces_stage_
+while_running`) — 15/15 clean, where the original code had just
+failed on a real machine on what was presumably one ordinary run.
+Then the full suite, 5 consecutive times — 458/458 every time,
+matching this session's established "don't trust a single green run"
+standard for anything touching threading/timing.
+
+**Status:** Accepted. No behavior change to any production code —
+this is a pure test-infrastructure fix. `docs/ARCHITECTURE_DECISIONS.
+md` gets this entry specifically so a future session (or a future
+`grep` for "race" or "flaky") finds the real story here instead of
+re-discovering the same bug from scratch if it's ever touched again.
+Full suite: 458/458 passing, verified 5 consecutive clean runs plus
+15 consecutive clean runs of the specific fixed test.
+
+*Next entry: ADR-053.*
+
+## ADR-053 — Studio Experience Moved to the Site Root
+
+**Context:** since Phase 1 (ADR-040), the new chat/sidebar/preview
+experience deliberately lived at `/studio`, with the old v2
+single-form generation page kept untouched at `/` — a conscious
+choice at the time to build v3 incrementally without risking the
+existing homepage. With every planned phase now shipped and the
+product feature-complete, requested explicitly: make the real product
+the actual main page, not a sub-route someone has to already know
+about.
+
+**Decision:** `frontend/app/studio/page.tsx`'s content moved to
+`frontend/app/page.tsx` (the root route) wholesale. The old v2
+homepage (a simple sync-generation form, `generateSync`/
+`generateFromTopicSync`, no chat, no format choice beyond the
+original PPTX/DOCX, no workspace or brand awareness) is retired — it
+was always the predecessor UI the new experience was built to
+replace, not a separate page worth preserving alongside it.
+
+`/studio` itself is not deleted outright — it's now a one-line
+server-side `redirect("/")`, so anyone with an old bookmark or
+browser-history entry from testing this session lands somewhere real
+instead of hitting a 404. `AppShell.tsx`'s routing condition (which
+decides Sidebar-shell layout vs. the original NavBar layout) changed
+from `pathname.startsWith("/studio")` to `pathname === "/" ||
+pathname.startsWith("/studio")` — the root gets the full sidebar
+experience now, the (now-trivial) `/studio` redirect route still
+matches too so it never briefly flashes the wrong layout before
+redirecting. `/login`, `/register`, `/dashboard`, and
+`/projects/[id]` are entirely untouched — this move only affects
+`/` and `/studio`.
+
+`Sidebar.tsx`'s internal links updated to match: the logo/"Home" nav
+item and "New presentation" button now point at `/` instead of
+`/studio`; the still-`comingSoon` placeholder items (Templates, Brand
+kits, Assets, Settings) were similarly repointed from `/studio/*` to
+top-level paths for consistency, even though they're inert
+(`onClick={e => e.preventDefault()}`) and don't currently navigate
+anywhere — correctness now rather than a latent inconsistency waiting
+to surface if they're ever enabled.
+
+**Verified with real HTTP requests against the actual production
+build, not just a successful compile:** ran `next build` then `next
+start` and issued real requests — `GET /studio` returned a genuine
+`307 Temporary Redirect`, and `GET /` returned `200` with the sidebar/
+studio markup actually present in the returned HTML. A clean
+`next build` alone would not have caught a redirect misconfiguration
+or a routing condition that compiled fine but behaved wrong at
+runtime — this is the same "run it and look, don't just trust the
+build" discipline ADR-046/048 established for visual output, applied
+here to routing behavior instead.
+
+**Status:** Accepted. `npx tsc --noEmit` clean. `npm run build` clean,
+with the route table itself confirming the intended shape: `/` at
+102 kB (the full studio bundle) and `/studio` shrunk to 138 B (just
+the redirect). No backend changes — this is a pure frontend routing
+change. No new tests (this repo's frontend has no automated test
+suite; verification here was the build + real HTTP requests against
+the running production server, described above).
+
+*Next entry: ADR-054.*

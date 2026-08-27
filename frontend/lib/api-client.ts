@@ -151,6 +151,23 @@ export async function generateAsync(file: File, opts: DocumentGenerateOptions = 
   return res.json() as Promise<{ job_id: string; status: string }>;
 }
 
+// -- Document Q&A (ADR-050) ------------------------------------------------
+// Synchronous — no job/polling involved, unlike generation. One AI call,
+// answered immediately.
+
+export async function askDocument(file: File, question: string): Promise<{ answer: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  const params = new URLSearchParams({ question });
+  const res = await fetch(`${API_BASE}/documents/ask?${params.toString()}`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: form,
+  });
+  if (!res.ok) throw new Error((await res.json()).detail || "Could not get an answer");
+  return res.json();
+}
+
 export async function getJobStatus(jobId: string) {
   const res = await fetch(`${API_BASE}/jobs/${jobId}`);
   if (!res.ok) throw new Error("Could not check job status");

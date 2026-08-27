@@ -1,292 +1,544 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { generateSync, generateFromTopicSync } from "@/lib/api-client";
+import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import {
+  generateFromTopicAsync,
+  generateAsync,
+  getJobStatus,
+  jobDownloadUrl,
+  getProject,
+  getSessionToken,
+  listWorkspaces,
+  WorkspaceSummary,
+  askDocument,
+} from "@/lib/api-client";
+import { ExportFormat } from "@/lib/export-formats";
 
-type Mode = "topic" | "document";
-type Status = "idle" | "working" | "done" | "error";
+type Mode = "topic" | "document" | "ask";
 
-const AUDIENCES = [
-  { value: "general", label: "General audience" },
-  { value: "student_school", label: "School / classroom" },
-  { value: "business", label: "Business / meeting" },
-  { value: "academic", label: "Academic / conference" },
+type Msg =
+  | { kind: "assistant-text"; id: string; text: string }
+  | { kind: "user-text"; id: string; text: string }
+  | { kind: "job"; id: string; jobId: string; outputFormat: ExportFormat };
+
+const STAGE_LABELS = [
+  "Understanding request",
+  "Building outline",
+  "Generating content",
+  "Designing slides",
+  "Selecting visuals",
+  "Applying design",
 ];
 
-const LANGUAGES = [
-  { value: "en", label: "English" },
-  { value: "es", label: "Spanish" },
-  { value: "fr", label: "French" },
-  { value: "pt", label: "Portuguese" },
-  { value: "de", label: "German" },
+// Must match the stage strings the backend reports via GET /jobs/{id}
+// (backend/engines/ai_generate.py's STAGE_* constants, ADR-040), in order.
+const STAGE_KEYS = [
+  "understanding_request",
+  "building_outline",
+  "generating_content",
+  "designing_slides",
+  "selecting_visuals",
+  "applying_design",
 ];
 
-function downloadBlob(blob: Blob, filename: string) {
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  window.URL.revokeObjectURL(url);
+function uid() {
+  return Math.random().toString(36).slice(2, 10);
 }
 
-export default function HomePage() {
+function JobBubble({ jobId, outputFormat }: { jobId: string; outputFormat: ExportFormat }) {
+  const [status, setStatus] = useState<"pending" | "running" | "done" | "failed">("pending");
+  const [stageIdx, setStageIdx] = useState(0);
+  const [result, setResult] = useState<{
+    slideCount?: number;
+    projectId?: string | null;
+    qualityScore?: number;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [slides, setSlides] = useState<{ order: number; title: string }[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let usingRealStage = false;
+    let stageTimer: ReturnType<typeof setInterval> | null = null;
+
+    // Cosmetic fallback progression, only used until (if ever) the
+    // backend reports a real stage for this job. Both topic-generation
+    // and document-upload jobs report real stages as of ADR-040 (the
+    // document path just has 4 of the 6 shared labels, since it's a
+    // rule-based-structure-plus-optional-AI-enhancement pipeline, not
+    // the topic path's separate outline/content/layout calls) — this
+    // timer is only ever seen briefly before the first real stage
+    // arrives, or on an older/misbehaving backend that never reports one.
+    stageTimer = setInterval(() => {
+      if (usingRealStage) return;
+      setStageIdx((i) => (i < STAGE_LABELS.length - 1 ? i + 1 : i));
+    }, 1600);
+
+    const poll = async () => {
+      try {
+        const s = await getJobStatus(jobId);
+        if (cancelled) return;
+        if (s.status === "done") {
+          setStatus("done");
+          setStageIdx(STAGE_LABELS.length - 1);
+          setResult({ slideCount: s.slide_count, projectId: s.project_id, qualityScore: s.quality_score });
+          if (stageTimer) clearInterval(stageTimer);
+          if (s.project_id) {
+            try {
+              const proj = await getProject(s.project_id);
+              if (!cancelled) setSlides(proj.slides);
+            } catch {
+              /* preview is best-effort; download still works without it */
+            }
+          }
+          return;
+        }
+        if (s.status === "failed") {
+          setStatus("failed");
+          setError(s.error || "Generation failed.");
+          if (stageTimer) clearInterval(stageTimer);
+          return;
+        }
+        if (s.stage) {
+          const idx = STAGE_KEYS.indexOf(s.stage);
+          if (idx >= 0) {
+            usingRealStage = true;
+            setStageIdx(idx);
+          }
+        }
+        setStatus(s.status as "pending" | "running");
+        setTimeout(poll, 1200);
+      } catch (e) {
+        if (!cancelled) {
+          setStatus("failed");
+          setError(e instanceof Error ? e.message : "Could not check job status.");
+          if (stageTimer) clearInterval(stageTimer);
+        }
+      }
+    };
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (stageTimer) clearInterval(stageTimer);
+    };
+  }, [jobId]);
+
+  if (status === "failed") {
+    return <div className="op-error-bubble">Something went wrong: {error}</div>;
+  }
+
+  if (status !== "done") {
+    return (
+      <div className="op-steps">
+        {STAGE_LABELS.map((label, i) => (
+          <span key={label} className={`op-step ${i < stageIdx ? "done" : i === stageIdx ? "active" : ""}`}>
+            <span className="op-step-dot" />
+            {label}
+          </span>
+        ))}
+      </div>
+    );
+  }
+
+  const FORMAT_CONFIG: Record<ExportFormat, {
+    label: string; icon: string; downloadLabel: string; sectionsNoun: string; isSvg: boolean;
+  }> = {
+    pptx: { label: "presentation", icon: "PPTX", downloadLabel: "Download .zip", sectionsNoun: "slides", isSvg: false },
+    document_docx: { label: "document", icon: "DOCX", downloadLabel: "Download .docx", sectionsNoun: "sections", isSvg: false },
+    infographic_svg: { label: "infographic", icon: "SVG", downloadLabel: "Download .svg", sectionsNoun: "sections", isSvg: true },
+    diagram_svg: { label: "diagram", icon: "SVG", downloadLabel: "Download .svg", sectionsNoun: "steps", isSvg: true },
+    poster_svg: { label: "poster", icon: "SVG", downloadLabel: "Download .svg", sectionsNoun: "highlights", isSvg: true },
+  };
+  const cfg = FORMAT_CONFIG[outputFormat];
+
+  return (
+    <>
+      <div className="op-result-card">
+        <div className="op-result-icon">{cfg.icon}</div>
+        <div>
+          <div style={{ fontWeight: 600, fontSize: 13.5 }}>
+            Your {cfg.label} is ready
+          </div>
+          <div className="op-result-meta">
+            {result?.slideCount ?? slides?.length ?? "—"} {cfg.sectionsNoun}
+            {typeof result?.qualityScore === "number" ? ` · quality ${Math.round(result.qualityScore * 100)}%` : ""}
+          </div>
+        </div>
+      </div>
+      {cfg.isSvg && (
+        <div className="op-infographic-preview">
+          <img src={jobDownloadUrl(jobId)} alt={`Generated ${cfg.label}`} />
+        </div>
+      )}
+      <div className="op-result-actions">
+        <a className="op-pill-btn primary" href={jobDownloadUrl(jobId)} download>
+          {cfg.downloadLabel}
+        </a>
+        {result?.projectId ? (
+          <Link className="op-pill-btn" href={`/projects/${result.projectId}`}>
+            {outputFormat === "pptx" ? "Edit slide by slide →" : "Edit in project workspace →"}
+          </Link>
+        ) : (
+          <span className="op-pill-btn" style={{ cursor: "default" }}>
+            Log in to save &amp; edit this {cfg.label}
+          </span>
+        )}
+      </div>
+      {!cfg.isSvg && slides && slides.length > 0 && (
+        <div className="op-slide-grid" style={{ paddingLeft: 32, gridTemplateColumns: "repeat(3, 1fr)" }}>
+          {slides.slice(0, 6).map((s) => (
+            <div key={s.order} className="op-slide-thumb">
+              <span className="op-slide-thumb-num">{s.order}</span>
+              {s.title}
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+export default function StudioPage() {
+  const [messages, setMessages] = useState<Msg[]>([
+    {
+      kind: "assistant-text",
+      id: "welcome",
+      text: "Tell me what you'd like to present — a topic, an idea, or upload a document — and I'll build the deck.",
+    },
+  ]);
   const [mode, setMode] = useState<Mode>("topic");
-
-  return (
-    <div className="container" style={{ paddingTop: 64, paddingBottom: 96 }}>
-      <p className="eyebrow" style={{ marginBottom: 14 }}>AI-first, still no credits to count</p>
-      <h1 style={{ maxWidth: 700 }}>
-        Describe your presentation. Get a <span className="highlight">real, styled deck</span>. Free.
-      </h1>
-      <p style={{ maxWidth: 560, marginTop: 18, fontSize: 17 }}>
-        Type a topic and OpenPresent plans, writes, and designs the whole thing — title
-        slide to closing slide, speaker notes included. Have a document instead? Upload
-        it and we'll structure that. No account required. No "3 free generations" timer. Ever.
-      </p>
-
-      <div className="mode-tabs" style={{ marginTop: 40 }}>
-        <button
-          className={`mode-tab ${mode === "topic" ? "active" : ""}`}
-          onClick={() => setMode("topic")}
-        >
-          Generate from a topic
-        </button>
-        <button
-          className={`mode-tab ${mode === "document" ? "active" : ""}`}
-          onClick={() => setMode("document")}
-        >
-          Upload a document instead
-        </button>
-      </div>
-
-      {mode === "topic" ? <TopicForm /> : <DocumentForm />}
-
-      <section style={{ marginTop: 88, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 24 }}>
-        <FeatureNote
-          eyebrow="AI-first, not AI-only"
-          text="A real inference pipeline plans, drafts, and reviews your deck. No AI configured yet? A rule-based generator still produces a usable deck — never a dead end."
-        />
-        <FeatureNote
-          eyebrow="No credit anxiety"
-          text="Generate as many presentations as you actually need. Nothing counts down."
-        />
-        <FeatureNote
-          eyebrow="Your work, reusable"
-          text="Save a project once, regenerate it as a different version later — a summary, a different theme, anything."
-        />
-      </section>
-    </div>
-  );
-}
-
-function TopicForm() {
-  const [topic, setTopic] = useState("");
-  const [slideCount, setSlideCount] = useState(10);
-  const [audienceType, setAudienceType] = useState("general");
-  const [language, setLanguage] = useState("en");
-  const [status, setStatus] = useState<Status>("idle");
-  const [errorMsg, setErrorMsg] = useState("");
-  const [savedProjectId, setSavedProjectId] = useState<string | null>(null);
-
-  async function handleGenerate() {
-    if (!topic.trim()) return;
-    setStatus("working");
-    setErrorMsg("");
-    setSavedProjectId(null);
-    try {
-      const { blob, projectId } = await generateFromTopicSync({
-        topic, slideCount, audienceType, language, exportFormat: "pptx",
-      });
-      downloadBlob(blob, "presentation.zip");
-      setSavedProjectId(projectId);
-      setStatus("done");
-    } catch (e: any) {
-      setStatus("error");
-      setErrorMsg(e.message || "Something went wrong");
-    }
-  }
-
-  return (
-    <div className="card" style={{ maxWidth: 560 }}>
-      <label className="field-label" htmlFor="topic-input">What's the presentation about?</label>
-      <textarea
-        id="topic-input"
-        rows={3}
-        placeholder="e.g. The causes and effects of the French Revolution"
-        value={topic}
-        onChange={(e) => setTopic(e.target.value)}
-      />
-
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 16 }}>
-        <div>
-          <label className="field-label" htmlFor="slide-count">Slides</label>
-          <input
-            id="slide-count"
-            type="number"
-            min={3}
-            max={30}
-            value={slideCount}
-            onChange={(e) => setSlideCount(Number(e.target.value))}
-          />
-        </div>
-        <div>
-          <label className="field-label" htmlFor="language">Language</label>
-          <select id="language" value={language} onChange={(e) => setLanguage(e.target.value)}>
-            {LANGUAGES.map((l) => <option key={l.value} value={l.value}>{l.label}</option>)}
-          </select>
-        </div>
-        <div style={{ gridColumn: "1 / -1" }}>
-          <label className="field-label" htmlFor="audience">Audience</label>
-          <select id="audience" value={audienceType} onChange={(e) => setAudienceType(e.target.value)}>
-            {AUDIENCES.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
-          </select>
-        </div>
-      </div>
-
-      <div style={{ marginTop: 18, display: "flex", gap: 12, alignItems: "center" }}>
-        <button
-          className="btn btn-primary"
-          disabled={!topic.trim() || status === "working"}
-          onClick={handleGenerate}
-        >
-          {status === "working" ? "Planning and designing your deck…" : "Generate presentation"}
-        </button>
-        {status === "done" && <span style={{ fontSize: 14, color: "var(--accent-teal)" }}>Downloaded ✓ (.pptx + speaker notes .docx, zipped)</span>}
-      </div>
-      {status === "error" && <p className="error-text" style={{ marginTop: 10 }}>{errorMsg}</p>}
-      {status === "done" && savedProjectId && (
-        <p style={{ fontSize: 14, marginTop: 10 }}>
-          <a href={`/projects/${savedProjectId}`} style={{ color: "var(--accent-teal)", fontWeight: 600 }}>
-            Edit this presentation, slide by slide →
-          </a>
-        </p>
-      )}
-      {status === "done" && !savedProjectId && (
-        <p style={{ fontSize: 13, color: "var(--muted)", marginTop: 10 }}>
-          <a href="/register" style={{ color: "var(--accent-teal)", fontWeight: 600 }}>Create a free account</a>
-          {" "}next time to save this and edit individual slides afterward.
-        </p>
-      )}
-      <p style={{ fontSize: 13, color: "var(--muted)", marginTop: 14, marginBottom: 0 }}>
-        Larger decks take longer to plan — if generation feels slow, try fewer slides first.{" "}
-        <a href="/register" style={{ color: "var(--accent-teal)", fontWeight: 600 }}>Create a free account</a>{" "}
-        to save and revisit what you generate.
-      </p>
-    </div>
-  );
-}
-
-function DocumentForm() {
+  const [outputFormat, setExportFormat] = useState<ExportFormat>("pptx");
+  const [input, setInput] = useState("");
   const [file, setFile] = useState<File | null>(null);
-  const [audienceType, setAudienceType] = useState("student_school");
-  const [language, setLanguage] = useState("en");
-  const [targetSlideCount, setTargetSlideCount] = useState<number | "">("");
-  const [status, setStatus] = useState<Status>("idle");
-  const [errorMsg, setErrorMsg] = useState("");
-  const [savedProjectId, setSavedProjectId] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string>("");  // "" = ungrouped
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const threadRef = useRef<HTMLDivElement>(null);
+  const signedIn = typeof window !== "undefined" && !!getSessionToken();
 
-  async function handleGenerate() {
-    if (!file) return;
-    setStatus("working");
-    setErrorMsg("");
-    setSavedProjectId(null);
+  useEffect(() => {
+    threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages]);
+
+  useEffect(() => {
+    if (!signedIn) return;
+    listWorkspaces().then(setWorkspaces).catch(() => setWorkspaces([]));
+  }, [signedIn]);
+
+  async function handleSend() {
+    if (busy) return;
+    if (mode === "topic" && !input.trim()) return;
+    if (mode === "document" && !file) return;
+    if (mode === "ask" && (!file || !input.trim())) return;
+
+    const userLabel =
+      mode === "topic" ? input.trim() :
+      mode === "ask" ? `Asked about ${file?.name}: ${input.trim()}` :
+      `Uploaded: ${file?.name}`;
+    setMessages((m) => [...m, { kind: "user-text", id: uid(), text: userLabel }]);
+    setBusy(true);
+
     try {
-      const { blob, projectId } = await generateSync(file, {
-        exportFormat: "pptx",
-        audienceType,
-        language,
-        targetSlideCount: targetSlideCount === "" ? undefined : Number(targetSlideCount),
-      });
-      downloadBlob(blob, "presentation.zip");
-      setSavedProjectId(projectId);
-      setStatus("done");
-    } catch (e: any) {
-      setStatus("error");
-      setErrorMsg(e.message || "Something went wrong");
+      if (mode === "ask") {
+        // Synchronous — no job/polling, unlike generation (ADR-050).
+        const result = await askDocument(file as File, input.trim());
+        setInput("");
+        setFile(null);
+        setMessages((m) => [...m, { kind: "assistant-text", id: uid(), text: result.answer }]);
+        return;
+      }
+
+      let job: { job_id: string };
+      const workspaceId = selectedWorkspaceId || undefined;  // ADR-044
+      if (mode === "topic") {
+        job = await generateFromTopicAsync({ topic: input.trim(), exportFormat: outputFormat, workspaceId });
+      } else {
+        job = await generateAsync(file as File, { exportFormat: outputFormat, workspaceId });
+      }
+      setInput("");
+      setFile(null);
+      setMessages((m) => [...m, { kind: "job", id: uid(), jobId: job.job_id, outputFormat }]);
+    } catch (e) {
+      const verb = mode === "ask" ? "get an answer" : "start generation";
+      setMessages((m) => [
+        ...m,
+        { kind: "assistant-text", id: uid(), text: `Couldn't ${verb}: ${e instanceof Error ? e.message : "unknown error"}` },
+      ]);
+    } finally {
+      setBusy(false);
     }
   }
 
+  const latestJob = [...messages].reverse().find((m): m is Extract<Msg, { kind: "job" }> => m.kind === "job");
+
   return (
-    <div className="card" style={{ maxWidth: 520 }}>
-      <label className="field-label" htmlFor="file-upload">Your document (.txt or .pdf)</label>
-      <input
-        id="file-upload"
-        ref={inputRef}
-        type="file"
-        accept=".txt,.md,.pdf"
-        onChange={(e) => setFile(e.target.files?.[0] || null)}
-      />
+    <div className="op-studio">
+      <div className="op-chat-col">
+        <div className="op-chat-header">New presentation</div>
+        <div className="op-chat-thread" ref={threadRef}>
+          {messages.map((m) => {
+            if (m.kind === "assistant-text") {
+              return (
+                <div key={m.id} className="op-bubble op-bubble-assistant op-bubble-row">
+                  <span className="op-bubble-avatar" />
+                  <span>{m.text}</span>
+                </div>
+              );
+            }
+            if (m.kind === "user-text") {
+              return (
+                <div key={m.id} className="op-bubble op-bubble-user">
+                  {m.text}
+                </div>
+              );
+            }
+            return (
+              <div key={m.id}>
+                <div className="op-bubble op-bubble-assistant op-bubble-row" style={{ marginBottom: 0 }}>
+                  <span className="op-bubble-avatar" />
+                  <span>Working on it…</span>
+                </div>
+                <JobBubble jobId={m.jobId} outputFormat={m.outputFormat} />
+              </div>
+            );
+          })}
+        </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 16 }}>
-        <div>
-          <label className="field-label" htmlFor="doc-audience">Audience</label>
-          <select id="doc-audience" value={audienceType} onChange={(e) => setAudienceType(e.target.value)}>
-            {AUDIENCES.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
-          </select>
-        </div>
-        <div>
-          <label className="field-label" htmlFor="doc-language">Language</label>
-          <select id="doc-language" value={language} onChange={(e) => setLanguage(e.target.value)}>
-            {LANGUAGES.map((l) => <option key={l.value} value={l.value}>{l.label}</option>)}
-          </select>
-        </div>
-        <div style={{ gridColumn: "1 / -1" }}>
-          <label className="field-label" htmlFor="doc-slide-count">
-            Target slide count <span style={{ color: "var(--muted)", fontWeight: 400 }}>(optional)</span>
-          </label>
-          <input
-            id="doc-slide-count"
-            type="number"
-            min={3}
-            max={30}
-            placeholder="Let the document decide"
-            value={targetSlideCount}
-            onChange={(e) => setTargetSlideCount(e.target.value === "" ? "" : Number(e.target.value))}
-          />
+        {!signedIn && (
+          <div className="op-composer-hint" style={{ padding: "0 24px 8px 24px" }}>
+            <Link href="/login" style={{ color: "var(--op-violet)", fontWeight: 600 }}>
+              Log in
+            </Link>{" "}
+            to save this as an editable project — generation without an account still works, you just get a download only.
+          </div>
+        )}
+
+        <div className="op-composer">
+          <div className="op-mode-row">
+            <button className={`op-mode-pill ${mode === "topic" ? "active" : ""}`} onClick={() => setMode("topic")}>
+              Describe a topic
+            </button>
+            <button className={`op-mode-pill ${mode === "document" ? "active" : ""}`} onClick={() => setMode("document")}>
+              Upload a source document
+            </button>
+            <button className={`op-mode-pill ${mode === "ask" ? "active" : ""}`} onClick={() => setMode("ask")}>
+              Ask a question about a document
+            </button>
+            {mode !== "ask" && (
+              <>
+                <span style={{ width: 1, alignSelf: "stretch", background: "var(--op-border)", margin: "0 4px" }} />
+                <button
+                  className={`op-mode-pill ${outputFormat === "pptx" ? "active" : ""}`}
+                  onClick={() => setExportFormat("pptx")}
+                  title="Generate a slide deck (.pptx)"
+                >
+                  → Slides
+                </button>
+                <button
+                  className={`op-mode-pill ${outputFormat === "document_docx" ? "active" : ""}`}
+                  onClick={() => setExportFormat("document_docx")}
+                  title="Generate a Word document (.docx) instead of a deck"
+                >
+                  → Document
+                </button>
+                <button
+                  className={`op-mode-pill ${outputFormat === "infographic_svg" ? "active" : ""}`}
+                  onClick={() => setExportFormat("infographic_svg")}
+                  title="Generate a single-page visual summary (.svg) instead of a deck"
+                >
+                  → Infographic
+                </button>
+                <button
+                  className={`op-mode-pill ${outputFormat === "diagram_svg" ? "active" : ""}`}
+                  onClick={() => setExportFormat("diagram_svg")}
+                  title="Generate a process-flow diagram (.svg) instead of a deck"
+                >
+                  → Diagram
+                </button>
+                <button
+                  className={`op-mode-pill ${outputFormat === "poster_svg" ? "active" : ""}`}
+                  onClick={() => setExportFormat("poster_svg")}
+                  title="Generate a shareable poster (.svg) instead of a deck"
+                >
+                  → Poster
+                </button>
+                {signedIn && workspaces.length > 0 && (
+                  <select
+                    className="op-workspace-select"
+                    value={selectedWorkspaceId}
+                    onChange={(e) => setSelectedWorkspaceId(e.target.value)}
+                    title="Save this generation into a workspace"
+                  >
+                    <option value="">No workspace</option>
+                    {workspaces.map((w) => (
+                      <option key={w.workspace_id} value={w.workspace_id}>{w.name}</option>
+                    ))}
+                  </select>
+                )}
+              </>
+            )}
+          </div>
+
+          {mode === "ask" ? (
+            <div className="op-ask-box">
+              <div className="op-ask-file-row">
+                {file ? file.name : "Choose a .txt or .pdf file to ask about…"}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".txt,.pdf"
+                  style={{ display: "none" }}
+                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                />
+                <button
+                  className="op-pill-btn"
+                  style={{ marginLeft: 10, padding: "3px 10px", fontSize: 12 }}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  Browse
+                </button>
+              </div>
+              <div className="op-composer-box">
+                <textarea
+                  rows={1}
+                  placeholder="e.g. What does this document say about pricing?"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      handleSend();
+                    }
+                  }}
+                />
+                <button className="op-send-btn" onClick={handleSend} disabled={busy || !file || !input.trim()}>
+                  →
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="op-composer-box">
+              {mode === "topic" ? (
+                <textarea
+                  rows={1}
+                  placeholder="e.g. Create a 10-slide investor pitch deck for an AI healthcare startup"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      handleSend();
+                    }
+                  }}
+                />
+              ) : (
+                <div style={{ flex: 1, fontSize: 14.5, color: file ? "var(--op-text)" : "var(--op-text-muted)", padding: "6px 0" }}>
+                  {file ? file.name : "Choose a .txt or .pdf file…"}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".txt,.pdf"
+                    style={{ display: "none" }}
+                    onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                  />
+                  <button
+                    className="op-pill-btn"
+                    style={{ marginLeft: 10, padding: "3px 10px", fontSize: 12 }}
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    Browse
+                  </button>
+                </div>
+              )}
+              <button className="op-send-btn" onClick={handleSend} disabled={busy || (mode === "topic" ? !input.trim() : !file)}>
+                →
+              </button>
+            </div>
+          )}
+          <div className="op-composer-hint">
+            {mode === "topic" && "Enter to send, Shift+Enter for a new line."}
+            {mode === "document" && "Documents are enhanced with AI when a provider is configured, deterministic fallback otherwise."}
+            {mode === "ask" && "Answers are grounded in the uploaded document only — not general knowledge."}
+            {mode !== "ask" && outputFormat === "document_docx" ? " Building a Word document, not a slide deck." : ""}
+          </div>
         </div>
       </div>
 
-      <div style={{ marginTop: 16, display: "flex", gap: 12, alignItems: "center" }}>
-        <button
-          className="btn btn-primary"
-          disabled={!file || status === "working"}
-          onClick={handleGenerate}
-        >
-          {status === "working" ? "Building your deck…" : "Generate presentation"}
-        </button>
-        {status === "done" && <span style={{ fontSize: 14, color: "var(--accent-teal)" }}>Downloaded ✓ (.pptx + speaker notes .docx, zipped)</span>}
+      <div className="op-preview-col">
+        <div className="op-preview-tabs">
+          <span className="op-preview-tab active">Preview</span>
+          <span className="op-preview-tab" title="Full slide-by-slide editing lives in the saved project view">
+            Edit
+          </span>
+        </div>
+        {!latestJob ? (
+          <div className="op-preview-empty">
+            <div style={{ fontSize: 28 }}>◇</div>
+            Your slides will appear here once generation starts.
+          </div>
+        ) : (
+          <div style={{ padding: 4 }}>
+            {/* The JobBubble already renders the slide grid inline in the
+                thread; this column mirrors it for the currently-active job
+                so the layout matches the reference design. */}
+            <JobBubblePreviewMirror jobId={latestJob.jobId} />
+          </div>
+        )}
       </div>
-      {status === "error" && <p className="error-text" style={{ marginTop: 10 }}>{errorMsg}</p>}
-      {status === "done" && savedProjectId && (
-        <p style={{ fontSize: 14, marginTop: 10 }}>
-          <a href={`/projects/${savedProjectId}`} style={{ color: "var(--accent-teal)", fontWeight: 600 }}>
-            Edit this presentation, slide by slide →
-          </a>
-        </p>
-      )}
-      {status === "done" && !savedProjectId && (
-        <p style={{ fontSize: 13, color: "var(--muted)", marginTop: 10 }}>
-          <a href="/register" style={{ color: "var(--accent-teal)", fontWeight: 600 }}>Create a free account</a>
-          {" "}next time to save this and edit individual slides afterward.
-        </p>
-      )}
-      <p style={{ fontSize: 13, color: "var(--muted)", marginTop: 14, marginBottom: 0 }}>
-        We'll structure and design a deck from what's already in your document — AI improves
-        it further when available (including translating into your chosen language), but a
-        good deck comes out either way. Target slide count is a hint, not a guarantee — the
-        AI will consolidate or expand sections to get close, but won't force an unnatural fit.
-      </p>
     </div>
   );
 }
 
-function FeatureNote({ eyebrow, text }: { eyebrow: string; text: string }) {
+// Small dedicated fetch for the right-hand preview column so it doesn't
+// depend on the chat bubble's internal state.
+function JobBubblePreviewMirror({ jobId }: { jobId: string }) {
+  const [slides, setSlides] = useState<{ order: number; title: string }[] | null>(null);
+  const [doneNoProject, setDoneNoProject] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const s = await getJobStatus(jobId);
+        if (cancelled) return;
+        if (s.status === "done") {
+          if (s.project_id) {
+            const proj = await getProject(s.project_id);
+            if (!cancelled) setSlides(proj.slides);
+          } else {
+            setDoneNoProject(true);
+          }
+          return;
+        }
+        if (s.status === "failed") return;
+        setTimeout(check, 1500);
+      } catch {
+        /* silent — chat thread already surfaces the error */
+      }
+    };
+    check();
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId]);
+
+  if (!slides && !doneNoProject) {
+    return <div className="op-preview-empty">Generating…</div>;
+  }
+  if (doneNoProject) {
+    return <div className="op-preview-empty">Log in before generating to see a live slide preview here — anonymous generations are download-only.</div>;
+  }
   return (
-    <div>
-      <p className="eyebrow" style={{ marginBottom: 8 }}>{eyebrow}</p>
-      <p style={{ fontSize: 15 }}>{text}</p>
+    <div className="op-slide-grid">
+      {slides!.map((s) => (
+        <div key={s.order} className="op-slide-thumb">
+          <span className="op-slide-thumb-num">{s.order}</span>
+          {s.title}
+        </div>
+      ))}
     </div>
   );
 }
