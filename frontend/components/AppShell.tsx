@@ -4,15 +4,16 @@ import { usePathname } from "next/navigation";
 import NavBar from "@/components/NavBar";
 import Sidebar from "@/components/Sidebar";
 
-// The v3 "studio" experience (chat + preview, Claude-style sidebar) owns
-// its own full-height layout. Every other route keeps the original v2
-// NavBar/page layout untouched, so nothing existing breaks while v3 is
-// built out incrementally.
+// The main product experience (chat + preview, Claude-style sidebar)
+// lives at the site root now — it's the primary page, not a sub-route
+// (moved here from /studio; that path now just redirects to /). Every
+// other route (/login, /register, /dashboard, /projects/[id]) keeps
+// the original NavBar/page layout, untouched by this move.
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const isStudio = pathname?.startsWith("/studio");
+  const isStudioShell = pathname === "/" || pathname?.startsWith("/studio");
 
-  if (isStudio) {
+  if (isStudioShell) {
     return (
       <div className="op-shell">
         <Sidebar />
