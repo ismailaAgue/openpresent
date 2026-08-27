@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import {
   getProject, exportProject, getSlide, editSlide, regenerateSlide, SlideDetail,
 } from "@/lib/api-client";
+import { EXPORT_FORMATS, exportFormatMeta, ExportFormat } from "@/lib/export-formats";
 
 export default function ProjectDetailPage() {
   const params = useParams();
@@ -13,6 +14,14 @@ export default function ProjectDetailPage() {
   const [error, setError] = useState("");
   const [exporting, setExporting] = useState(false);
   const [expandedOrder, setExpandedOrder] = useState<number | null>(null);
+  // ADR-049 — every project's underlying Outline works with every
+  // export format regardless of what it was originally generated as
+  // (same Recipe, only the export step differs — ADR-041/046/047/048).
+  // Defaults to pptx since StoragePort doesn't persist which format a
+  // project was originally generated in — adding that would be a real,
+  // separate feature (a new stored field, a migration), not invented
+  // here just to make this default marginally smarter.
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("pptx");
 
   function loadProject() {
     getProject(projectId)
@@ -31,11 +40,12 @@ export default function ProjectDetailPage() {
   async function handleExport() {
     setExporting(true);
     try {
-      const blob = await exportProject(projectId, "pptx");
+      const meta = exportFormatMeta(exportFormat);
+      const blob = await exportProject(projectId, exportFormat);
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "presentation.pptx";
+      a.download = `${meta.label}.${meta.extension}`;
       a.click();
       window.URL.revokeObjectURL(url);
     } catch (e: any) {
@@ -91,9 +101,20 @@ export default function ProjectDetailPage() {
         ))}
       </div>
 
-      <button className="btn btn-primary" style={{ marginTop: 32 }} onClick={handleExport} disabled={exporting}>
-        {exporting ? "Building file…" : "Export as PowerPoint"}
-      </button>
+      <div style={{ marginTop: 32, display: "flex", alignItems: "center", gap: 10 }}>
+        <select
+          value={exportFormat}
+          onChange={(e) => setExportFormat(e.target.value as ExportFormat)}
+          style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid var(--border)" }}
+        >
+          {EXPORT_FORMATS.map((f) => (
+            <option key={f.format} value={f.format}>{f.shortLabel}</option>
+          ))}
+        </select>
+        <button className="btn btn-primary" onClick={handleExport} disabled={exporting}>
+          {exporting ? "Building file…" : `Export as ${exportFormatMeta(exportFormat).label}`}
+        </button>
+      </div>
     </div>
   );
 }

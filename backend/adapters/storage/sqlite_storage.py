@@ -27,12 +27,20 @@ class SqliteStorageAdapter(StoragePort):
                 title TEXT NOT NULL,
                 recipe_json TEXT NOT NULL,
                 created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                workspace_id TEXT
             )
         """)
         self._conn.commit()
+        self._ensure_workspace_id_column()  # ADR-044 — safe on pre-existing dev DBs too
 
-    def save_recipe(self, owner_id: str, recipe: Recipe, title: str) -> str:
+    def _ensure_workspace_id_column(self):
+        cols = [row[1] for row in self._conn.execute("PRAGMA table_info(projects)").fetchall()]
+        if "workspace_id" not in cols:
+            self._conn.execute("ALTER TABLE projects ADD COLUMN workspace_id TEXT")
+            self._conn.commit()
+
+    def save_recipe(self, owner_id: str, recipe: Recipe, title: str, workspace_id: str | None = None) -> str:
         project_id = recipe.project_id or str(uuid.uuid4())
         now = time.time()
         existing = self._conn.execute(
@@ -40,15 +48,25 @@ class SqliteStorageAdapter(StoragePort):
         ).fetchone()
         recipe_json = json.dumps(_recipe_to_dict(recipe))
         if existing:
-            self._conn.execute(
-                "UPDATE projects SET recipe_json = ?, title = ?, updated_at = ? WHERE id = ?",
-                (recipe_json, title, now, project_id),
-            )
+            # ADR-044: an update (re-save of an existing project, e.g.
+            # after a slide edit) leaves workspace_id untouched unless
+            # the caller explicitly passes one — editing a slide must
+            # never silently un-assign a project from its workspace.
+            if workspace_id is not None:
+                self._conn.execute(
+                    "UPDATE projects SET recipe_json = ?, title = ?, updated_at = ?, workspace_id = ? WHERE id = ?",
+                    (recipe_json, title, now, workspace_id, project_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE projects SET recipe_json = ?, title = ?, updated_at = ? WHERE id = ?",
+                    (recipe_json, title, now, project_id),
+                )
         else:
             self._conn.execute(
-                "INSERT INTO projects (id, owner_id, title, recipe_json, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (project_id, owner_id, title, recipe_json, now, now),
+                "INSERT INTO projects (id, owner_id, title, recipe_json, created_at, updated_at, workspace_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (project_id, owner_id, title, recipe_json, now, now, workspace_id),
             )
         self._conn.commit()
         return project_id
@@ -62,14 +80,21 @@ class SqliteStorageAdapter(StoragePort):
             return None  # not found OR owned by someone else — same response, per isolation boundary
         return _recipe_from_dict(json.loads(row[0]))
 
-    def list_projects(self, owner_id: str) -> list[ProjectSummary]:
-        rows = self._conn.execute(
-            "SELECT id, owner_id, title, created_at, updated_at FROM projects "
-            "WHERE owner_id = ? ORDER BY updated_at DESC",
-            (owner_id,),
-        ).fetchall()
+    def list_projects(self, owner_id: str, workspace_id: str | None = None) -> list[ProjectSummary]:
+        if workspace_id is not None:
+            rows = self._conn.execute(
+                "SELECT id, owner_id, title, created_at, updated_at, workspace_id FROM projects "
+                "WHERE owner_id = ? AND workspace_id = ? ORDER BY updated_at DESC",
+                (owner_id, workspace_id),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id, owner_id, title, created_at, updated_at, workspace_id FROM projects "
+                "WHERE owner_id = ? ORDER BY updated_at DESC",
+                (owner_id,),
+            ).fetchall()
         return [
-            ProjectSummary(project_id=r[0], owner_id=r[1], title=r[2], created_at=r[3], updated_at=r[4])
+            ProjectSummary(project_id=r[0], owner_id=r[1], title=r[2], created_at=r[3], updated_at=r[4], workspace_id=r[5])
             for r in rows
         ]
 
@@ -79,6 +104,13 @@ class SqliteStorageAdapter(StoragePort):
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def unassign_workspace(self, workspace_id: str, owner_id: str) -> None:
+        self._conn.execute(
+            "UPDATE projects SET workspace_id = NULL WHERE workspace_id = ? AND owner_id = ?",
+            (workspace_id, owner_id),
+        )
+        self._conn.commit()
 
 
 def _recipe_to_dict(recipe: Recipe) -> dict:

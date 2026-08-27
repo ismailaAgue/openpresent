@@ -97,6 +97,16 @@ class _OpenAICompatibleBase(_JSONPipelineMixin, _TextEnhancementMixin, AIPort, A
                                         "provider": self.provider_label})
             return []
 
+    def answer_question(self, context: str, question: str) -> str:
+        if not self.is_available():
+            return "AI is not configured for this deployment, so I can't answer questions about this document."
+        try:
+            return self._answer_question_raising(context, question)
+        except Exception as e:
+            capture_exception(e, tags={"stage": "ai_port", "method": "answer_question",
+                                        "provider": self.provider_label})
+            return "The AI provider couldn't answer that question right now — please try again."
+
     # -- internals -------------------------------------------------------
 
     def _call_text(self, prompt: str, json_mode: bool = False) -> str:

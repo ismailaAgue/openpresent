@@ -9,14 +9,17 @@ import {
   jobDownloadUrl,
   getProject,
   getSessionToken,
+  listWorkspaces,
+  WorkspaceSummary,
 } from "@/lib/api-client";
 
 type Mode = "topic" | "document";
+import { ExportFormat } from "@/lib/export-formats";
 
 type Msg =
   | { kind: "assistant-text"; id: string; text: string }
   | { kind: "user-text"; id: string; text: string }
-  | { kind: "job"; id: string; jobId: string };
+  | { kind: "job"; id: string; jobId: string; outputFormat: ExportFormat };
 
 const STAGE_LABELS = [
   "Understanding request",
@@ -42,7 +45,7 @@ function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
-function JobBubble({ jobId }: { jobId: string }) {
+function JobBubble({ jobId, outputFormat }: { jobId: string; outputFormat: ExportFormat }) {
   const [status, setStatus] = useState<"pending" | "running" | "done" | "failed">("pending");
   const [stageIdx, setStageIdx] = useState(0);
   const [result, setResult] = useState<{
@@ -59,10 +62,13 @@ function JobBubble({ jobId }: { jobId: string }) {
     let stageTimer: ReturnType<typeof setInterval> | null = null;
 
     // Cosmetic fallback progression, only used until (if ever) the
-    // backend reports a real stage for this job. Document-upload jobs
-    // don't report a stage as of this backend version, so this timer is
-    // what they'll see for the whole run — topic-generation jobs switch
-    // to real data (ADR-040) as soon as the first stage arrives below.
+    // backend reports a real stage for this job. Both topic-generation
+    // and document-upload jobs report real stages as of ADR-040 (the
+    // document path just has 4 of the 6 shared labels, since it's a
+    // rule-based-structure-plus-optional-AI-enhancement pipeline, not
+    // the topic path's separate outline/content/layout calls) — this
+    // timer is only ever seen briefly before the first real stage
+    // arrives, or on an older/misbehaving backend that never reports one.
     stageTimer = setInterval(() => {
       if (usingRealStage) return;
       setStageIdx((i) => (i < STAGE_LABELS.length - 1 ? i + 1 : i));
@@ -135,33 +141,51 @@ function JobBubble({ jobId }: { jobId: string }) {
     );
   }
 
+  const FORMAT_CONFIG: Record<ExportFormat, {
+    label: string; icon: string; downloadLabel: string; sectionsNoun: string; isSvg: boolean;
+  }> = {
+    pptx: { label: "presentation", icon: "PPTX", downloadLabel: "Download .zip", sectionsNoun: "slides", isSvg: false },
+    document_docx: { label: "document", icon: "DOCX", downloadLabel: "Download .docx", sectionsNoun: "sections", isSvg: false },
+    infographic_svg: { label: "infographic", icon: "SVG", downloadLabel: "Download .svg", sectionsNoun: "sections", isSvg: true },
+    diagram_svg: { label: "diagram", icon: "SVG", downloadLabel: "Download .svg", sectionsNoun: "steps", isSvg: true },
+    poster_svg: { label: "poster", icon: "SVG", downloadLabel: "Download .svg", sectionsNoun: "highlights", isSvg: true },
+  };
+  const cfg = FORMAT_CONFIG[outputFormat];
+
   return (
     <>
       <div className="op-result-card">
-        <div className="op-result-icon">PPTX</div>
+        <div className="op-result-icon">{cfg.icon}</div>
         <div>
-          <div style={{ fontWeight: 600, fontSize: 13.5 }}>Your presentation is ready</div>
+          <div style={{ fontWeight: 600, fontSize: 13.5 }}>
+            Your {cfg.label} is ready
+          </div>
           <div className="op-result-meta">
-            {result?.slideCount ?? slides?.length ?? "—"} slides
+            {result?.slideCount ?? slides?.length ?? "—"} {cfg.sectionsNoun}
             {typeof result?.qualityScore === "number" ? ` · quality ${Math.round(result.qualityScore * 100)}%` : ""}
           </div>
         </div>
       </div>
+      {cfg.isSvg && (
+        <div className="op-infographic-preview">
+          <img src={jobDownloadUrl(jobId)} alt={`Generated ${cfg.label}`} />
+        </div>
+      )}
       <div className="op-result-actions">
         <a className="op-pill-btn primary" href={jobDownloadUrl(jobId)} download>
-          Download .zip
+          {cfg.downloadLabel}
         </a>
         {result?.projectId ? (
           <Link className="op-pill-btn" href={`/projects/${result.projectId}`}>
-            Edit slide by slide →
+            {outputFormat === "pptx" ? "Edit slide by slide →" : "Edit in project workspace →"}
           </Link>
         ) : (
           <span className="op-pill-btn" style={{ cursor: "default" }}>
-            Log in to save &amp; edit slides
+            Log in to save &amp; edit this {cfg.label}
           </span>
         )}
       </div>
-      {slides && slides.length > 0 && (
+      {!cfg.isSvg && slides && slides.length > 0 && (
         <div className="op-slide-grid" style={{ paddingLeft: 32, gridTemplateColumns: "repeat(3, 1fr)" }}>
           {slides.slice(0, 6).map((s) => (
             <div key={s.order} className="op-slide-thumb">
@@ -184,9 +208,12 @@ export default function StudioPage() {
     },
   ]);
   const [mode, setMode] = useState<Mode>("topic");
+  const [outputFormat, setExportFormat] = useState<ExportFormat>("pptx");
   const [input, setInput] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string>("");  // "" = ungrouped
   const fileInputRef = useRef<HTMLInputElement>(null);
   const threadRef = useRef<HTMLDivElement>(null);
   const signedIn = typeof window !== "undefined" && !!getSessionToken();
@@ -194,6 +221,11 @@ export default function StudioPage() {
   useEffect(() => {
     threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    if (!signedIn) return;
+    listWorkspaces().then(setWorkspaces).catch(() => setWorkspaces([]));
+  }, [signedIn]);
 
   async function handleSend() {
     if (busy) return;
@@ -206,14 +238,15 @@ export default function StudioPage() {
 
     try {
       let job: { job_id: string };
+      const workspaceId = selectedWorkspaceId || undefined;  // ADR-044
       if (mode === "topic") {
-        job = await generateFromTopicAsync({ topic: input.trim() });
+        job = await generateFromTopicAsync({ topic: input.trim(), exportFormat: outputFormat, workspaceId });
       } else {
-        job = await generateAsync(file as File);
+        job = await generateAsync(file as File, { exportFormat: outputFormat, workspaceId });
       }
       setInput("");
       setFile(null);
-      setMessages((m) => [...m, { kind: "job", id: uid(), jobId: job.job_id }]);
+      setMessages((m) => [...m, { kind: "job", id: uid(), jobId: job.job_id, outputFormat }]);
     } catch (e) {
       setMessages((m) => [
         ...m,
@@ -253,7 +286,7 @@ export default function StudioPage() {
                   <span className="op-bubble-avatar" />
                   <span>Working on it…</span>
                 </div>
-                <JobBubble jobId={m.jobId} />
+                <JobBubble jobId={m.jobId} outputFormat={m.outputFormat} />
               </div>
             );
           })}
@@ -274,8 +307,57 @@ export default function StudioPage() {
               Describe a topic
             </button>
             <button className={`op-mode-pill ${mode === "document" ? "active" : ""}`} onClick={() => setMode("document")}>
-              Upload a document
+              Upload a source document
             </button>
+            <span style={{ width: 1, alignSelf: "stretch", background: "var(--op-border)", margin: "0 4px" }} />
+            <button
+              className={`op-mode-pill ${outputFormat === "pptx" ? "active" : ""}`}
+              onClick={() => setExportFormat("pptx")}
+              title="Generate a slide deck (.pptx)"
+            >
+              → Slides
+            </button>
+            <button
+              className={`op-mode-pill ${outputFormat === "document_docx" ? "active" : ""}`}
+              onClick={() => setExportFormat("document_docx")}
+              title="Generate a Word document (.docx) instead of a deck"
+            >
+              → Document
+            </button>
+            <button
+              className={`op-mode-pill ${outputFormat === "infographic_svg" ? "active" : ""}`}
+              onClick={() => setExportFormat("infographic_svg")}
+              title="Generate a single-page visual summary (.svg) instead of a deck"
+            >
+              → Infographic
+            </button>
+            <button
+              className={`op-mode-pill ${outputFormat === "diagram_svg" ? "active" : ""}`}
+              onClick={() => setExportFormat("diagram_svg")}
+              title="Generate a process-flow diagram (.svg) instead of a deck"
+            >
+              → Diagram
+            </button>
+            <button
+              className={`op-mode-pill ${outputFormat === "poster_svg" ? "active" : ""}`}
+              onClick={() => setExportFormat("poster_svg")}
+              title="Generate a shareable poster (.svg) instead of a deck"
+            >
+              → Poster
+            </button>
+            {signedIn && workspaces.length > 0 && (
+              <select
+                className="op-workspace-select"
+                value={selectedWorkspaceId}
+                onChange={(e) => setSelectedWorkspaceId(e.target.value)}
+                title="Save this generation into a workspace"
+              >
+                <option value="">No workspace</option>
+                {workspaces.map((w) => (
+                  <option key={w.workspace_id} value={w.workspace_id}>{w.name}</option>
+                ))}
+              </select>
+            )}
           </div>
 
           <div className="op-composer-box">
@@ -317,6 +399,7 @@ export default function StudioPage() {
           </div>
           <div className="op-composer-hint">
             {mode === "topic" ? "Enter to send, Shift+Enter for a new line." : "Documents are enhanced with AI when a provider is configured, deterministic fallback otherwise."}
+            {" "}{outputFormat === "document_docx" ? "Building a Word document, not a slide deck." : ""}
           </div>
         </div>
       </div>

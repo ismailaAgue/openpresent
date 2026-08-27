@@ -23,7 +23,7 @@ import threading
 import time
 from backend.adapters import registry
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -48,31 +48,60 @@ MAX_SLIDE_COUNT = 30
 init_sentry()  # no-op unless SENTRY_DSN is configured — see monitoring/sentry_setup.py
 
 
-def _in_process_worker_loop():
+def _in_process_worker_loop(stop_event: threading.Event):
     """Runs in a background thread inside the API process. See module
     docstring / ADR-015 for why this replaces a separate worker service
     at Stage 0-1. Controlled by OPENPRESENT_INPROCESS_WORKER (default
     "true") so it can be turned off once a real separate worker exists
-    (Stage 2+) without touching this code — just an env var flip."""
+    (Stage 2+) without touching this code — just an env var flip.
+
+    ADR-042: takes a stop_event and checks it every iteration (via
+    Event.wait() instead of time.sleep(), so a stop request interrupts
+    the sleep immediately rather than waiting out the last 0.5s poll).
+    Previously this looped forever with no way to stop it short of
+    killing the process — harmless in production (one process, one
+    worker thread, for the process's whole lifetime) but meant every
+    test using TestClient(app) leaked a new daemon thread that never
+    stopped, so a long test run accumulated N zombie worker threads all
+    racing on the registry's non-thread-safe lazy-singleton getters.
+    That's what caused test_jobs_endpoint_surfaces_stage_while_running's
+    intermittent 404s — a zombie thread from an earlier test winning
+    the singleton-initialization race for the CURRENT test's reset
+    registry, so the test's own `queue` variable and the route handler's
+    `registry.get_queue_adapter()` call ended up pointing at two
+    different in-memory databases. Real bug, not test-only: the same
+    race is theoretically reachable in production too under a cold
+    start with concurrent requests, just far less likely to ever be hit
+    with a single long-lived worker thread instead of many short-lived
+    ones."""
     from backend.workers.generation_worker import process_one_job
-    while True:
+    while not stop_event.is_set():
         try:
             did_work = process_one_job()
         except Exception:
             did_work = False  # never let a bad job crash the whole loop/thread
-        time.sleep(0.5 if not did_work else 0)
+        stop_event.wait(0.5 if not did_work else 0)
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     # Modern replacement for the deprecated @app.on_event("startup")
-    # decorator (FastAPI's own recommended migration) — same behavior,
-    # same daemon-thread worker, just the current API shape. Nothing
-    # runs on shutdown; the daemon thread is killed with the process.
+    # decorator (FastAPI's own recommended migration) — same daemon-
+    # thread worker, just the current API shape.
+    stop_event = threading.Event()
+    thread = None
     if os.environ.get("OPENPRESENT_INPROCESS_WORKER", "true").lower() == "true":
-        thread = threading.Thread(target=_in_process_worker_loop, daemon=True)
+        thread = threading.Thread(target=_in_process_worker_loop, args=(stop_event,), daemon=True)
         thread.start()
     yield
+    # ADR-042: signal + join on shutdown so the thread actually stops
+    # instead of leaking for the rest of the process's life (see the
+    # long comment on _in_process_worker_loop for why this matters).
+    # A generous-but-bounded timeout: never hang app shutdown forever
+    # if a single in-flight job is unusually slow to finish.
+    stop_event.set()
+    if thread is not None:
+        thread.join(timeout=5)
 
 
 app = FastAPI(title="OpenPresent API — Phase 4", lifespan=_lifespan)
@@ -105,7 +134,140 @@ app.add_middleware(
     expose_headers=["X-Project-Id", "X-Structure-Source", "X-Quality-Score"],
 )
 
-_MEDIA_TYPES = {"pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
+_MEDIA_TYPES = {
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    # ADR-041 (v3 Phase 3)
+    "document_docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    # ADR-046 (v3 Phase 6)
+    "infographic_svg": "image/svg+xml",
+    # ADR-047 (v3 Phase 6)
+    "diagram_svg": "image/svg+xml",
+    # ADR-048 (v3 Phase 6)
+    "poster_svg": "image/svg+xml",
+}
+
+# export_format is used as both the ExportPort lookup key AND, until now,
+# literally interpolated into the download filename — fine while "pptx"
+# was the only format (files.pptx), wrong once a format id isn't also a
+# valid bare extension ("presentation.document_docx" is not a file
+# anyone recognizes). This is the one place that distinction is made.
+_FILE_EXTENSIONS = {"document_docx": "docx", "infographic_svg": "svg", "diagram_svg": "svg", "poster_svg": "svg"}  # anything absent: format_id IS the extension
+_FILE_BASENAMES = {"document_docx": "document", "infographic_svg": "infographic", "diagram_svg": "diagram", "poster_svg": "poster"}  # anything absent: "presentation"
+
+
+def _download_filename(export_format: str) -> str:
+    ext = _FILE_EXTENSIONS.get(export_format, export_format)
+    base = _FILE_BASENAMES.get(export_format, "presentation")
+    return f"{base}.{ext}"
+
+
+# ADR-043 — cost circuit breaker. This was the #1 item in the original
+# handoff doc's "actually risky right now" list, written before any of
+# this existed: "A single generation can now trigger 6+ AI calls...
+# Nothing caps spend." Fixed-window (daily, UTC-bucketed) counter, not
+# a general rate limiter — see ports/quota.py's docstring for why that
+# scope line was drawn deliberately. Defaults chosen to be generous
+# enough not to bother a real user in normal use (30/day signed-in)
+# while still bounding worst-case daily spend from any single source,
+# with anonymous use capped much lower (5/day) since it can't be tied
+# to an account for follow-up if abused.
+DAILY_WINDOW_SECONDS = 86400
+
+
+def _generation_limit_user() -> int:
+    # Read at call time, not import time — a module-level constant
+    # baked in from os.environ at import would never see an env var
+    # changed later (including by tests via monkeypatch.setenv, which
+    # is exactly what caught this the first time it was written wrong).
+    return int(os.environ.get("OPENPRESENT_DAILY_GENERATION_LIMIT_USER", "30"))
+
+
+def _generation_limit_anon() -> int:
+    return int(os.environ.get("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "5"))
+
+
+def _enforce_generation_quota(user, request: Request) -> None:
+    """Raises HTTPException(429) if this caller is over their daily cap.
+    Must be called BEFORE any AI/export work starts — the whole point
+    is to gate spend, not just report it after the fact. Anonymous
+    callers are keyed by IP; request.client can be None under some ASGI
+    test/proxy setups, so that's treated as a single shared "unknown"
+    bucket rather than raising — a slightly-too-strict shared limit for
+    that edge case is a fine tradeoff against ever letting an unkeyable
+    caller bypass the cap entirely."""
+    _enforce_daily_quota(user, request, key_prefix="", noun="generations",
+                          limit_user=_generation_limit_user(), limit_anon=_generation_limit_anon())
+
+
+# ADR-050 (v3 Phase 7, PDF/document Q&A) — a SEPARATE, lighter quota
+# bucket from generation, not the same one. A single Q&A call is one
+# AI request; a single generation is 6+ (per ADR-043's own reasoning).
+# Sharing one bucket would make whichever cap is reused wrong for the
+# other feature — either generation's cap is too generous for how
+# cheap Q&A actually is, or Q&A inherits a cap sized for something 6x
+# more expensive per use. Same QuotaPort/adapter, different key
+# namespace and separate, more generous limits.
+def _qa_limit_user() -> int:
+    return int(os.environ.get("OPENPRESENT_DAILY_QA_LIMIT_USER", "100"))
+
+
+def _qa_limit_anon() -> int:
+    return int(os.environ.get("OPENPRESENT_DAILY_QA_LIMIT_ANON", "15"))
+
+
+def _enforce_qa_quota(user, request: Request) -> None:
+    _enforce_daily_quota(user, request, key_prefix="qa_", noun="questions",
+                          limit_user=_qa_limit_user(), limit_anon=_qa_limit_anon())
+
+
+def _enforce_daily_quota(user, request: Request, key_prefix: str, noun: str,
+                          limit_user: int, limit_anon: int) -> None:
+    quota = registry.get_quota_adapter()
+    if user:
+        key, limit = f"{key_prefix}user:{user.id}", limit_user
+    else:
+        client_ip = request.client.host if request.client else "unknown"
+        key, limit = f"{key_prefix}anon:{client_ip}", limit_anon
+    count = quota.record_attempt(key, DAILY_WINDOW_SECONDS)
+    if count > limit:
+        message = (
+            f"You've reached your daily limit of {limit} {noun}. Try again tomorrow."
+            if user else
+            f"You've reached the daily limit of {limit} {noun} for anonymous use. "
+            f"Log in for a higher daily limit, or try again tomorrow."
+        )
+        raise HTTPException(status_code=429, detail=message)
+
+
+def _resolve_workspace_id(workspace_id: str | None, user) -> str | None:
+    """ADR-044 — validates workspace ownership before letting a
+    generation get assigned to it, so a caller can't attach a project
+    to a workspace_id they don't own (not a data leak either way, since
+    every listing is still owner_id-scoped, but a project silently
+    pointing at an unreachable/foreign workspace_id would just be
+    confusing — better to fail clearly at assignment time). Anonymous
+    callers or a None workspace_id both simply pass through as None
+    (ungrouped), same as pre-ADR-044 behavior."""
+    if workspace_id is None or user is None:
+        return None
+    if registry.get_workspace_adapter().get_workspace(workspace_id, user.id) is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    return workspace_id
+
+
+def _fetch_brand_profile(resolved_workspace_id: str | None, user):
+    """ADR-045 — returns the workspace's BrandProfile if one has been
+    set and isn't empty, else None. Takes an already-resolved (i.e.
+    already ownership-checked) workspace_id specifically so this never
+    does its own separate authorization check — reuses whatever
+    _resolve_workspace_id already validated, rather than re-deriving
+    that logic a second time in a second place."""
+    if resolved_workspace_id is None or user is None:
+        return None
+    profile = registry.get_brand_adapter().get_brand_profile(resolved_workspace_id, user.id)
+    if profile is None or profile.is_empty():
+        return None
+    return profile
 
 
 def _current_user(authorization: str | None):
@@ -133,6 +295,30 @@ class TopicGenerateRequest(BaseModel):
     tone: str = "professional"
     export_format: str = "pptx"
     bundle_speaker_notes: bool = True
+    workspace_id: str | None = None  # ADR-044 — optional; None saves ungrouped, same as before
+
+
+class WorkspaceCreateRequest(BaseModel):
+    name: str
+
+
+class WorkspaceRenameRequest(BaseModel):
+    name: str
+
+
+class BrandProfileRequest(BaseModel):
+    # ADR-045 — set_brand_profile() at the port level is a whole-record
+    # replace, not a partial merge (see ports/brand.py), so this PUT is
+    # "replace the whole profile with exactly this," not "patch these
+    # fields." Every field defaults to "" so a caller who only cares
+    # about e.g. colors can still send a valid request, but doing so
+    # DOES blank any other previously-set fields — the frontend always
+    # sends the full form for exactly this reason, not a subset.
+    name: str = ""
+    colors: str = ""
+    tone: str = ""
+    audience: str = ""
+    visual_style: str = ""
 
 
 class SlideEditRequest(BaseModel):
@@ -230,10 +416,11 @@ def login(req: LoginRequest):
 # -- Generation (sync — no account required, keeps quick-use free) -----
 
 @app.post("/generate")
-async def generate(file: UploadFile = File(...), export_format: str = "pptx",
+async def generate(request: Request, file: UploadFile = File(...), export_format: str = "pptx",
                     bundle_speaker_notes: bool = True,
                     audience_type: str = "student_school", language: str = "en",
                     target_slide_count: int | None = None,
+                    workspace_id: str | None = None,
                     authorization: str | None = Header(default=None)):
     # ADR-039 fix: previously this endpoint never accepted or checked
     # auth at all, and never saved a project — only /generate/async
@@ -245,6 +432,9 @@ async def generate(file: UploadFile = File(...), export_format: str = "pptx",
     # correctly at the API level. Fixed by giving sync generation the
     # same "save if logged in" behavior async already had.
     user = _current_user(authorization)
+    _enforce_generation_quota(user, request)  # ADR-043 — before any AI/export work starts
+    resolved_workspace_id = _resolve_workspace_id(workspace_id, user)  # ADR-044 — validate before any work too
+    brand = _fetch_brand_profile(resolved_workspace_id, user)  # ADR-045
     file_bytes = await file.read()
     try:
         recipe, output_bytes = generate_presentation(
@@ -254,6 +444,7 @@ async def generate(file: UploadFile = File(...), export_format: str = "pptx",
             audience_type=audience_type,
             language=language,
             target_slide_count=target_slide_count,
+            brand=brand,
         )
     except UnsupportedFileTypeError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -268,7 +459,7 @@ async def generate(file: UploadFile = File(...), export_format: str = "pptx",
     project_id = None
     if owner_id:
         title = recipe.outline.slides[0].title if recipe.outline.slides else "Untitled"
-        project_id = registry.get_storage_adapter().save_recipe(owner_id, recipe, title)
+        project_id = registry.get_storage_adapter().save_recipe(owner_id, recipe, title, workspace_id=resolved_workspace_id)
 
     registry.get_analytics_adapter().record_generation(owner_id, recipe.outline.structure_source.value)
     registry.get_analytics_adapter().record_export(owner_id)
@@ -291,7 +482,7 @@ async def generate(file: UploadFile = File(...), export_format: str = "pptx",
     return Response(
         content=output_bytes,
         media_type=_MEDIA_TYPES.get(export_format, "application/octet-stream"),
-        headers={"Content-Disposition": f'attachment; filename="presentation.{export_format}"', **extra_headers},
+        headers={"Content-Disposition": f'attachment; filename="{_download_filename(export_format)}"', **extra_headers},
     )
 
 
@@ -304,7 +495,8 @@ def _clean_slide_count(n: int) -> int:
 
 
 @app.post("/generate/topic")
-def generate_from_topic(req: TopicGenerateRequest, authorization: str | None = Header(default=None)):
+def generate_from_topic(req: TopicGenerateRequest, request: Request,
+                         authorization: str | None = Header(default=None)):
     if not req.topic or not req.topic.strip():
         raise HTTPException(status_code=400, detail="topic is required")
     # ADR-039 fix — same gap, same fix as sync /generate above: this
@@ -312,6 +504,9 @@ def generate_from_topic(req: TopicGenerateRequest, authorization: str | None = H
     # form (the primary "AI-first" flow) never produced anything
     # editable even for a logged-in user.
     user = _current_user(authorization)
+    _enforce_generation_quota(user, request)  # ADR-043 — before any AI/export work starts
+    resolved_workspace_id = _resolve_workspace_id(req.workspace_id, user)  # ADR-044
+    brand = _fetch_brand_profile(resolved_workspace_id, user)  # ADR-045
     try:
         recipe, output_bytes, quality = generate_presentation_from_topic(
             topic=req.topic,
@@ -320,6 +515,7 @@ def generate_from_topic(req: TopicGenerateRequest, authorization: str | None = H
             language=req.language,
             tone=req.tone,
             export_format=req.export_format,
+            brand=brand,
         )
     except UnsupportedFormatError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -330,7 +526,7 @@ def generate_from_topic(req: TopicGenerateRequest, authorization: str | None = H
     project_id = None
     if owner_id:
         title = recipe.outline.slides[0].title if recipe.outline.slides else "Untitled"
-        project_id = registry.get_storage_adapter().save_recipe(owner_id, recipe, title)
+        project_id = registry.get_storage_adapter().save_recipe(owner_id, recipe, title, workspace_id=resolved_workspace_id)
 
     registry.get_analytics_adapter().record_generation(owner_id, recipe.outline.structure_source.value)
     registry.get_analytics_adapter().record_export(owner_id)
@@ -347,7 +543,7 @@ def generate_from_topic(req: TopicGenerateRequest, authorization: str | None = H
         headers["Content-Disposition"] = 'attachment; filename="presentation.zip"'
         return Response(content=zip_bytes, media_type="application/zip", headers=headers)
 
-    headers["Content-Disposition"] = f'attachment; filename="presentation.{req.export_format}"'
+    headers["Content-Disposition"] = f'attachment; filename="{_download_filename(req.export_format)}"'
     return Response(
         content=output_bytes,
         media_type=_MEDIA_TYPES.get(req.export_format, "application/octet-stream"),
@@ -356,11 +552,14 @@ def generate_from_topic(req: TopicGenerateRequest, authorization: str | None = H
 
 
 @app.post("/generate/topic/async")
-def generate_from_topic_async(req: TopicGenerateRequest,
+def generate_from_topic_async(req: TopicGenerateRequest, request: Request,
                                authorization: str | None = Header(default=None)):
     if not req.topic or not req.topic.strip():
         raise HTTPException(status_code=400, detail="topic is required")
     user = _current_user(authorization)
+    _enforce_generation_quota(user, request)  # ADR-043 — gate the enqueue itself, not just the sync path
+    resolved_workspace_id = _resolve_workspace_id(req.workspace_id, user)  # ADR-044
+    brand = _fetch_brand_profile(resolved_workspace_id, user)  # ADR-045
     queue = registry.get_queue_adapter()
     job_id = queue.enqueue("generate_topic", {
         "topic": req.topic,
@@ -371,18 +570,32 @@ def generate_from_topic_async(req: TopicGenerateRequest,
         "export_format": req.export_format,
         "bundle_speaker_notes": req.bundle_speaker_notes,
         "owner_id": user.id if user else None,
+        "workspace_id": resolved_workspace_id,
+        # ADR-045 — a job payload must be JSON-serializable (it's
+        # persisted as JSON, see adapters/queue/*), so this is the
+        # BrandProfile's fields as a plain dict, not the dataclass
+        # itself. generation_worker.py reconstructs it before calling
+        # the engine.
+        "brand": {
+            "name": brand.name, "colors": brand.colors, "tone": brand.tone,
+            "audience": brand.audience, "visual_style": brand.visual_style,
+        } if brand else None,
     })
     return {"job_id": job_id, "status": "pending"}
 
 
 @app.post("/generate/async")
-async def generate_async(file: UploadFile = File(...), export_format: str = "pptx",
+async def generate_async(request: Request, file: UploadFile = File(...), export_format: str = "pptx",
                           bundle_speaker_notes: bool = True,
                           audience_type: str = "student_school", language: str = "en",
                           target_slide_count: int | None = None,
+                          workspace_id: str | None = None,
                           authorization: str | None = Header(default=None)):
     file_bytes = await file.read()
     user = _current_user(authorization)
+    _enforce_generation_quota(user, request)  # ADR-043 — gate the enqueue itself, not just the sync path
+    resolved_workspace_id = _resolve_workspace_id(workspace_id, user)  # ADR-044
+    brand = _fetch_brand_profile(resolved_workspace_id, user)  # ADR-045
     queue = registry.get_queue_adapter()
     job_id = queue.enqueue("generate", {
         "filename": file.filename or "upload.txt",
@@ -393,8 +606,46 @@ async def generate_async(file: UploadFile = File(...), export_format: str = "ppt
         "language": language,
         "target_slide_count": target_slide_count,
         "owner_id": user.id if user else None,
+        "workspace_id": resolved_workspace_id,
+        "brand": {
+            "name": brand.name, "colors": brand.colors, "tone": brand.tone,
+            "audience": brand.audience, "visual_style": brand.visual_style,
+        } if brand else None,
     })
     return {"job_id": job_id, "status": "pending"}
+
+
+# -- Document Q&A (ADR-050, v3 Phase 7) -------------------------------------
+
+@app.post("/documents/ask")
+async def ask_document(request: Request, file: UploadFile = File(...), question: str = "",
+                        authorization: str | None = Header(default=None)):
+    """Answers a question grounded in an uploaded document's text —
+    reuses the exact same IngestionPort extraction step every
+    generation endpoint already uses (no new extraction logic, per the
+    v3 roadmap's own note on this phase), routed to AIPort.
+    answer_question instead of into the generation pipeline. Always
+    200 with an `answer` field, even when AI isn't configured — see
+    AIPort.answer_question's docstring for why this is the one AIPort
+    method where the degraded response is an explicit, honest sentence
+    rather than a silent pass-through, and api/main.py follows that
+    same contract at the HTTP layer rather than special-casing a 503
+    for it."""
+    if not question or not question.strip():
+        raise HTTPException(status_code=400, detail="question is required")
+    user = _current_user(authorization)
+    _enforce_qa_quota(user, request)  # ADR-050 — separate, lighter cap than generation (see _enforce_qa_quota)
+    file_bytes = await file.read()
+    try:
+        ingestion = registry.get_ingestion_adapter(file.filename or "upload.txt")
+        source_text = ingestion.extract_text(file_bytes, file.filename or "upload.txt")
+    except UnsupportedFileTypeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except CorruptFileError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    answer = registry.get_ai_adapter().answer_question(source_text, question.strip())
+    return {"answer": answer}
 
 
 @app.get("/jobs/{job_id}")
@@ -405,7 +656,7 @@ def get_job(job_id: str):
         raise HTTPException(status_code=404, detail="job not found")
     response = {"job_id": job.id, "status": job.status.value}
     if job.status == JobStatus.RUNNING and job.stage:
-        response["stage"] = job.stage  # ADR-040 — best-effort, topic generation only
+        response["stage"] = job.stage  # ADR-040 — both generate_topic and document-upload jobs report this
     if job.status == JobStatus.DONE and job.result:
         response["structure_source"] = job.result.get("structure_source")
         response["slide_count"] = job.result.get("slide_count")
@@ -438,22 +689,155 @@ def download_job(job_id: str):
     return Response(
         content=file_bytes,
         media_type=_MEDIA_TYPES.get(fmt, "application/octet-stream"),
-        headers={"Content-Disposition": f'attachment; filename="presentation.{fmt}"'},
+        headers={"Content-Disposition": f'attachment; filename="{_download_filename(fmt)}"'},
     )
 
 
 # -- Projects (requires auth — this is the reusable-project surface) ---
 
 @app.get("/projects")
-def list_projects(authorization: str | None = Header(default=None)):
+def list_projects(workspace_id: str | None = None, authorization: str | None = Header(default=None)):
     user = _current_user(authorization)
     if user is None:
         raise HTTPException(status_code=401, detail="login required")
-    projects = registry.get_storage_adapter().list_projects(user.id)
+    if workspace_id is not None:
+        _resolve_workspace_id(workspace_id, user)  # ADR-044 — 404s if not owned, same check as generation
+    projects = registry.get_storage_adapter().list_projects(user.id, workspace_id=workspace_id)
     return [
-        {"project_id": p.project_id, "title": p.title, "updated_at": p.updated_at}
+        {"project_id": p.project_id, "title": p.title, "updated_at": p.updated_at, "workspace_id": p.workspace_id}
         for p in projects
     ]
+
+
+# -- Workspaces (ADR-044, v3 Phase 4) ------------------------------------
+
+@app.post("/workspaces")
+def create_workspace(req: WorkspaceCreateRequest, authorization: str | None = Header(default=None)):
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    if not req.name or not req.name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+    workspace_id = registry.get_workspace_adapter().create_workspace(user.id, req.name.strip())
+    return {"workspace_id": workspace_id, "name": req.name.strip()}
+
+
+@app.get("/workspaces")
+def list_workspaces(authorization: str | None = Header(default=None)):
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    workspaces = registry.get_workspace_adapter().list_workspaces(user.id)
+    return [
+        {"workspace_id": w.workspace_id, "name": w.name, "created_at": w.created_at, "updated_at": w.updated_at}
+        for w in workspaces
+    ]
+
+
+@app.get("/workspaces/{workspace_id}")
+def get_workspace(workspace_id: str, authorization: str | None = Header(default=None)):
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    workspace = registry.get_workspace_adapter().get_workspace(workspace_id, user.id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    projects = registry.get_storage_adapter().list_projects(user.id, workspace_id=workspace_id)
+    return {
+        "workspace_id": workspace.workspace_id, "name": workspace.name,
+        "created_at": workspace.created_at, "updated_at": workspace.updated_at,
+        "projects": [{"project_id": p.project_id, "title": p.title, "updated_at": p.updated_at} for p in projects],
+    }
+
+
+@app.patch("/workspaces/{workspace_id}")
+def rename_workspace(workspace_id: str, req: WorkspaceRenameRequest,
+                      authorization: str | None = Header(default=None)):
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    if not req.name or not req.name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+    renamed = registry.get_workspace_adapter().rename_workspace(workspace_id, user.id, req.name.strip())
+    if not renamed:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    return {"workspace_id": workspace_id, "name": req.name.strip()}
+
+
+@app.delete("/workspaces/{workspace_id}")
+def delete_workspace(workspace_id: str, authorization: str | None = Header(default=None)):
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    # ADR-044: unassign BEFORE delete, not after — if delete succeeded
+    # but the process died before unassigning, projects would be left
+    # pointing at a workspace_id that no longer resolves for this user.
+    # Unassigning first means the worst case of a mid-operation crash is
+    # "workspace still exists, projects already ungrouped" — recoverable
+    # (just delete the now-empty workspace again) rather than orphaned
+    # in a way nothing surfaces.
+    registry.get_storage_adapter().unassign_workspace(workspace_id, user.id)
+    deleted = registry.get_workspace_adapter().delete_workspace(workspace_id, user.id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    return {"deleted": True}
+
+
+# -- Brand Memory (ADR-045, v3 Phase 5) ------------------------------------
+
+def _require_owned_workspace(workspace_id: str, user) -> None:
+    if registry.get_workspace_adapter().get_workspace(workspace_id, user.id) is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+
+
+@app.put("/workspaces/{workspace_id}/brand")
+def set_brand_profile(workspace_id: str, req: BrandProfileRequest,
+                       authorization: str | None = Header(default=None)):
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    _require_owned_workspace(workspace_id, user)
+    profile = registry.get_brand_adapter().set_brand_profile(
+        workspace_id, user.id, name=req.name, colors=req.colors, tone=req.tone,
+        audience=req.audience, visual_style=req.visual_style,
+    )
+    return {
+        "workspace_id": profile.workspace_id, "name": profile.name, "colors": profile.colors,
+        "tone": profile.tone, "audience": profile.audience, "visual_style": profile.visual_style,
+        "updated_at": profile.updated_at,
+    }
+
+
+@app.get("/workspaces/{workspace_id}/brand")
+def get_brand_profile(workspace_id: str, authorization: str | None = Header(default=None)):
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    _require_owned_workspace(workspace_id, user)
+    profile = registry.get_brand_adapter().get_brand_profile(workspace_id, user.id)
+    if profile is None:
+        # A workspace with no brand profile set yet is a normal state,
+        # not an error — 200 with nulls, not 404, so the frontend can
+        # render an empty form without special-casing "doesn't exist
+        # yet" vs "exists but you're not allowed to see it" (the latter
+        # is what the workspace-ownership check above already handles
+        # with a real 404).
+        return {"workspace_id": workspace_id, "name": "", "colors": "", "tone": "", "audience": "", "visual_style": ""}
+    return {
+        "workspace_id": profile.workspace_id, "name": profile.name, "colors": profile.colors,
+        "tone": profile.tone, "audience": profile.audience, "visual_style": profile.visual_style,
+        "updated_at": profile.updated_at,
+    }
+
+
+@app.delete("/workspaces/{workspace_id}/brand")
+def delete_brand_profile(workspace_id: str, authorization: str | None = Header(default=None)):
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    _require_owned_workspace(workspace_id, user)
+    registry.get_brand_adapter().delete_brand_profile(workspace_id, user.id)
+    return {"deleted": True}
 
 
 @app.get("/projects/{project_id}")
@@ -566,7 +950,7 @@ def export_project(project_id: str, export_format: str = "pptx",
     return Response(
         content=file_bytes,
         media_type=_MEDIA_TYPES.get(export_format, "application/octet-stream"),
-        headers={"Content-Disposition": f'attachment; filename="presentation.{export_format}"'},
+        headers={"Content-Disposition": f'attachment; filename="{_download_filename(export_format)}"'},
     )
 
 

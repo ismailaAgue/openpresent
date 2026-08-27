@@ -37,10 +37,12 @@ class PostgresStorageAdapter(StoragePort):
                         updated_at DOUBLE PRECISION NOT NULL
                     )
                 """)
+                # ADR-044 — additive column, safe on a pre-existing prod table.
+                cur.execute("ALTER TABLE op_projects ADD COLUMN IF NOT EXISTS workspace_id TEXT")
         finally:
             self._pool.putconn(conn)
 
-    def save_recipe(self, owner_id: str, recipe: Recipe, title: str) -> str:
+    def save_recipe(self, owner_id: str, recipe: Recipe, title: str, workspace_id: str | None = None) -> str:
         project_id = recipe.project_id or str(uuid.uuid4())
         now = time.time()
         recipe_json = json.dumps(dataclasses.asdict(recipe))
@@ -54,15 +56,25 @@ class PostgresStorageAdapter(StoragePort):
                 )
                 existing = cur.fetchone()
                 if existing:
-                    cur.execute(
-                        "UPDATE op_projects SET recipe_json = %s, title = %s, updated_at = %s WHERE id = %s",
-                        (recipe_json, title, now, project_id),
-                    )
+                    # ADR-044: leave workspace_id untouched on update
+                    # unless explicitly passed — see sqlite_storage.py's
+                    # identical comment for why.
+                    if workspace_id is not None:
+                        cur.execute(
+                            "UPDATE op_projects SET recipe_json = %s, title = %s, updated_at = %s, "
+                            "workspace_id = %s WHERE id = %s",
+                            (recipe_json, title, now, workspace_id, project_id),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE op_projects SET recipe_json = %s, title = %s, updated_at = %s WHERE id = %s",
+                            (recipe_json, title, now, project_id),
+                        )
                 else:
                     cur.execute(
-                        "INSERT INTO op_projects (id, owner_id, title, recipe_json, created_at, updated_at) "
-                        "VALUES (%s, %s, %s, %s, %s, %s)",
-                        (project_id, owner_id, title, recipe_json, now, now),
+                        "INSERT INTO op_projects (id, owner_id, title, recipe_json, created_at, updated_at, workspace_id) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (project_id, owner_id, title, recipe_json, now, now, workspace_id),
                     )
             return project_id
         finally:
@@ -84,21 +96,28 @@ class PostgresStorageAdapter(StoragePort):
             return None
         return _recipe_from_dict(json.loads(row[0]))
 
-    def list_projects(self, owner_id: str) -> list[ProjectSummary]:
+    def list_projects(self, owner_id: str, workspace_id: str | None = None) -> list[ProjectSummary]:
         conn = self._pool.getconn()
         try:
             conn.autocommit = True
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, owner_id, title, created_at, updated_at FROM op_projects "
-                    "WHERE owner_id = %s ORDER BY updated_at DESC",
-                    (owner_id,),
-                )
+                if workspace_id is not None:
+                    cur.execute(
+                        "SELECT id, owner_id, title, created_at, updated_at, workspace_id FROM op_projects "
+                        "WHERE owner_id = %s AND workspace_id = %s ORDER BY updated_at DESC",
+                        (owner_id, workspace_id),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT id, owner_id, title, created_at, updated_at, workspace_id FROM op_projects "
+                        "WHERE owner_id = %s ORDER BY updated_at DESC",
+                        (owner_id,),
+                    )
                 rows = cur.fetchall()
         finally:
             self._pool.putconn(conn)
         return [
-            ProjectSummary(project_id=r[0], owner_id=r[1], title=r[2], created_at=r[3], updated_at=r[4])
+            ProjectSummary(project_id=r[0], owner_id=r[1], title=r[2], created_at=r[3], updated_at=r[4], workspace_id=r[5])
             for r in rows
         ]
 
@@ -112,6 +131,18 @@ class PostgresStorageAdapter(StoragePort):
                 )
                 deleted = cur.rowcount > 0
             return deleted
+        finally:
+            self._pool.putconn(conn)
+
+    def unassign_workspace(self, workspace_id: str, owner_id: str) -> None:
+        conn = self._pool.getconn()
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE op_projects SET workspace_id = NULL WHERE workspace_id = %s AND owner_id = %s",
+                    (workspace_id, owner_id),
+                )
         finally:
             self._pool.putconn(conn)
 

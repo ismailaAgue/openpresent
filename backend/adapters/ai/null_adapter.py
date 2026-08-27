@@ -32,3 +32,10 @@ class NullAdapter(AIPort):
 
     def suggest(self, context: str) -> list[str]:
         return []
+
+    def answer_question(self, context: str, question: str) -> str:
+        # The one AIPort method with no meaningful non-AI fallback —
+        # see ports/ai.py's docstring on this method for why an honest
+        # message, not silence or an echo of the input, is the right
+        # degraded behavior here specifically.
+        return "AI is not configured for this deployment, so I can't answer questions about this document."

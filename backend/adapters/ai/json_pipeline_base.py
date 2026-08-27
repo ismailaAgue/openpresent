@@ -96,11 +96,40 @@ class _JSONPipelineMixin:
                 "\nGrounding facts gathered about this topic (use what's relevant, "
                 "ignore what isn't):\n- " + "\n- ".join(research.facts[:8]) + "\n"
             )
+        brand_block = ""
+        # ADR-045 — Brand Memory. Free text the model reads and weighs
+        # alongside everything else here, not a hard constraint it must
+        # satisfy exactly (a "must use these exact colors" instruction
+        # would be a Layout-stage/theme concern, not a Strategy-stage
+        # one — see ports/brand.py's module docstring for the full
+        # scope line on why color mapping isn't wired any deeper than
+        # this yet). An empty/unset brand profile produces this exact
+        # empty string, so a workspace with no brand info gets the
+        # identical prompt this always produced.
+        if request.brand and not request.brand.is_empty():
+            b = request.brand
+            brand_lines = []
+            if b.name:
+                brand_lines.append(f"Brand/organization: {b.name}")
+            if b.tone:
+                brand_lines.append(f"Brand tone: {b.tone}")
+            if b.audience:
+                brand_lines.append(f"Brand's usual audience: {b.audience}")
+            if b.visual_style:
+                brand_lines.append(f"Visual style direction: {b.visual_style}")
+            if b.colors:
+                brand_lines.append(f"Brand colors (context only, not a hard layout constraint): {b.colors}")
+            brand_block = (
+                "\nThis deck is for a workspace with an established brand identity — "
+                "let it inform tone_notes and the overall narrative feel, without "
+                "overriding what actually fits this specific topic:\n"
+                + "\n".join(f"- {line}" for line in brand_lines) + "\n"
+            )
         return (
             "You are the strategist for a presentation-generation pipeline, planning "
             f"a {request.slide_count}-slide deck on: \"{request.topic}\".\n"
             f"Audience: {request.audience_type}. Language: {request.language}. "
-            f"Tone: {request.tone}.\n" + research_block +
+            f"Tone: {request.tone}.\n" + research_block + brand_block +
             "\nChoose the narrative style that best fits this specific topic and "
             f"audience from this list:\n{style_menu}\n\n"
             f"(A randomly-suggested starting candidate is \"{suggested['name']}\" — use it "
@@ -516,6 +545,27 @@ class _TextEnhancementMixin:
         result = [line.strip("- ").strip() for line in raw.splitlines() if line.strip()][:3]
         if not result:
             raise ValueError("model returned no suggestions")
+        return result
+
+    def _answer_question_raising(self, context: str, question: str) -> str:
+        # ADR-050. Explicitly instructed to stay grounded in the given
+        # context rather than answering from general knowledge — the
+        # point of this feature is "what does THIS document say,"
+        # not a general chatbot riding on the document as a pretext.
+        # Truncated to 4000 chars — more generous than build_structure_
+        # prompt's 2000 (an outline-improvement prompt needs less
+        # source material than answering an arbitrary question does),
+        # but still bounded regardless of how large an uploaded
+        # document is, same reasoning as that method, different number.
+        prompt = (
+            "Answer the question using ONLY the information in the document text below. "
+            "If the document doesn't contain enough information to answer, say so plainly "
+            "rather than guessing or using outside knowledge.\n\n"
+            f"Document text:\n{context[:4000]}\n\nQuestion: {question}\n\nAnswer:"
+        )
+        result = self._call_text(prompt).strip()
+        if not result:
+            raise ValueError("model returned an empty answer")
         return result
 
 

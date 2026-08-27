@@ -78,6 +78,70 @@ def test_gemini_strategy_accepts_research_brief_without_erroring():
     assert strategy.narrative_style
 
 
+# -- Brand Memory prompt injection (ADR-045) --------------------------------
+
+def test_strategy_prompt_includes_brand_fields_when_present():
+    from backend.ports.brand import BrandProfile
+    adapter = gemini_with(strategy_json())
+    brand = BrandProfile(workspace_id="ws1", owner_id="u1", name="Acme Corp",
+                          tone="Playful but credible", audience="Enterprise investors",
+                          visual_style="Minimal and clean", colors="Blue and purple")
+    request = GenerationRequest(topic="Photosynthesis", slide_count=3, brand=brand)
+    prompt = adapter._build_strategy_prompt(request, None)
+    assert "Acme Corp" in prompt
+    assert "Playful but credible" in prompt
+    assert "Enterprise investors" in prompt
+    assert "Minimal and clean" in prompt
+    assert "Blue and purple" in prompt
+
+
+def test_strategy_prompt_omits_brand_block_when_brand_is_none():
+    adapter = gemini_with(strategy_json())
+    request = make_request(3)  # brand defaults to None
+    prompt = adapter._build_strategy_prompt(request, None)
+    assert "brand identity" not in prompt.lower()
+
+
+def test_strategy_prompt_omits_brand_block_when_brand_is_empty():
+    """An all-blank BrandProfile (e.g. a workspace where the fields
+    were set then cleared) must produce no brand block, exactly like
+    no brand at all — is_empty() is exactly what makes this true.
+    (Can't compare full prompts for equality since suggest_style()
+    randomizes an unrelated part of the prompt on every call.)"""
+    from backend.ports.brand import BrandProfile
+    adapter = gemini_with(strategy_json())
+    empty_brand = BrandProfile(workspace_id="ws1", owner_id="u1")
+    with_none = GenerationRequest(topic="Photosynthesis", slide_count=3, brand=None)
+    with_empty = GenerationRequest(topic="Photosynthesis", slide_count=3, brand=empty_brand)
+    assert "brand identity" not in adapter._build_strategy_prompt(with_none, None).lower()
+    assert "brand identity" not in adapter._build_strategy_prompt(with_empty, None).lower()
+
+
+def test_strategy_prompt_only_includes_set_brand_fields():
+    """A brand profile with only SOME fields set must not inject
+    placeholder text for the unset ones."""
+    from backend.ports.brand import BrandProfile
+    adapter = gemini_with(strategy_json())
+    brand = BrandProfile(workspace_id="ws1", owner_id="u1", tone="Playful")  # only tone set
+    request = GenerationRequest(topic="Photosynthesis", slide_count=3, brand=brand)
+    prompt = adapter._build_strategy_prompt(request, None)
+    assert "Brand tone: Playful" in prompt
+    assert "Brand colors" not in prompt
+    assert "Visual style direction" not in prompt
+
+
+def test_generate_strategy_end_to_end_with_brand_still_parses_normally():
+    """The brand block only changes the PROMPT sent, not response
+    parsing — confirms end to end that a brand-augmented call still
+    produces a normal, valid PresentationStrategy."""
+    from backend.ports.brand import BrandProfile
+    adapter = gemini_with(strategy_json())
+    brand = BrandProfile(workspace_id="ws1", owner_id="u1", tone="Playful")
+    request = GenerationRequest(topic="Photosynthesis", slide_count=3, brand=brand)
+    strategy = adapter.generate_strategy(request)
+    assert strategy.narrative_style == "Classic Narrative"
+
+
 # -- Stage 2: Outline structure ---------------------------------------------
 
 def test_gemini_generates_outline_structure():
@@ -463,6 +527,49 @@ def test_composite_suggest_degrades_to_empty_list_when_all_fail():
 
     composite = CompositeAIAdapter([GeminiAdapter(api_key="fake-key", http_post=fake_post_fail)])
     assert composite.suggest("some context") == []
+
+
+# -- answer_question cascade (ADR-050, v3 Phase 7) -----------------------
+
+def test_composite_answer_question_cascades_to_working_provider():
+    def fake_post_fail(url, body, timeout):
+        return {"candidates": []}
+
+    def fake_post_succeed(url, body, timeout):
+        return {"candidates": [{"content": {"parts": [{"text": "The answer is 42."}]}}]}
+
+    failing = GeminiAdapter(api_key="fake-key", http_post=fake_post_fail)
+    working = GeminiAdapter(api_key="fake-key", http_post=fake_post_succeed)
+    composite = CompositeAIAdapter([failing, working])
+    result = composite.answer_question("some document text", "What is the answer?")
+    assert result == "The answer is 42."
+
+
+def test_composite_answer_question_degrades_to_honest_message_when_all_fail():
+    """Confirms the cascade's degraded_default for this method is the
+    same explicit 'AI not configured' sentence NullAdapter itself
+    returns — not the generic 'echo the input back' degrade every
+    other _cascade_text call uses, since there's no sensible echo for
+    a Q&A answer."""
+    def fake_post_fail(url, body, timeout):
+        return {"candidates": []}
+
+    composite = CompositeAIAdapter([
+        GeminiAdapter(api_key="fake-key", http_post=fake_post_fail),
+        GeminiAdapter(api_key="fake-key", http_post=fake_post_fail),
+    ])
+    result = composite.answer_question("some document text", "a question")
+    assert "not configured" in result.lower()
+
+
+def test_composite_answer_question_no_providers_available():
+    class NeverAvailable:
+        def is_available(self):
+            return False
+
+    composite = CompositeAIAdapter([NeverAvailable()])
+    result = composite.answer_question("doc text", "a question")
+    assert "not configured" in result.lower()
 
 
 # -- AIPort invisible-failure logging (ADR-033 regression, other half) --

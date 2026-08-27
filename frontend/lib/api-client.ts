@@ -60,6 +60,7 @@ export interface DocumentGenerateOptions {
   audienceType?: string;
   language?: string;
   targetSlideCount?: number;
+  workspaceId?: string | null;  // ADR-044
 }
 
 export interface SyncGenerateResult {
@@ -96,6 +97,7 @@ export interface TopicGenerateOptions {
   language?: string;
   tone?: string;
   exportFormat?: string;
+  workspaceId?: string | null;  // ADR-044
 }
 
 function topicRequestBody(opts: TopicGenerateOptions) {
@@ -106,6 +108,7 @@ function topicRequestBody(opts: TopicGenerateOptions) {
     language: opts.language ?? "en",
     tone: opts.tone ?? "professional",
     export_format: opts.exportFormat ?? "pptx",
+    workspace_id: opts.workspaceId ?? null,
   };
 }
 
@@ -138,6 +141,7 @@ export async function generateAsync(file: File, opts: DocumentGenerateOptions = 
     language: opts.language ?? "en",
   });
   if (opts.targetSlideCount) params.set("target_slide_count", String(opts.targetSlideCount));
+  if (opts.workspaceId) params.set("workspace_id", opts.workspaceId);
   const res = await fetch(`${API_BASE}/generate/async?${params.toString()}`, {
     method: "POST",
     headers: authHeaders(),
@@ -155,8 +159,9 @@ export async function getJobStatus(jobId: string) {
     slide_count?: number; project_id?: string; error?: string;
     quality_score?: number; quality_issues?: string[];
     // ADR-040 — best-effort live progress; present only while status is
-    // "running", and only for topic generation (not document upload) as
-    // of this backend version.
+    // "running". Both job types (topic generation and document upload)
+    // report it, though the document path reports fewer of the 6 shared
+    // stage labels since its pipeline has less internal structure.
     stage?: string;
   }>;
 }
@@ -169,13 +174,115 @@ export interface ProjectSummary {
   project_id: string;
   title: string;
   updated_at: number;
+  workspace_id?: string | null;  // ADR-044
 }
 
-export async function listProjects(): Promise<ProjectSummary[]> {
-  const res = await fetch(`${API_BASE}/projects`, { headers: authHeaders() });
+export async function listProjects(workspaceId?: string): Promise<ProjectSummary[]> {
+  const url = workspaceId ? `${API_BASE}/projects?workspace_id=${workspaceId}` : `${API_BASE}/projects`;
+  const res = await fetch(url, { headers: authHeaders() });
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (res.status === 404) throw new Error("Workspace not found");
   if (!res.ok) throw new Error("Could not load your projects");
   return res.json();
+}
+
+// -- Workspaces (ADR-044) -------------------------------------------------
+
+export interface WorkspaceSummary {
+  workspace_id: string;
+  name: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export async function listWorkspaces(): Promise<WorkspaceSummary[]> {
+  const res = await fetch(`${API_BASE}/workspaces`, { headers: authHeaders() });
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (!res.ok) throw new Error("Could not load your workspaces");
+  return res.json();
+}
+
+export async function createWorkspace(name: string): Promise<WorkspaceSummary> {
+  const res = await fetch(`${API_BASE}/workspaces`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error((await res.json()).detail || "Could not create workspace");
+  return res.json();
+}
+
+export async function getWorkspace(workspaceId: string) {
+  const res = await fetch(`${API_BASE}/workspaces/${workspaceId}`, { headers: authHeaders() });
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (res.status === 404) throw new Error("Workspace not found");
+  if (!res.ok) throw new Error("Could not load workspace");
+  return res.json() as Promise<{
+    workspace_id: string; name: string; created_at: number; updated_at: number;
+    projects: { project_id: string; title: string; updated_at: number }[];
+  }>;
+}
+
+export async function renameWorkspace(workspaceId: string, name: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/workspaces/${workspaceId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error((await res.json()).detail || "Could not rename workspace");
+}
+
+export async function deleteWorkspace(workspaceId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/workspaces/${workspaceId}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json()).detail || "Could not delete workspace");
+}
+
+// -- Brand Memory (ADR-045) ------------------------------------------------
+
+export interface BrandProfile {
+  workspace_id: string;
+  name: string;
+  colors: string;
+  tone: string;
+  audience: string;
+  visual_style: string;
+  updated_at?: number;
+}
+
+export async function getBrandProfile(workspaceId: string): Promise<BrandProfile> {
+  const res = await fetch(`${API_BASE}/workspaces/${workspaceId}/brand`, { headers: authHeaders() });
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (res.status === 404) throw new Error("Workspace not found");
+  if (!res.ok) throw new Error("Could not load brand profile");
+  return res.json();
+}
+
+export async function setBrandProfile(workspaceId: string, profile: {
+  name?: string; colors?: string; tone?: string; audience?: string; visual_style?: string;
+}): Promise<BrandProfile> {
+  const res = await fetch(`${API_BASE}/workspaces/${workspaceId}/brand`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    // ADR-045: this is a whole-record replace at the API/port level,
+    // not a partial patch — always send the full form.
+    body: JSON.stringify({
+      name: profile.name ?? "", colors: profile.colors ?? "", tone: profile.tone ?? "",
+      audience: profile.audience ?? "", visual_style: profile.visual_style ?? "",
+    }),
+  });
+  if (!res.ok) throw new Error((await res.json()).detail || "Could not save brand profile");
+  return res.json();
+}
+
+export async function deleteBrandProfile(workspaceId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/workspaces/${workspaceId}/brand`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json()).detail || "Could not clear brand profile");
 }
 
 export async function getProject(projectId: string) {
