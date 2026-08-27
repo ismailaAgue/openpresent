@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-multipart
+pypdf
+python-pptx
+python-docx
+pytest
+psycopg2-binary
+sentry-sdk
+httpx2
+# httpx2 above is required by starlette.testclient.TestClient (used in
+# tests/integration/test_api_http.py for real HTTP-level integration
+# tests) — not used by application code at runtime, only by the test
+# suite. Kept in this single requirements.txt rather than a separate
+# dev-requirements file, matching this project's existing convention
+# (pytest is already here for the same reason).

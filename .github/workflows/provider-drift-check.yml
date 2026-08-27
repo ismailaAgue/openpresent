@@ -1,0 +1,150 @@
+name: Live Provider Drift Check
+
+# ADR-036. Runs tests/smoke/test_live_provider_drift.py against REAL
+# provider APIs using REAL credentials (GitHub Actions secrets) — this
+# is the automated version of what previously only happened by a human
+# reading production error logs after a real user hit a stale model
+# name or a deprecated endpoint (ADR-031/033/034).
+#
+# Deliberately a SEPARATE workflow from ci.yml: this one needs secrets
+# and real network access, runs on a schedule rather than every push,
+# and its failures mean "a third-party provider changed something,"
+# not "a code change broke something" — those are different signals
+# that deserve different treatment (an issue to investigate, not a
+# blocked PR).
+#
+# Every job step is skip-safe: any secret you haven't configured in
+# this repo's Settings -> Secrets and variables -> Actions just means
+# that provider's tests skip (see test_live_provider_drift.py's
+# _require_env) rather than fail — this workflow degrades exactly like
+# every provider in the app itself does.
+
+on:
+  schedule:
+    # Daily at 06:00 UTC. Adjust to taste — daily is frequent enough to
+    # catch a deprecation within a day of it happening (see ADR-034:
+    # Gemini's shutdown notice period was measured in months, but
+    # OpenRouter's free-tier churn was measured in DAYS, which is the
+    # more urgent case this schedule is tuned for).
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}  # manual "Run workflow" button for on-demand checks
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run live provider smoke tests
+        id: smoke_tests
+        run: PYTHONPATH=. python -m pytest tests/smoke/ -v --tb=short 2>&1 | tee smoke_test_output.txt
+        env:
+          # Every one of these is optional — unset ones just mean that
+          # provider's tests skip. Configure whichever you actually
+          # use in Settings -> Secrets and variables -> Actions.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          HUGGINGFACE_API_KEY: ${{ secrets.HUGGINGFACE_API_KEY }}
+          OPENPRESENT_UNSPLASH_ACCESS_KEY: ${{ secrets.OPENPRESENT_UNSPLASH_ACCESS_KEY }}
+          OPENPRESENT_PEXELS_API_KEY: ${{ secrets.OPENPRESENT_PEXELS_API_KEY }}
+          OPENPRESENT_PIXABAY_API_KEY: ${{ secrets.OPENPRESENT_PIXABAY_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
+
+      - name: Read test output for issue filing
+        if: always()
+        id: read_output
+        run: |
+          {
+            echo 'content<<DRIFT_EOF'
+            tail -c 60000 smoke_test_output.txt
+            echo 'DRIFT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: File or update a GitHub issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = "provider-drift";
+            const title = "🔴 Live provider drift detected";
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `The scheduled live provider drift check failed on ${new Date().toISOString().slice(0, 10)}.`,
+              ``,
+              `**Run:** ${runUrl}`,
+              ``,
+              `This means at least one AI/image/research provider's API has changed in a way`,
+              `this codebase doesn't handle yet — a deprecated model, a changed response shape,`,
+              `an auth change, etc. Same failure family as ADR-031/033/034: check the run's`,
+              `logs for the specific provider and error, fix the same way those were fixed`,
+              `(usually a config default + a regression test in tests/contract/), then close`,
+              `this issue — it will reopen automatically if the check fails again.`,
+              ``,
+              `<details><summary>Test output (truncated)</summary>`,
+              ``,
+              "```",
+              `${{ steps.read_output.outputs.content }}`,
+              "```",
+              `</details>`,
+            ].join("\n");
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: label,
+            });
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body: `Still failing as of this run.\n\n${body}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: [label],
+              });
+            }
+
+      - name: Close the drift issue if it's now passing
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = "provider-drift";
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: label,
+            });
+            for (const issue of open.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: "Live provider drift check is passing again — closing automatically.",
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: "closed",
+              });
+            }

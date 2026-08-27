@@ -1,0 +1,69 @@
+name: CI
+
+# ADR-036. Runs on every push and every pull request — this is what
+# turns "241 tests pass" from a claim someone has to run by hand into
+# something actually enforced. Deliberately requires ZERO secrets:
+# the entire test suite (tests/contract, tests/integration) is
+# hermetic by design — every AI/media/research provider is either
+# mocked or forced off via autouse fixtures (see
+# tests/integration/test_api_http.py's reset_all_registry_singletons)
+# — so this workflow can run on any fork, any PR from an external
+# contributor, with no API keys ever exposed to CI.
+#
+# Live provider drift detection is deliberately a SEPARATE workflow
+# (provider-drift-check.yml) — it needs real API keys and runs on a
+# schedule, not on every push, since third-party API availability is
+# not something a code push should be blocked on.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the full hermetic test suite
+        # Explicitly excludes tests/smoke/ — two of its checks
+        # (Wikipedia/Wikimedia) need no API key and would otherwise
+        # run here too, making this job depend on live third-party
+        # availability on every single push, which is exactly what
+        # this workflow is designed NOT to do. Live checks belong only
+        # in provider-drift-check.yml's scheduled run.
+        run: PYTHONPATH=. python -m pytest tests/ --ignore=tests/smoke -v --durations=10
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
