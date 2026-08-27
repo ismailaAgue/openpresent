@@ -21,6 +21,7 @@ restarts, while a separate managed Postgres instance is.
 """
 
 import os
+import threading
 from backend.adapters.ingestion.txt_adapter import TxtIngestionAdapter
 from backend.adapters.ingestion.pdf_adapter import PdfIngestionAdapter
 from backend.adapters.structure.rule_based import RuleBasedStructureAdapter
@@ -40,6 +41,16 @@ from backend.adapters.research.composite_research import CompositeResearchAdapte
 from backend.adapters.design.rule_based import RuleBasedDesignAdapter
 from backend.adapters.export.pptx_adapter import PptxExportAdapter
 from backend.adapters.export.docx_notes_adapter import SpeakerNotesDocxExportAdapter
+from backend.adapters.export.document_docx_adapter import DocumentDocxExportAdapter
+from backend.adapters.export.infographic_svg_adapter import InfographicSvgExportAdapter
+from backend.adapters.export.diagram_svg_adapter import DiagramSvgExportAdapter
+from backend.adapters.export.poster_svg_adapter import PosterSvgExportAdapter
+from backend.adapters.quota.sqlite_adapter import SqliteQuotaAdapter
+from backend.adapters.quota.postgres_quota import PostgresQuotaAdapter
+from backend.adapters.workspace.sqlite_adapter import SqliteWorkspaceAdapter
+from backend.adapters.workspace.postgres_workspace import PostgresWorkspaceAdapter
+from backend.adapters.brand.sqlite_adapter import SqliteBrandAdapter
+from backend.adapters.brand.postgres_brand import PostgresBrandAdapter
 from backend.adapters.queue.sqlite_adapter import SqliteQueueAdapter
 from backend.adapters.queue.postgres_queue import PostgresQueueAdapter
 from backend.adapters.storage.sqlite_storage import SqliteStorageAdapter
@@ -58,7 +69,19 @@ from backend.adapters.media.wikimedia_adapter import WikimediaProvider
 _INGESTION_ADAPTERS = [TxtIngestionAdapter(), PdfIngestionAdapter()]
 _STRUCTURE_ADAPTER = RuleBasedStructureAdapter()
 _DESIGN_ADAPTER = RuleBasedDesignAdapter()
-_EXPORT_ADAPTERS = {"pptx": PptxExportAdapter()}
+_EXPORT_ADAPTERS = {
+    "pptx": PptxExportAdapter(),
+    # ADR-041 (v3 Phase 3) — a real, standalone selectable format, not
+    # just the notes_docx companion (which stays wired directly into
+    # export_bundle.py, not this map, since it's never chosen on its own).
+    "document_docx": DocumentDocxExportAdapter(),
+    # ADR-046 (v3 Phase 6) — first render target that isn't PPTX/DOCX.
+    "infographic_svg": InfographicSvgExportAdapter(),
+    # ADR-047 (v3 Phase 6) — second render target, linear process flow.
+    "diagram_svg": DiagramSvgExportAdapter(),
+    # ADR-048 (v3 Phase 6) — third and final render target, posters/social graphics.
+    "poster_svg": PosterSvgExportAdapter(),
+}
 
 _ai_adapter_instance = None
 _queue_adapter_instance = None
@@ -67,6 +90,31 @@ _auth_adapter_instance = None
 _analytics_adapter_instance = None
 _media_adapter_instance = None
 _research_adapter_instance = None
+_quota_adapter_instance = None
+_workspace_adapter_instance = None
+_brand_adapter_instance = None
+
+# ADR-042: guards get_queue_adapter()'s lazy singleton init specifically.
+# The plain "if X is None: X = ..." pattern every get_*_adapter() here
+# uses is a classic non-atomic check-then-set race under real threading
+# — normally harmless (production has exactly one long-lived worker
+# thread created once at startup), but became a real, reproducible
+# source of test flakiness once multiple worker threads could exist
+# briefly at once (see the fix in api/main.py's _lifespan/_in_process_
+# worker_loop for why that no longer happens either — this lock is
+# belt-and-suspenders on top of that, not a replacement for it). Scoped
+# to just the queue adapter, the one actually implicated by a real
+# failure, rather than every getter in this file speculatively — the
+# same race is structurally possible on the others too if a future
+# caller ever creates adapters from more than one thread, worth
+# revisiting then rather than guessing at the shape of that now.
+_queue_adapter_lock = threading.Lock()
+# ADR-043 — same lazy-singleton race the queue getter had (ADR-042),
+# guarded from the start this time instead of discovered via a flaky
+# test, since it's the same pattern with the same known failure mode.
+_quota_adapter_lock = threading.Lock()
+_workspace_adapter_lock = threading.Lock()
+_brand_adapter_lock = threading.Lock()
 
 
 def _database_url() -> str | None:
@@ -187,12 +235,14 @@ def get_export_adapter(format_id: str):
 def get_queue_adapter():
     global _queue_adapter_instance
     if _queue_adapter_instance is None:
-        db_url = _database_url()
-        if db_url:
-            _queue_adapter_instance = PostgresQueueAdapter(db_url)
-        else:
-            db_path = os.environ.get("OPENPRESENT_QUEUE_DB", ":memory:")
-            _queue_adapter_instance = SqliteQueueAdapter(db_path)
+        with _queue_adapter_lock:
+            if _queue_adapter_instance is None:  # re-check: lost the race while acquiring the lock
+                db_url = _database_url()
+                if db_url:
+                    _queue_adapter_instance = PostgresQueueAdapter(db_url)
+                else:
+                    db_path = os.environ.get("OPENPRESENT_QUEUE_DB", ":memory:")
+                    _queue_adapter_instance = SqliteQueueAdapter(db_path)
     return _queue_adapter_instance
 
 
@@ -308,3 +358,54 @@ def get_research_adapter():
 
             _research_adapter_instance = CompositeResearchAdapter(providers)
     return _research_adapter_instance
+
+
+def get_quota_adapter():
+    """ADR-043 — cost circuit breaker. Same Postgres-if-DATABASE_URL-set,
+    SQLite-otherwise pattern as get_queue_adapter(), including the
+    double-checked-locking fix from ADR-042 applied from the start here."""
+    global _quota_adapter_instance
+    if _quota_adapter_instance is None:
+        with _quota_adapter_lock:
+            if _quota_adapter_instance is None:
+                db_url = _database_url()
+                if db_url:
+                    _quota_adapter_instance = PostgresQuotaAdapter(db_url)
+                else:
+                    db_path = os.environ.get("OPENPRESENT_QUOTA_DB", ":memory:")
+                    _quota_adapter_instance = SqliteQuotaAdapter(db_path)
+    return _quota_adapter_instance
+
+
+def get_workspace_adapter():
+    """ADR-044 — Project Workspace. Same Postgres-if-DATABASE_URL-set,
+    SQLite-otherwise pattern, with the double-checked-locking fix
+    applied from the start (ADR-042/043 precedent)."""
+    global _workspace_adapter_instance
+    if _workspace_adapter_instance is None:
+        with _workspace_adapter_lock:
+            if _workspace_adapter_instance is None:
+                db_url = _database_url()
+                if db_url:
+                    _workspace_adapter_instance = PostgresWorkspaceAdapter(db_url)
+                else:
+                    db_path = os.environ.get("OPENPRESENT_WORKSPACE_DB", ":memory:")
+                    _workspace_adapter_instance = SqliteWorkspaceAdapter(db_path)
+    return _workspace_adapter_instance
+
+
+def get_brand_adapter():
+    """ADR-045 — Brand Memory. Same Postgres-if-DATABASE_URL-set,
+    SQLite-otherwise pattern, with the double-checked-locking fix
+    applied from the start (ADR-042/043/044 precedent)."""
+    global _brand_adapter_instance
+    if _brand_adapter_instance is None:
+        with _brand_adapter_lock:
+            if _brand_adapter_instance is None:
+                db_url = _database_url()
+                if db_url:
+                    _brand_adapter_instance = PostgresBrandAdapter(db_url)
+                else:
+                    db_path = os.environ.get("OPENPRESENT_BRAND_DB", ":memory:")
+                    _brand_adapter_instance = SqliteBrandAdapter(db_path)
+    return _brand_adapter_instance

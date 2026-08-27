@@ -36,6 +36,7 @@ from typing import Callable
 from backend.adapters import registry
 from backend.models.recipe import Recipe, Theme
 from backend.ports.ai_pipeline import GenerationRequest, QualityReport
+from backend.ports.brand import BrandProfile
 from backend.ports.export import UnsupportedFormatError
 from backend.pipeline.deterministic_topic_outline import build_deterministic_outline
 from backend.pipeline.variety import pick_theme_variant
@@ -77,6 +78,7 @@ def generate_presentation_from_topic(
     export_format: str = "pptx",
     project_id: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    brand: BrandProfile | None = None,  # ADR-045 — optional, purely additive
 ) -> tuple[Recipe, bytes, QualityReport]:
     if not topic or not topic.strip():
         raise ValueError("topic must not be empty")
@@ -85,6 +87,7 @@ def generate_presentation_from_topic(
     request = GenerationRequest(
         topic=topic.strip(), slide_count=slide_count,
         audience_type=audience_type, language=language, tone=tone,
+        brand=brand,
     )
 
     _report(on_stage, STAGE_UNDERSTANDING)

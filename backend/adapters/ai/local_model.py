@@ -101,6 +101,16 @@ class LocalModelAdapter(_JSONPipelineMixin, _TextEnhancementMixin, AIPort, AIPip
                                         "provider": "LocalModelAdapter"})
             return []
 
+    def answer_question(self, context: str, question: str) -> str:
+        if not self.is_available():
+            return "AI is not configured for this deployment, so I can't answer questions about this document."
+        try:
+            return self._answer_question_raising(context, question)
+        except Exception as e:
+            capture_exception(e, tags={"stage": "ai_port", "method": "answer_question",
+                                        "provider": "LocalModelAdapter"})
+            return "The AI provider couldn't answer that question right now — please try again."
+
     # -- AIPipelinePort (ADR-028/031: local models can also serve
     # topic-first generation — "local models preferred when available"
     # in the provider priority list). All five AIPipelinePort stage

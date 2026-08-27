@@ -44,6 +44,17 @@ def test_null_adapter_passes_outline_through_unmodified():
     assert result is outline
 
 
+def test_null_adapter_answer_question_returns_honest_unavailable_message():
+    """The one AIPort method with no meaningful non-AI degradation —
+    NullAdapter must say so explicitly, not return an empty string or
+    silently echo the question/context back."""
+    answer = NullAdapter().answer_question("some document text", "What does this say?")
+    assert "not configured" in answer.lower()
+    assert answer != ""
+    assert answer != "some document text"  # not an echo of the context
+    assert answer != "What does this say?"  # not an echo of the question
+
+
 # -- LocalModelAdapter: unreachable server -> graceful degradation, never raises --
 
 def test_local_model_unreachable_reports_unavailable():
@@ -64,6 +75,7 @@ def test_local_model_unreachable_falls_back_on_all_methods():
     assert adapter.translate("hello", "fr") == "hello"
     assert adapter.summarize("hello world", max_length=5) == "hello"
     assert adapter.suggest("context") == []
+    assert "not configured" in adapter.answer_question("doc text", "question?").lower()
 
 
 # -- LocalModelAdapter: reachable, well-formed response --
@@ -99,3 +111,32 @@ def test_local_model_server_error_falls_back_to_baseline():
     outline = make_outline()
     result = adapter.propose_structure(outline, "source text")
     assert result is outline
+
+
+# -- answer_question (ADR-050, v3 Phase 7) -------------------------------
+
+def test_local_model_answer_question_returns_model_response_when_available():
+    client = FakeHttpClient(generate_response="The three stages are evaporation, condensation, and precipitation.")
+    adapter = LocalModelAdapter(http_client=client)
+    answer = adapter.answer_question("The water cycle has three stages...", "What are the stages?")
+    assert answer == "The three stages are evaporation, condensation, and precipitation."
+
+
+def test_local_model_answer_question_degrades_on_server_error():
+    """Unlike rewrite/translate/summarize (which fall back to the
+    unmodified input), there's no sensible 'unmodified input' for a
+    Q&A answer — the degraded response must be an honest statement
+    that the provider failed, not an empty string or a raised
+    exception reaching the caller."""
+    client = FakeHttpClient(generate_status=500)
+    adapter = LocalModelAdapter(http_client=client)
+    answer = adapter.answer_question("doc text", "a question")
+    assert answer != ""
+    assert "couldn't" in answer.lower() or "not configured" in answer.lower()
+
+
+def test_local_model_answer_question_degrades_on_empty_model_response():
+    client = FakeHttpClient(generate_response="")
+    adapter = LocalModelAdapter(http_client=client)
+    answer = adapter.answer_question("doc text", "a question")
+    assert answer != ""  # never surfaces a blank answer to the caller

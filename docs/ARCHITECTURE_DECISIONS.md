@@ -747,28 +747,971 @@ and deliberately never fabricated for a state that isn't actually
 running.
 
 **Scope limits, stated plainly:**
-1. Only `generate_presentation_from_topic` (topic mode) reports real
-   stages. `generate_presentation` (document-upload mode, `engines/
-   generate.py`) does not yet — the studio frontend's document-mode
-   step indicators are still the cosmetic timer. Flagged, not silently
-   left inconsistent.
+1. ~~Only `generate_presentation_from_topic` (topic mode) reports real
+   stages.~~ **Closed same-session:** `generate_presentation`
+   (document-upload mode, `engines/generate.py`) now also takes an
+   `on_stage` callback and reports 4 of the 6 shared labels
+   (`understanding_request → building_outline → generating_content →
+   applying_design` — it skips `designing_slides`/`selecting_visuals`
+   because that pipeline genuinely has no separate layout-planning or
+   image-selection call to report on; padding in stages that don't
+   correspond to real work would make the indicator lie in the other
+   direction). `generating_content` itself only fires when an AI
+   adapter is actually available, since with `NullAdapter` there is no
+   content-generation step to report. `GET /jobs/{id}`'s `stage` field
+   is job-type-agnostic — no endpoint change was needed, it already
+   read `job.stage` generically.
 2. `on_stage` is explicitly best-effort: every call site wraps it in a
    try/except that reports to Sentry/Bugsink and swallows the error —
    a broken progress sink must never break or slow an otherwise-
-   successful generation. Covered by a dedicated test (see below).
+   successful generation. Covered by a dedicated test for each engine.
 3. No new database tables, no brand memory, no document/infographic/
    diagram generation yet — see `V3_ROADMAP.md` (delivered alongside
-   this ADR) for the full phased plan. This entry is Phase 1 + a slice
-   of Phase 2 from that roadmap, not the whole thing.
+   this ADR) for the full phased plan. This entry is Phase 1 + Phase 2
+   from that roadmap, not the whole thing.
 
-**Status:** Accepted. 9 new tests: 4 on `SqliteQueueAdapter.
+**Status:** Accepted. 12 new tests total: 4 on `SqliteQueueAdapter.
 update_stage` (sets/reads correctly, silent no-op on an unknown job
-id, survives into a completed job's record), 3 on the engine's
+id, survives into a completed job's record), 3 on the topic engine's
 `on_stage` orchestration (full 6-stage order on the AI path, correct
-2-stage-fewer sequence on deterministic fallback, and a callback that
-raises never breaks generation), 2 HTTP-level (`stage` present and
-correct while running, absent once done). Full suite: 292/292 passing.
-Frontend typechecks and builds clean (`/studio` route confirmed in
-build output).
+shorter sequence on deterministic fallback, callback-raises-survives),
+3 on the document engine's `on_stage` orchestration (4-stage order
+with AI available, 3-stage order without, callback-raises-survives),
+2 HTTP-level (`stage` present and correct while running, absent once
+done). Full suite: 295/295 passing. Frontend typechecks and builds
+clean (`/studio` route confirmed in build output).
 
 *Next entry: ADR-041.*
+
+## ADR-041 — Documents as a Second Output Type (v3 Phase 3)
+
+**Context:** v3 roadmap Phase 3: reuse the existing 5-stage pipeline
+and Recipe/Outline model for a genuinely different deliverable — a
+real Word document (proposal, report, exec summary) instead of a
+slide deck — rather than building a parallel document-generation
+system. The roadmap's own framing was "only Layout/Export differ,"
+and that held up exactly as expected: no changes to Strategy, Outline
+Structure, Slide Content, Layout Planning, or Quality Review were
+needed anywhere.
+
+**Decision:** new `DocumentDocxExportAdapter`
+(`backend/adapters/export/document_docx_adapter.py`, format_id
+`document_docx`), registered in `registry._EXPORT_ADAPTERS` alongside
+`pptx`. It consumes the exact same `Recipe` every other export format
+does. No new endpoint, no new job type, no new request field beyond
+the `export_format` string every generation endpoint already accepted
+— `export_format="document_docx"` on `/generate/topic`,
+`/generate/topic/async`, `/generate`, `/generate/async`, or
+`/projects/{id}/export` just works.
+
+This is deliberately a different thing from the existing
+`SpeakerNotesDocxExportAdapter` (`docx_notes_adapter.py`, ADR-030):
+that one is a presenter's companion aid, framed around slides
+("Slide 3: ...", "On-slide content:"). This adapter is meant to BE
+the deliverable — a document a reader opens and reads top to bottom
+with no reference to slides anywhere in it. Each `Slide` becomes a
+document section (title → heading, bullets → either a real Word
+bullet list or, when a section is a single sentence-length bullet,
+folded into a plain paragraph instead — deliberately conservative
+about forcing every bullet into prose, since that's a common way
+AI-authored documents read worse than a well-formatted list, not
+better). Speaker notes are intentionally never rendered — they exist
+for someone reading a deck aloud, which has no meaning once the
+document itself is the deliverable.
+
+**A real latent bug found and fixed while wiring this in:** every
+filename-generating call site in `api/main.py`
+(`/generate/topic`, `/generate/topic/async`'s job-download route,
+`/generate`, and `/projects/{id}/export`) built the download filename
+as `f'presentation.{export_format}'` — harmless while `pptx` was the
+only registered format (`presentation.pptx`), silently wrong the
+moment a second format existed (`presentation.document_docx` is not a
+filename anyone recognizes). Added `_download_filename()` and
+`_MEDIA_TYPES["document_docx"]`, fixed all 4 call sites. The existing
+`bundle_speaker_notes` guard was already correctly keyed to
+`export_format == "pptx"` specifically (not "truthy bundle flag"), so
+document exports were never at risk of being incorrectly zipped with
+a speaker-notes companion that makes no sense for them — confirmed by
+test, not just read.
+
+**Status:** Accepted. 8 new adapter-level tests
+(`tests/contract/test_document_docx_adapter.py`) covering format_id,
+valid-docx output, title-page-not-slide-1-heading framing, section
+headings present, single-sentence-bullet-becomes-paragraph, multi-
+bullet-stays-a-list, notes never rendered, and an empty outline still
+producing a valid (if minimal) document. 3 new HTTP-level tests
+covering sync generation, the bundling guard correctly skipping this
+format, and a full async round trip through job polling and download.
+
+*Next entry: ADR-042.*
+
+## ADR-042 — Worker Thread Graceful Shutdown (found while testing ADR-041)
+
+**Context:** discovered, not designed for — the new document-export
+HTTP tests exposed an existing test (`test_jobs_endpoint_surfaces_
+stage_while_running`, from ADR-040) intermittently failing with a 404
+on a job that had genuinely just been enqueued. Root cause traced to
+`_in_process_worker_loop` (`api/main.py`): the code's own prior
+comment said it plainly — *"Nothing runs on shutdown; the daemon
+thread is killed with the process."* True and harmless in production
+(one process, one worker thread, for its whole lifetime), but every
+test using `with TestClient(app) as client:` triggers a fresh
+lifespan startup, spawning a new daemon worker thread each time —
+and since none of them ever stopped, a test suite with many HTTP
+tests accumulated an increasing number of zombie threads over a
+single pytest run, all still looping `process_one_job()` and all
+calling `registry.get_queue_adapter()` every iteration.
+
+That getter's lazy-singleton pattern (`if _instance is None: _instance
+= ...`) is a classic non-atomic check-then-set race under real
+threading. With enough zombie threads calling it concurrently right
+as each test's autouse fixture reset the singleton to `None`, a
+zombie thread from an *earlier* test could occasionally win the
+re-initialization race for the *current* test's registry state —
+leaving the test's own `queue` variable and the API route handler's
+`registry.get_queue_adapter()` call pointing at two different
+in-memory SQLite databases, hence the 404 (right endpoint, wrong
+database, job genuinely didn't exist there).
+
+**Decision:** two fixes, addressing both the leak and the underlying
+race it was surfacing:
+1. `_in_process_worker_loop` now takes a `threading.Event` and checks
+   it every iteration (via `Event.wait()` instead of `time.sleep()`,
+   so a stop request interrupts the wait immediately). `_lifespan`
+   creates the event, starts the thread as before, and on shutdown
+   (after `yield`) sets the event and joins the thread with a 5s
+   timeout — bounded so a single unusually-slow in-flight job can
+   never hang app shutdown forever.
+2. `registry.get_queue_adapter()` — the one getter actually implicated
+   by a real, reproduced failure — now guards its lazy init with a
+   `threading.Lock` and a double-checked-locking pattern, closing the
+   race directly rather than relying solely on "there should only
+   ever be one thread calling this" now being true again.
+
+**Scope, stated plainly:** fix #2 is deliberately narrow — only
+`get_queue_adapter()`, not all seven `get_*_adapter()` singleton
+getters in `registry.py`, all of which share the same non-atomic
+pattern and are structurally exposed to the identical race if a
+future caller ever creates adapters from more than one thread. Not
+fixed speculatively here since only the queue getter has an actual
+reproduced failure behind it; worth a dedicated pass if/when a second
+one does.
+
+**Status:** Accepted. No new dedicated unit test for the threading fix
+itself (reliably unit-testing a race condition's *absence* without a
+flaky or artificially slow test is its own can of worms, not worth
+opening for this) — verified instead by running the full suite 5
+consecutive times end-to-end, 306/306 passing every time, where
+before this fix `test_jobs_endpoint_surfaces_stage_while_running`
+failed roughly 1 run in 3. Frontend typechecks and builds clean, `/studio` unaffected by either
+change in this entry.
+
+*Next entry: ADR-043.*
+
+## ADR-043 — Cost Circuit Breaker
+
+**Context:** the #1 item in the original project handoff doc's
+"actually risky right now" list, present before v3 work began: *"A
+single generation can now trigger 6+ AI calls (strategy/outline/
+content/layout/review/research), and editing/regeneration adds more
+on top. Nothing caps spend."* Adding a second output type (ADR-041)
+made this strictly worse — every format multiplies the same uncapped
+surface, not just presentations. The v3 roadmap itself flagged this
+as something that should happen "before Phase 3 ships"; it's landing
+right after instead, which is late relative to that intent but still
+before Phase 4+ adds further surface.
+
+**Decision:** new `QuotaPort` (`backend/ports/quota.py`) — deliberately
+just a fixed-window counter, not a general rate limiter (no burst
+logic, no leaky bucket, no IP-based abuse heuristics). The port's only
+job is "how many attempts landed here in this window" — policy (what
+limit, what to do when exceeded) lives entirely in the caller
+(`api/main.py`), not the port, matching this codebase's existing
+separation between ports (mechanism) and engines/API (policy).
+`SqliteQuotaAdapter`/`PostgresQuotaAdapter` mirror the existing queue
+adapters' structure exactly, including applying the ADR-042 lesson
+from the start this time: `get_quota_adapter()` uses the same
+double-checked-locking pattern as the now-fixed `get_queue_adapter()`,
+rather than waiting to discover the same race independently.
+
+All 4 generation endpoints (`/generate`, `/generate/topic`,
+`/generate/async`, `/generate/topic/async`) call
+`_enforce_generation_quota(user, request)` as the very first thing
+after resolving the caller's identity — before file reads, before any
+AI/export work, before the async path even enqueues a job. A rejected
+request costs one counter increment and nothing else. Signed-in users
+are keyed by `user.id` (default cap 30/day); anonymous callers are
+keyed by IP (default cap 5/day, deliberately lower since anonymous
+abuse can't be followed up on the way an account can). Both caps are
+env-var configurable (`OPENPRESENT_DAILY_GENERATION_LIMIT_USER`/
+`_ANON`) and read at call time, not baked into a module-level constant
+at import — a real bug caught by the tests themselves (see below).
+Window is a fixed 24h bucket keyed to the UTC calendar day, not a
+rolling window — simpler to reason about and to explain to a user
+("resets at midnight UTC") than a sliding one, and precision here
+doesn't need to be tighter than that for a cost cap.
+
+**A real bug the tests caught, not designed around from the start:**
+the first version read the two limit env vars into module-level
+constants (`GENERATION_LIMIT_USER = int(os.environ.get(...))`) at
+`api/main.py` import time. `monkeypatch.setenv` in a test — or any
+config change in production without a full process restart — would
+silently have no effect, since the constant was already baked in
+before the env var changed. All 3 of the first HTTP-level quota tests
+failed on first run with exactly this symptom (asserted 429, got 200).
+Fixed by reading the env vars inside small helper functions
+(`_generation_limit_user()`/`_generation_limit_anon()`) called at
+request time instead of at import time.
+
+**Scope, stated plainly:** this caps *request volume* per identity,
+which is a reasonable proxy for spend but not spend itself — a
+provider price change, a slow month of many large `slide_count`
+requests, or a future format with a very different cost profile
+(e.g. Phase 6's infographics/posters, if those end up image-generation
+heavy) could all still add up differently than this counter assumes.
+Good enough as the circuit breaker the handoff doc asked for; a
+genuine cost-based cap (estimating $ per request type, not just
+counting requests) is a real future upgrade, not represented here.
+
+**Status:** Accepted. 5 new adapter-level tests
+(`tests/contract/test_quota_port.py`: first attempt returns 1,
+repeated attempts increment, different keys independent, count keeps
+incrementing past a hypothetical limit rather than the port enforcing
+one itself, and a new window genuinely resets the count — verified
+with a real 1-second window and a real sleep, not mocked time). 4 new
+HTTP-level tests: anonymous callers blocked after their limit,
+the gate fires before any generation work even with a limit of zero,
+the async enqueue path is gated identically to the sync path (not
+just one of the two), and two different user accounts have genuinely
+independent quota buckets. Full suite: 315/315 passing, run 3
+consecutive times with no flakes. Frontend requires no changes —
+`api-client.ts` already surfaced every endpoint's `detail` field on a
+non-2xx response, so a 429's human-readable message reaches the
+studio's existing error bubble with no new code path.
+
+*Next entry: ADR-044.*
+
+## ADR-044 — Project Workspace (v3 Phase 4)
+
+**Context:** the vision doc's "central experience" — grouping
+generated projects into named folders, per user request ("continue
+building" after landing the cost circuit breaker). The bigger
+architectural step of the four v3 phases delivered so far: every
+previous phase (documents, real job progress, the quota gate) reused
+existing tables end to end. This one genuinely adds a new one.
+
+**Decision:** new `WorkspacePort` (`backend/ports/workspace.py`) —
+named folders (id/name/owner/timestamps only) a user groups projects
+into, kept deliberately separate from `StoragePort`'s existing
+project data rather than merged into one bigger port. `StoragePort`
+gained an optional `workspace_id` on `save_recipe`/`list_projects`
+plus a new `unassign_workspace()` method; both are additive and
+`workspace_id=None` reproduces exactly pre-ADR-044 behavior (existing
+callers, existing tests, unaffected). `SqliteWorkspaceAdapter`/
+`PostgresWorkspaceAdapter` mirror the existing adapter pattern
+exactly (Postgres gets the projects table's new `workspace_id` column
+via a safe `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, same as every
+additive-column change since ADR-040), and `get_workspace_adapter()`
+in `registry.py` applies the ADR-042/043 double-checked-locking
+pattern from the start rather than being a fifth place that race gets
+independently rediscovered.
+
+**The one genuinely subtle design choice, stated plainly in the
+port's own docstring so it's never accidentally reversed later:
+deleting a workspace never deletes its projects.** A project's actual
+generated content is the entire point of this product; an
+organizational folder being deleted must never destroy it as a side
+effect. `DELETE /workspaces/{id}` calls `StoragePort.
+unassign_workspace()` (clearing `workspace_id` back to `None` on every
+project inside it) *before* calling `WorkspacePort.delete_workspace()`
+— deliberately in that order, so a crash between the two steps leaves
+"workspace still exists, its projects already ungrouped" (recoverable
+— just delete the now-empty workspace again) rather than "workspace
+gone, projects silently pointing at a workspace_id that no longer
+resolves for anyone" (a state nothing would ever surface to the user).
+
+**API surface:** `POST/GET/PATCH/DELETE /workspaces`, `GET
+/workspaces/{id}` (workspace plus its projects, one response), and
+`GET /projects?workspace_id=...` for filtering (omitting the param
+keeps returning everything, matching the pre-ADR-044 endpoint
+exactly). All 4 generation endpoints (`/generate`, `/generate/topic`,
+`/generate/async`, `/generate/topic/async`) accept an optional
+`workspace_id` to assign a new project at creation time — validated
+by a new `_resolve_workspace_id()` helper *before* any AI/export work
+starts (same "gate first" discipline as ADR-043's quota check, which
+this literally sits right next to in every endpoint). An unowned
+`workspace_id` is rejected with `404`, not silently ignored or
+silently reassigned to someone else's folder — not a data leak either
+way (every listing stays owner_id-scoped regardless), just avoiding a
+confusing state where a project points at a workspace_id its actual
+owner can never see resolve in their own `list_workspaces()`.
+
+An edit call site re-saving an existing project (e.g. a slide
+regeneration) that doesn't pass `workspace_id` at all leaves the
+project's existing workspace assignment untouched rather than wiping
+it to `None` — explicit `None` was never a meaningful "unassign" input
+worth designing for here (nothing in the product surface offers
+"remove this project from its workspace" as a distinct action yet);
+the real failure mode this guards against is a call site that simply
+doesn't know about workspaces yet silently un-assigning things it was
+never trying to touch.
+
+**Status:** Accepted. 29 new tests: 10 on `WorkspacePort`/
+`SqliteWorkspaceAdapter` (create/get roundtrip, not-found and
+wrong-owner both return identical `None`/`False` rather than leaking
+which case applies, list scoped and ordered correctly, rename and
+delete both respect ownership), 8 on `StoragePort`'s new
+`workspace_id` behavior (assignment reflected in listing, omitted
+defaults to `None`, filtering works, re-saving without `workspace_id`
+preserves the existing assignment, re-saving *with* a new one does
+reassign, `unassign_workspace` clears the right rows and respects
+ownership and is a no-op on an empty match), 11 HTTP-level end to end
+(auth required, create/list/rename, per-user isolation, generation
+assignable to a workspace at creation, an unowned `workspace_id`
+rejected with 404 before any generation work, `/projects` filtering,
+and — the one that actually exercises this entry's core design
+guarantee — deleting a workspace through the real API and confirming
+the project inside it is still fully fetchable afterward, just
+ungrouped). Full suite: 344/344 passing, verified 3 consecutive clean
+runs.
+
+**Frontend, done same-session:** `api-client.ts` gained `workspaceId`
+on both `TopicGenerateOptions` and `DocumentGenerateOptions`, plus
+`listWorkspaces`/`createWorkspace`/`getWorkspace`/`renameWorkspace`/
+`deleteWorkspace`. The sidebar's "Recent" section (flat list since
+Phase 1) now sits alongside a real "Workspaces" section — expandable
+folders (click to fetch and show that workspace's projects inline,
+no separate route needed), a "+ New workspace" affordance, and a
+per-row delete button that only appears on hover. Workspace creation
+uses a plain `window.prompt()` rather than a styled modal — a
+deliberate, stated MVP shortcut (see the code comment at the call
+site), not a hidden gap. The studio composer gained a `<select>`
+workspace picker next to the existing Slides/Document toggle,
+defaulting to "No workspace" (ungrouped, unchanged pre-ADR-044
+behavior) and populated from the real `listWorkspaces()` call.
+Frontend typechecks and builds clean, `/studio` and the sidebar both
+confirmed in the production build output.
+
+*Next entry: ADR-045.*
+
+## ADR-045 — Brand Memory (v3 Phase 5)
+
+**Context:** the vision doc's Brand Memory section — "every project
+should have a brand profile... all generated assets should follow
+this automatically." Followed directly from Phase 4 (ADR-044): once
+workspaces exist as a real concept, a brand profile keyed to a
+workspace is one more table and one more input threaded into
+generation, not a new pipeline.
+
+**Decision:** new `BrandProfilePort` (`backend/ports/brand.py`) — a
+strict 1:1 relationship with a workspace, enforced structurally by
+keying the table directly on `workspace_id` as its primary key rather
+than giving profiles their own id and a separate foreign-key column.
+This matches the vision doc's own framing ("every workspace has a
+brand profile," not "workspaces choose from a library of profiles")
+and makes the 1:1 constraint impossible to violate by construction
+rather than a convention callers have to remember.
+`SqliteBrandAdapter`/`PostgresBrandAdapter` mirror every other
+adapter's pattern, `get_brand_adapter()` in `registry.py` applies the
+double-checked-locking fix from the start (ADR-042/043/044
+precedent).
+
+`set_brand_profile()` is a whole-record replace, not a partial merge
+— stated plainly in the port's docstring and re-stated at the API
+model (`BrandProfileRequest`) specifically because it's the one design
+choice most likely to bite someone who assumes PATCH-like partial-
+update semantics without reading the docstring first. `PUT
+/workspaces/{id}/brand` always expects the full form. `BrandProfile.
+is_empty()` (true when every field is blank) is what lets an
+all-cleared profile behave identically to no profile ever having been
+set — both produce zero prompt injection, checked by dedicated tests
+that assert an empty and a `None` brand produce the same absence of a
+brand block, not by relying on any date/random tiebreak.
+
+**Where it actually plugs into generation:** `GenerationRequest`
+(the topic pipeline's request object, `ports/ai_pipeline.py`) gained
+an optional `brand: BrandProfile | None = None` field.
+`json_pipeline_base.py`'s `_build_strategy_prompt` — the one shared
+prompt-builder every real AI provider adapter inherits — appends a
+brand block when `request.brand` is set and non-empty, framed
+explicitly to the model as informing tone/narrative feel rather than
+being a hard constraint: *"let it inform tone_notes and the overall
+narrative feel, without overriding what actually fits this specific
+topic."* Only the fields actually set are included (a brand profile
+with only `tone` filled in doesn't inject placeholder text for the
+unset color/audience/style fields). The API layer's new
+`_fetch_brand_profile()` helper fetches the workspace's profile
+(if any) right after `_resolve_workspace_id()` already validated
+ownership — deliberately reusing that check rather than re-deriving
+authorization logic a second time in a second place, same pattern
+`_enforce_generation_quota` and `_resolve_workspace_id` already
+established next to each other in every generation endpoint.
+
+For the async path, a job payload has to be JSON-serializable (it's
+persisted as JSON — see every queue adapter), so the enqueue side
+sends the `BrandProfile`'s five content fields as a plain dict (or
+`None`), and `generation_worker.py`'s new `_brand_from_payload()`
+reconstructs the actual dataclass before calling the engine —
+`workspace_id`/`owner_id`/timestamps are left at their dataclass
+defaults on the reconstructed copy since they're not meaningful for
+this transient, in-flight value (only the five content fields the
+prompt-builder reads matter).
+
+**Scope, stated plainly — one real limit remains:**
+1. **Color mapping isn't wired into the deterministic theme/layout
+   renderer.** A brand's `colors` field is free text the model reads
+   as context ("Blue and purple, modern"), not something mapped onto
+   the renderer's actual fixed theme palette. Mapping freeform color
+   descriptions onto real design tokens is a genuinely separate,
+   harder problem — worth its own pass once there's real usage data
+   on what people type into this field, not guessed at speculatively
+   here.
+
+~~2. Only the topic-generation pipeline reads brand.~~ **Closed
+same-session:** `generate_presentation` (document-upload mode,
+`engines/generate.py`) now also accepts a `brand` parameter, threaded
+into `_apply_title_enhancement` — the ONE AI touchpoint in that
+pipeline actually about phrasing rather than content
+(`propose_structure` is about document structure, not style, so it's
+not a natural fit for brand tone the same way this is; same reasoning
+the topic pipeline's Strategy stage used to decide where brand context
+belongs). Specifically only `tone` and `visual_style` are read (the
+two fields that are actually about phrasing) — `name`/`colors`/
+`audience` being set has zero effect on the rewrite instructions,
+confirmed by a dedicated test. Same job-payload serialize/reconstruct
+pattern as the topic pipeline's async path, reusing the same
+`_brand_from_payload()` helper rather than duplicating it.
+
+**Status:** Accepted. 24 new tests at initial ship (see below), plus
+7 more closing the document-mode gap same-session: 5 on
+`_apply_title_enhancement`'s brand handling (tone+visual_style appear
+in the rewrite instructions when set, unchanged when brand is `None`,
+unchanged when brand is present-but-empty, unchanged when only
+name/colors/audience are set, and an end-to-end call through the real
+`generate_presentation()` with a brand profile still produces valid
+output), 2 HTTP-level (document upload into a branded workspace
+succeeds on both the sync and async paths). Combined total:
+375/375 passing, verified 3 consecutive clean runs.
+
+Initial-ship test breakdown (24 new tests): 11 on `BrandProfilePort`/
+`SqliteBrandAdapter` (set/get roundtrip, never-set and wrong-owner
+both return `None`, whole-record-replace semantics proven by showing
+a second `set` call with fewer fields wipes the omitted ones rather
+than preserving them, `created_at` survives updates while `updated_at`
+advances, delete respects ownership, independent workspaces don't
+leak into each other, `is_empty()` on both a fully-default and a
+partially-set profile), 5 on prompt injection (brand fields present
+in the prompt when set, absent when `None`, absent when present-but-
+empty, only-the-set-fields appear — no placeholder text for unset
+ones, and an end-to-end call with a brand profile still parses into a
+normal `PresentationStrategy`), 8 HTTP-level (get-before-ever-set
+returns 200 with blanks not 404, set-then-get roundtrip through the
+real API, ownership enforced on all three brand endpoints, auth
+required, delete reverts to the never-set state, and — the ones that
+actually prove this doesn't break anything — generation into a
+branded workspace succeeds, generation into an unbranded workspace is
+unaffected, and the async job-payload serialize/reconstruct round
+trip works end to end, not just the sync path). Full suite: 368/368
+passing, verified 3 consecutive clean runs.
+
+**Frontend, done same-session:** `api-client.ts` gained
+`BrandProfile`/`getBrandProfile`/`setBrandProfile`/`deleteBrandProfile`.
+The sidebar's expandable workspace folders (ADR-044) gained a "Brand
+profile" toggle revealing a real inline form (5 plain text inputs —
+name, colors, tone, audience, visual style — not a styled
+color-picker or richer UI, matching this delivery's stated MVP scope
+elsewhere) with Save/Clear, pre-filled from the real API on open.
+Deliberately did NOT add a separate `/studio/brand` page — the
+sidebar's existing (still-`comingSoon`) "Brand kits" nav item implies
+a library/browse experience that isn't what got built; what shipped
+is genuinely per-workspace inline editing, and mislabeling it as the
+nav item's fuller concept would overstate the scope. Frontend
+typechecks and builds clean.
+
+*Next entry: ADR-046.*
+
+## ADR-046 — Infographics: First Phase 6 Render Target
+
+**Context:** v3 roadmap Phase 6 ("Infographics, diagrams, posters,
+social graphics") — the first phase whose formats are genuinely
+different render targets (SVG/HTML composition) rather than PPTX/DOCX
+variants. The roadmap's own sequencing note said to build this first:
+*"diagrams and infographics first — pure layout problems, no new
+content-generation logic."* That held up exactly as predicted: this
+entry required zero changes to Strategy, Outline Structure, Slide
+Content, Layout Planning, or Quality Review — only a new `ExportPort`
+adapter, the same shape of change ADR-041 (documents) made before it.
+
+**Decision:** new `InfographicSvgExportAdapter`
+(`backend/adapters/export/infographic_svg_adapter.py`, format_id
+`infographic_svg`), registered in `registry._EXPORT_ADAPTERS`
+alongside `pptx`/`document_docx`. Consumes the exact same `Recipe`
+every other format does. No new endpoint, no new job type — the same
+`export_format` string every generation endpoint already accepted now
+also works for infographics, on both topic and document-upload
+generation, sync and async, with no format-specific gating anywhere.
+
+**Layout:** a single vertically-scrolling SVG — a title header (from
+`slides[0]`, same "first slide becomes the header" convention
+`document_docx_adapter.py` established) followed by one numbered card
+per remaining slide, each with a heading and up to `MAX_BULLETS_
+PER_CARD` (6) bullets. Colors come from `pptx_adapter.py`'s existing
+`_COLOR_SETS` — deliberately NOT a separate infographic-only palette,
+since the entire point of `Theme.color_set_id` existing is that one
+theme choice should look consistent across every format a project
+gets exported to, including brand-informed themes from ADR-045.
+
+**A real bug caught by actually looking at the output, not just
+passing tests:** the first version used a fixed `HEADER_HEIGHT`
+constant, which left excessive dead space under short titles (a
+one-line title still reserved room for three). All 13 initial tests
+passed regardless, because none of them asserted anything about
+whitespace proportions — this was only caught by rendering a realistic
+sample to PNG (via `cairosvg`, a one-off dev-time check, not a new
+project dependency) and visually inspecting it. Fixed by computing
+header height dynamically from the actual wrapped title's line count
+before laying out anything else. Worth remembering as a pattern: a
+green test suite proves the assertions you wrote were satisfied, not
+that the output looks right — for anything with a visual component,
+actually rendering and looking at it once is cheap insurance a test
+suite alone can't provide.
+
+**SVG text doesn't auto-wrap**, so this does its own wrapping via
+`textwrap.wrap` against an estimated average-character-width — not
+real per-glyph font metrics. Stated explicitly as a deliberate
+tradeoff in the module docstring: exact wrapping would need either a
+real font-rendering dependency or shipping actual font metrics
+tables, disproportionate for what's meant to be a fast, lightweight
+visual summary rather than a typography-precise document.
+
+**Status:** Accepted. 13 new adapter-level tests
+(`tests/contract/test_infographic_svg_adapter.py`) — well-formed SVG
+proven by actually parsing it with `xml.etree.ElementTree` (not just
+"didn't raise"), title/section/bullet content present, one numbered
+`<circle>` per section confirmed by count not just presence, long
+bullet text genuinely wrapped (no single `<text>` line over 120
+chars), bullets beyond the cap correctly dropped rather than growing
+the card unboundedly, speaker notes never rendered, an empty outline
+still producing valid SVG, different `color_set_id`s producing
+genuinely different output (proving the theme actually flows through,
+not hardcoded), and special characters (`&`, `<`, `>`, `"`) proven
+escaped by parsing the result as XML rather than string-matching for
+their presence. 4 new HTTP-level tests: sync, the bundling guard
+correctly skipping this format, a full async round trip, and
+document-upload mode targeting this format too. Full suite: 392/392
+passing, verified 3 consecutive clean runs.
+
+**Frontend, done same-session:** studio composer gained a third
+`→ Infographic` toggle alongside Slides/Document. Went one step
+further than the document format's UI: an actual inline `<img>`
+preview renders directly in the chat thread, since browsers display
+SVG natively and the job-download endpoint requires no auth — free to
+add once the format existed. Typechecks and builds clean.
+
+**Known gap, stated plainly:** the project editor
+(`/projects/[id]`) only ever exports as PPTX regardless of what
+format a project was originally generated as (`handleExport()` is
+hardcoded to `"presentation.pptx"`). Editing a project's underlying
+content there is genuinely useful for any format (same `Outline` model
+underneath), but there's no re-export-as-infographic (or as-document)
+button on that page yet — a real, if narrow, product gap left for a
+future pass on that page specifically, not addressed here.
+
+*Next entry: ADR-047.*
+
+## ADR-047 — Diagrams: Second Phase 6 Render Target
+
+**Context:** the second Phase 6 format per the roadmap's own priority
+order ("diagrams and infographics first... posters and social
+graphics second"). Where this entry earned its own design decision
+rather than being a copy-paste of ADR-046: a "diagram" implies real
+structure — sequence, branching, decision points — and the `Outline`
+model (`models/recipe.py`) is a flat, ordered list of `Slide`s. It has
+no representation of a decision point, a loop, or parallel branches at
+all.
+
+**Decision:** build the diagram type this data model can actually
+support honestly — a linear process/sequence flow, one box per
+section connected by arrows in slide order — rather than either (a)
+silently ignoring structure the model doesn't have while visually
+implying it does (a flowchart-shaped output that's incapable of
+encoding an actual flowchart's branching is a dishonest artifact,
+not a smaller version of a real one), or (b) inventing a new
+structured branching input the AI pipeline would need to populate
+(a materially bigger change — deferred to `V3_ROADMAP.md`, not
+attempted speculatively here). This is the same "build what the data
+honestly supports" reasoning ADR-041 already used once (document_docx
+doesn't invent document-specific AI generation, it reuses the same
+Outline verbatim) — applied here to a case where NOT doing so would
+have been a more attractive shortcut, since a "flowchart" visually
+reads as more sophisticated than it structurally is.
+
+**Extracted `svg_utils.py`, a genuinely shared module** — the escape/
+hex-color/text-wrap helpers `infographic_svg_adapter.py` (ADR-046)
+already had were needed identically here, so they moved to a small
+shared module rather than being duplicated a second time. Explicitly
+NOT a shared layout engine or base class — `ExportPort`'s own
+docstring principle ("a broken/slow adapter for one format never
+affects the others") still holds; sharing pure, stateless string
+utilities doesn't create the coupling that principle actually guards
+against, duplicating character-escaping logic across every future SVG
+adapter would just be a latent bug waiting to diverge between them.
+`infographic_svg_adapter.py` was refactored to use the shared module
+too — its own 13 tests re-run unchanged and still pass, confirming
+the refactor was behavior-preserving.
+
+**Each box** shows a section's title and, space permitting, only its
+FIRST bullet as a terse sub-line — deliberately not a card of many
+bullets like the infographic adapter's cards. A diagram box is meant
+to read in a glance, not be read like a document; a dedicated test
+confirms a second bullet on the same slide is correctly never shown,
+not just that the first one appears. Same reused `_COLOR_SETS`
+palette as every other format (ADR-046's reasoning applies
+identically), same "slides[0] becomes the header" convention as
+`document_docx_adapter.py` and `infographic_svg_adapter.py` before it.
+
+**Verified visually before writing tests, learning directly from
+ADR-046's own lesson** — rendered two realistic samples to PNG
+(a normal 4-step onboarding flow, and a deliberately extreme long-
+text edge case) and inspected both. The diagram adapter got the
+layout right on the first attempt this time (no header-height-style
+bug to fix), which is itself informative: computing header height
+dynamically from wrapped-line count, the exact fix ADR-046 needed
+partway through, was written into this adapter from the start instead
+of being a bug to discover — direct evidence the earlier lesson
+actually transferred rather than needing to be relearned.
+
+**Status:** Accepted. 17 new adapter-level tests
+(`tests/contract/test_diagram_svg_adapter.py`) — well-formed SVG via
+real XML parsing, correct box count (verified by actual `<rect>`
+count, accounting for the 2 non-box background/accent rects), exactly
+N-1 arrows for N boxes (a single box produces zero arrows, confirmed
+by a dedicated test, not just inferred from the N-1 formula), step
+titles and the first-bullet subline both present, a second bullet on
+the same slide confirmed absent (not just "first bullet present" —
+the actual scoping-to-one behavior), a step with zero bullets still
+rendering without a subline and without raising, speaker notes never
+used as a subline, long titles genuinely wrapped, an empty outline
+and a header-only (zero-step) outline both still producing valid SVG,
+different color sets producing different output, and special
+characters proven escaped by parsing as XML. 8 new tests for the
+extracted `svg_utils.py` itself (escaping all 5 XML special
+characters, hex formatting including single-digit-component padding,
+wrapping short text unchanged, wrapping long text across multiple
+lines, ellipsis truncation beyond max_lines, empty-string input
+returning one empty line rather than raising). 4 new HTTP-level tests
+(sync, bundling correctly skipped, async round trip, document-upload
+mode). Full suite: 421/421 passing, verified 3 consecutive clean
+runs.
+
+**Frontend, done same-session:** studio composer gained a fourth
+`→ Diagram` toggle. The result-card rendering logic in `studio/
+page.tsx` was refactored from a stack of format-specific ternaries
+(already getting hard to read at 3 formats) into a single
+`FORMAT_CONFIG` lookup table keyed by `OutputFormat` — the diagram
+format's inline SVG preview, download label, and section-count noun
+("steps," distinct from infographic's "sections") all came from
+adding one row to that table rather than another round of if/else
+branches. Typechecks and builds clean.
+
+**Carried-forward gap, unchanged from ADR-046:** the project editor
+page still only ever exports as PPTX regardless of a project's
+original format. Not addressed in this entry either — same stated
+gap, not growing silently with each new format added.
+
+*Next entry: ADR-048.*
+
+## ADR-048 — Posters: Third and Final Phase 6 Render Target
+
+**Context:** the last format in Phase 6's roadmap, and the one the
+roadmap itself flagged as different from the other two: *"posters and
+social graphics second — need real design-system work — this is where
+frontend-design-grade visual judgment matters most and is worth doing
+carefully rather than fast."* This entry took that seriously —
+consulted this project's `frontend-design` skill before writing any
+code, and it directly shaped two structural decisions, not just
+surface styling.
+
+**Decision, and why it looks different from ADR-046/047:**
+1. **No numbered markers.** The infographic and diagram adapters both
+   number their content because it genuinely IS ordered (a deck's
+   slide sequence, a process's steps). A poster's highlight lines are
+   independently true claims about the same topic, not a sequence —
+   numbering them would be exactly the "decoration that doesn't encode
+   real information" the skill warns against as a default AI-slop
+   pattern. Verified by a dedicated test asserting no bare "1"/"2"/"3"
+   text node appears anywhere in the output.
+2. **The headline dominates**, per the skill's "the hero is a thesis."
+   Where the other two adapters give the title a modest header
+   treatment and spend most of the canvas on content, this adapter's
+   title is the largest, boldest element on the page, with a
+   restrained accent-circle signature device behind it — "spend your
+   boldness in one place," not scattered decoration.
+
+**Where this deliberately does NOT follow the skill as literally as a
+bespoke page would:** color palette. The skill's guidance is one
+considered, specific palette per brief. This reuses the same
+`_COLOR_SETS` every other export format already uses (same reasoning
+as ADR-046/047) — because this is a reusable engine serving arbitrary
+topics via a small set of themes (including brand-informed themes
+from ADR-045), not a one-off page; a user's chosen theme staying
+consistent across every format they export to matters more here than
+a bespoke one-off palette would per generation. Stated as a deliberate
+tension with the skill's usual guidance, not an oversight.
+
+**Two real bugs found by rendering and looking, not by the test
+suite** — same discipline ADR-046 established, applied from the
+start this time rather than learned mid-way through again:
+1. Highlight lines had a small accent tick placed at each line's
+   estimated left text edge — this project's `wrap_text` is a
+   character-count estimate, not real font metrics (documented
+   limitation, `svg_utils.py`), so the estimated edge didn't match
+   where the actual centered text rendered, and the tick visibly
+   overlapped the first line's text. Fixed by moving the tick to a
+   small mark centered ABOVE each highlight block instead of beside
+   it — centered elements don't need accurate width measurement to
+   align correctly, sidestepping the root limitation entirely rather
+   than trying to measure around it.
+2. With a typical 3-highlight deck, content was pinned to a fixed
+   top offset (mirroring the OTHER bug ADR-046 had to fix, not the
+   same one) leaving the entire bottom half of the fixed-size canvas
+   empty — looked broken, not minimal. Fixed by computing the whole
+   content block's height first and vertically centering it within a
+   safe band (clear of the top accent circles, clear of the footer),
+   rather than starting layout from a constant.
+
+**One remaining minor, stated limitation, not hidden:** an unusually
+long 3-line headline can graze the decorative accent circles in the
+poster's upper-right corner (verified by rendering a deliberately
+extreme long-title case). Judged acceptable rather than fixed further
+— the circles are low-opacity texture, not solid shapes, so text stays
+legible where they overlap, and this is the one deliberate visual
+risk the template already takes per its own docstring; chasing further
+precision here traded against real returns for a corner case, not a
+typical one.
+
+**Also unlike the other two SVG adapters: a FIXED canvas** (800×1000,
+a common portrait poster/social-graphic ratio), not one that grows
+with content — a poster is meant to be one consistent shareable-image
+size, confirmed by a dedicated test comparing a minimal-content and a
+maximal-content poster's dimensions are identical. `MAX_HIGHLIGHTS`
+(4) keeps content within what that fixed canvas can hold; a section
+with no bullets falls back to its own title as the highlight (a
+poster can't afford a dropped highlight just because a section lacked
+supporting detail — its title is still a true claim about the topic).
+
+**Status:** Accepted. 14 new adapter-level tests
+(`tests/contract/test_poster_svg_adapter.py`) — well-formed SVG,
+fixed canvas size regardless of content amount, headline present, no
+numbered markers anywhere (the one behavioral difference from ADR-046/
+047 actually verified, not just claimed), highlights correctly capped
+at `MAX_HIGHLIGHTS`, a bulletless section falling back to its own
+title, notes never used as a highlight, the divider present exactly
+when there's at least one highlight and absent when there are zero
+(both directions tested, not just the positive case), long headlines
+genuinely wrapped, an empty outline still producing valid SVG,
+different color sets producing different output, and special
+characters proven escaped via real XML parsing. 4 new HTTP-level
+tests (sync, bundling correctly skipped, async round trip, document-
+upload mode). Full suite: 439/439 passing, verified 3 consecutive
+clean runs.
+
+**Phase 6 is now complete** — all three planned render targets
+(infographics, diagrams, posters) shipped across ADR-046/047/048.
+
+**Frontend, done same-session:** studio composer gained a fifth and
+final `→ Poster` toggle. The `FORMAT_CONFIG` lookup table ADR-047
+introduced specifically to avoid another round of stacked ternaries
+did its job here — adding poster support was one new row, not a new
+branch anywhere in the rendering logic. Typechecks and builds clean.
+
+**Carried-forward gap, unchanged across all three Phase 6 entries:**
+the project editor page still only ever exports as PPTX regardless of
+a project's original format. Stated again rather than left to grow
+silently invisible with each new format added — four formats deep now
+(document, infographic, diagram, poster) and still not addressed
+there.
+
+*Next entry: ADR-049.*
+
+## ADR-049 — Project Editor: All 5 Export Formats, Not Just PPTX
+
+**Context:** the gap flagged and carried forward across all three
+Phase 6 entries (ADR-046/047/048): the project editor page
+(`/projects/[id]`) only ever exported as PPTX, regardless of a
+project's actual format — real, narrow, and left explicitly stated
+rather than allowed to grow silently invisible as more formats got
+added. Four formats deep by the end of Phase 6, still unaddressed.
+Closed this session before starting Phase 7.
+
+**Decision:** the export button became a format selector + export
+button pair. Every project's editor can now export to any of the 5
+formats (`pptx`, `document_docx`, `infographic_svg`, `diagram_svg`,
+`poster_svg`) — genuinely free to pick any of them regardless of
+which format the project might originally have been generated as,
+since every format is just a different `ExportPort` reading the exact
+same `Recipe`/`Outline` (the same fact ADR-041/046/047/048 already
+established makes this trivially true at the API level; this entry
+is purely about the frontend finally exposing what the backend could
+already do).
+
+**Deliberately did NOT add "remember the project's original format"
+as a smarter default.** `StoragePort`/`ProjectSummary` don't persist
+which format a project was originally generated in — that's a real,
+separate feature (a new stored field, a schema change) that would
+need its own justification, not something to invent silently just to
+make a dropdown's default marginally more convenient. The selector
+defaults to `pptx` (matching the page's pre-existing behavior) and
+is freely changeable from there.
+
+**Extracted `lib/export-formats.ts`** — a small shared module (format
+id, display label, short label for compact UI, file extension) so the
+project editor and the studio composer read from one source of truth
+for "which formats exist" rather than the editor introducing a THIRD
+hand-maintained list of the same 5 format ids (studio's `FORMAT_CONFIG`
+already existed from ADR-047, and was itself introduced specifically
+to stop that duplication from spreading). The studio page's own
+`OutputFormat` type alias was retired in favor of importing
+`ExportFormat` from this shared module — one canonical type now, not
+two type aliases for the identical five string literals that could
+silently drift out of sync if a sixth format were ever added to one
+but not the other. Studio's richer per-format UI config (icon,
+download-button label, section-count noun) stayed local to
+`studio/page.tsx`, since those are genuinely studio-specific
+concerns, not something the editor page needs.
+
+**Status:** Accepted. No new backend changes, no new backend tests —
+this was purely a frontend surface change against an API that already
+fully supported it (confirmed by the fact that zero backend files
+needed touching). Verified: `npx tsc --noEmit` clean, `npm run build`
+clean with `/projects/[id]`'s bundle size increasing as expected for
+the new selector UI. Full backend suite re-run for completeness
+despite being untouched: 439/439 passing, unaffected as expected.
+
+*Next entry: ADR-050.*
+
+## ADR-050 — Phase 7: Q&A on Uploaded Documents, and a Real-PDF Testing Gap Closed
+
+**Context:** the last phase from the original vision doc's MVP scope
+— "PDF Intelligence." The roadmap's own framing for this phase was
+*"Document-mode already accepts PDFs for structure extraction. Extend
+to Q&A-over-PDF... no new extraction logic needed, just new consumers
+of what already exists."* Checked that "already accepts PDFs" claim
+before building anything new, per this session's established
+discipline of verifying rather than assuming — and found a real,
+previously-invisible gap.
+
+**A real gap found by checking, not assumed to be fine because the
+roadmap said so:** every HTTP-level test that ever sent a `.pdf`
+through the API used a deliberately CORRUPT one
+(`test_generate_sync_corrupt_pdf_returns_422`) — a real, valid PDF
+had never actually been sent through `/generate` and verified to
+produce real output, for ANY of the 5 export formats, despite the
+roadmap confidently stating PDF-to-any-format "already works." It
+happened to be true (verified by manually constructing a real PDF and
+running it through `generate_presentation()` for all 5 formats before
+writing any test — same "render and look before trusting" discipline
+ADR-046/048 established, applied here to a claim instead of a visual
+layout), but "happened to be true, unverified" and "verified" are
+different states, and the test suite only now proves the latter.
+
+**No new PDF-generation dependency added** to prove this — this
+project's only real PDF dependency is `pypdf` (for reading). Rather
+than adding `reportlab` or similar just to generate a test fixture,
+`tests/integration/test_api_http.py` gained a small hand-written
+minimal-PDF constructor (`_make_minimal_pdf`) using raw PDF content-
+stream syntax, round-tripped through `pypdf`'s own reader as proof it
+produces genuinely valid, text-extractable output — zero new
+dependencies, real coverage.
+
+**The genuinely new feature: Q&A on an uploaded document.**
+`AIPort` gained `answer_question(context, question) -> str` —
+implemented identically across every real provider adapter (Gemini,
+the OpenAI-compatible base shared by Groq/OpenRouter/HuggingFace,
+LocalModel) via the same `_TextEnhancementMixin` pattern every other
+AIPort text method already uses (`_answer_question_raising`,
+wrapped by each adapter's public method in the established try/
+except-degrade pattern), and cascades through `CompositeAIAdapter`
+via the same generic `_cascade_text` every other method already
+uses — no special-casing needed there at all.
+
+**The one place this method's contract genuinely differs from every
+other AIPort method, stated explicitly in the port docstring:**
+`answer_question` has no meaningful non-AI degradation. Every other
+AIPort method degrades to "return the input unchanged" when AI is
+unavailable — a sensible fallback since presentations/documents/etc.
+still work fine unenhanced. There's no equivalent sensible fallback
+for "answer an arbitrary question about a document" — echoing the
+question back, or the document's raw text, would both be actively
+unhelpful, not a graceful degradation. So `NullAdapter.
+answer_question` (and every adapter's degraded-path return, and
+`CompositeAIAdapter`'s `degraded_default`) returns an explicit,
+honest sentence stating AI isn't configured — never silence, never an
+echo, verified by dedicated tests asserting the response is neither
+the question nor the context verbatim.
+
+**New endpoint: `POST /documents/ask`** — file upload + `question`
+query param (matching the established convention every other file-
+upload endpoint uses for its non-file parameters, confirmed by
+checking existing passing tests' calling convention before writing
+the new ones, rather than assuming). Reuses the exact same
+`IngestionPort.extract_text` step every generation endpoint already
+uses — genuinely "no new extraction logic," the one part of the
+roadmap's framing that held up exactly as stated. Always returns
+`200` with an `answer` field, even when AI isn't configured — the
+HTTP layer follows the same "explicit honest message, not a special-
+cased error" contract `AIPort.answer_question` itself establishes,
+rather than inventing a `503` for a case the port already has a
+defined behavior for.
+
+**Gated by a SEPARATE, lighter quota bucket than generation
+(`_enforce_qa_quota`, `_qa_limit_user`/`_qa_limit_anon`, env vars
+`OPENPRESENT_DAILY_QA_LIMIT_USER`/`_ANON`, defaults 100/15 vs
+generation's 30/5).** A single Q&A call is one AI request; a single
+generation is 6+ (ADR-043's own reasoning for why generation's cap
+exists at all). Sharing one bucket would make whichever cap got reused
+wrong for the other feature. Refactored `_enforce_generation_quota`
+into a small generic `_enforce_daily_quota` helper both quota gates
+now call with different key prefixes/limits/nouns, rather than
+duplicating the whole gate function a second time — verified
+behavior-preserving by re-running the full suite before adding any
+new tests (439/439, unchanged) immediately after that refactor, not
+after the new feature was also mixed in.
+
+**A real bug caught immediately, not shipped:** while wiring in the
+new endpoint, a `str_replace` edit accidentally deleted the
+`@app.get("/jobs/{job_id}")` decorator line entirely, silently
+orphaning that route (the function still existed, just with no
+route registered — FastAPI would 404 on the real endpoint while the
+Python file still imported and ran without error). Caught immediately
+by re-viewing the edited region right after making the change, before
+running any tests — fixed before it could hide inside a "tests still
+pass" false confidence (the existing test suite calling `GET /jobs/
+{id}` would eventually have caught it too, but catching it by reading
+the diff is strictly faster and doesn't rely on that route happening
+to have test coverage).
+
+**Status:** Accepted. 19 new tests: 4 on `NullAdapter`/
+`LocalModelAdapter`'s `answer_question` (honest unavailable message
+— explicitly not an echo of either the question or the context —
+model response returned when available, degrades to an honest
+message on server error, never surfaces a blank answer even when the
+model itself returns one), 3 on `CompositeAIAdapter`'s cascade
+(cascades to a working provider, degrades to the honest message when
+every provider fails — not the generic "echo the input" every other
+method's degrade uses — and behaves correctly with zero available
+providers), 12 HTTP-level (real PDF through `/generate` for all 5
+formats via `pytest.mark.parametrize`, `/documents/ask` requiring a
+question, returning a real answer field via the `NullAdapter` path in
+this hermetic suite, working with a real PDF specifically, correctly
+rejecting an unsupported filetype and a corrupt PDF, and — proving
+the separate-bucket design actually works rather than just being
+described that way — a generation-quota env var set to 0 not blocking
+Q&A, and Q&A's own limit genuinely blocking after being reached).
+Full suite: 458/458 passing, verified 3 consecutive clean runs.
+
+**This closes every phase from the original vision doc's MVP scope.**
+Phases 1 through 7 are now all shipped, each with its honest, stated
+partial gaps documented in `V3_ROADMAP.md` rather than glossed over.
+
+*Next entry: ADR-051.*

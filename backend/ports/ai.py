@@ -47,3 +47,16 @@ class AIPort(Protocol):
 
     def suggest(self, context: str) -> list[str]:
         ...
+
+    def answer_question(self, context: str, question: str) -> str:
+        """ADR-050 (v3 Phase 7, PDF/document Q&A). Answers `question`
+        using only `context` (the extracted text of an uploaded
+        document) as source material. Unlike every other AIPort
+        method, there is no meaningful rule-based degradation for
+        "answer an arbitrary question about a document" — so instead
+        of silently returning an empty or unhelpful string when AI is
+        unavailable (which every other method does, since those have
+        a sensible non-AI fallback: return the input unchanged), this
+        must return an honest, explicit sentence saying AI isn't
+        available. Never raise, same as every other method here."""
+        ...

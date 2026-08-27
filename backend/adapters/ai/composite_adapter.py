@@ -95,6 +95,16 @@ class CompositeAIAdapter(AIPort, AIPipelinePort):
     def suggest(self, context):
         return self._cascade_text("_suggest_raising", [], context)
 
+    def answer_question(self, context, question):
+        # Unlike every other _cascade_text call, the degraded_default
+        # here isn't "the original input unchanged" (there's no
+        # sensible echo for a Q&A answer) — it's the same honest
+        # "AI not configured" message NullAdapter itself would return,
+        # reached only once every configured provider has genuinely
+        # failed, not as a first resort.
+        degraded_default = "AI is not configured for this deployment, so I can't answer questions about this document."
+        return self._cascade_text("_answer_question_raising", degraded_default, context, question)
+
     def _cascade_text(self, raising_method_name: str, degraded_default, *args):
         """Tries every available provider's raising implementation in
         turn, only falling back to degraded_default (the original,

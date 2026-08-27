@@ -30,6 +30,7 @@ import io
 import zipfile
 import time
 import pytest
+from docx import Document
 from fastapi.testclient import TestClient
 from backend.adapters import registry
 
@@ -47,6 +48,55 @@ SAMPLE_TEXT_DOC = (
 ).encode("utf-8")
 
 
+def _make_minimal_pdf(text_lines: list[str]) -> bytes:
+    """A hand-written, valid, minimal single-page PDF with real,
+    extractable text — used instead of a PDF-generation library (e.g.
+    reportlab) specifically because this project's only real PDF
+    dependency is pypdf (for reading), not for writing. Round-tripped
+    through pypdf's own reader as part of ADR-050's real-PDF test
+    coverage — see test_ai_generate_engine.py/test_title_enhancement.py
+    for the equivalent reasoning on why SAMPLE_TEXT_DOC alone wasn't
+    enough evidence that PDF-specific ingestion actually works end to
+    end (it never had, before ADR-050 — only the corrupt-PDF error
+    path had ever been exercised via a real HTTP request)."""
+    content_lines = ["BT", "/F1 12 Tf", "72 720 Td"]
+    for i, line in enumerate(text_lines):
+        if i > 0:
+            content_lines.append("0 -18 Td")
+        escaped = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        content_lines.append(f"({escaped}) Tj")
+    content_lines.append("ET")
+    content = "\n".join(content_lines).encode("latin-1")
+
+    objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> "
+        b"/MediaBox [0 0 612 792] /Contents 5 0 R >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        b"5 0 obj\n<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream\nendobj\n",
+    ]
+    pdf = b"%PDF-1.4\n"
+    offsets = []
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf += obj
+    xref_offset = len(pdf)
+    pdf += b"xref\n0 " + str(len(objects) + 1).encode() + b"\n0000000000 65535 f \n"
+    for off in offsets:
+        pdf += f"{off:010d} 00000 n \n".encode()
+    pdf += b"trailer\n<< /Size " + str(len(objects) + 1).encode() + b" /Root 1 0 R >>\nstartxref\n" + str(xref_offset).encode() + b"\n%%EOF"
+    return pdf
+
+
+SAMPLE_PDF_DOC = _make_minimal_pdf([
+    "The Water Cycle",
+    "Evaporation: Water turns into vapor when heated by the sun.",
+    "Condensation: Vapor cools and forms clouds.",
+    "Precipitation: Water falls back to earth as rain or snow.",
+])
+
+
 @pytest.fixture(autouse=True)
 def reset_all_registry_singletons(monkeypatch):
     """Every registry-cached adapter reset to None before each test —
@@ -57,7 +107,7 @@ def reset_all_registry_singletons(monkeypatch):
     fake via monkeypatch, same pattern used throughout this suite."""
     for attr in ("_ai_adapter_instance", "_queue_adapter_instance", "_storage_adapter_instance",
                  "_auth_adapter_instance", "_analytics_adapter_instance", "_media_adapter_instance",
-                 "_research_adapter_instance"):
+                 "_research_adapter_instance", "_quota_adapter_instance", "_workspace_adapter_instance", "_brand_adapter_instance"):
         setattr(registry, attr, None)
     monkeypatch.setenv("OPENPRESENT_AI_ADAPTER", "null")
     monkeypatch.setenv("OPENPRESENT_RESEARCH_ADAPTER", "null")
@@ -68,7 +118,7 @@ def reset_all_registry_singletons(monkeypatch):
     yield
     for attr in ("_ai_adapter_instance", "_queue_adapter_instance", "_storage_adapter_instance",
                  "_auth_adapter_instance", "_analytics_adapter_instance", "_media_adapter_instance",
-                 "_research_adapter_instance"):
+                 "_research_adapter_instance", "_quota_adapter_instance", "_workspace_adapter_instance", "_brand_adapter_instance"):
         setattr(registry, attr, None)
 
 
@@ -239,6 +289,669 @@ def test_generate_topic_async_full_round_trip(client):
     assert download_resp.status_code == 200
     zf = zipfile.ZipFile(io.BytesIO(download_resp.content))
     assert "presentation.pptx" in zf.namelist()
+
+
+# -- Documents as a second output type (ADR-041, v3 Phase 3) -------------
+
+# -- Cost circuit breaker (ADR-043) --------------------------------------
+
+def test_anonymous_generation_blocked_after_daily_limit(client, monkeypatch):
+    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "2")
+    for _ in range(2):
+        resp = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4})
+        assert resp.status_code == 200
+    blocked = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4})
+    assert blocked.status_code == 429
+    assert "daily limit" in blocked.json()["detail"].lower()
+
+
+def test_quota_gate_runs_before_any_generation_work(client, monkeypatch):
+    """The 429 must come from the gate itself, not from generation
+    happening and then being discarded — proven by setting the limit to
+    zero and confirming the very first request is blocked, with no
+    generation-specific side effect (no X-Project-Id etc.) ever occurring."""
+    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "0")
+    resp = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4})
+    assert resp.status_code == 429
+
+
+def test_async_enqueue_is_also_gated_not_just_the_sync_path(client, monkeypatch):
+    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "0")
+    resp = client.post("/generate/topic/async", json={"topic": "Volcanoes", "slide_count": 4})
+    assert resp.status_code == 429
+
+
+def test_quota_is_keyed_separately_per_user(client, monkeypatch):
+    """Two different accounts must not share a quota bucket — this test
+    would fail if the key were something global like just "user" instead
+    of including the actual user id."""
+    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_USER", "1")
+    client.post("/auth/register", json={"email": "a@example.com", "password": "password123"})
+    token_a = client.post("/auth/login", json={"email": "a@example.com", "password": "password123"}).json()["session_token"]
+    client.post("/auth/register", json={"email": "b@example.com", "password": "password123"})
+    token_b = client.post("/auth/login", json={"email": "b@example.com", "password": "password123"}).json()["session_token"]
+
+    resp_a1 = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4},
+                           headers={"Authorization": f"Bearer {token_a}"})
+    assert resp_a1.status_code == 200
+    resp_a2 = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4},
+                           headers={"Authorization": f"Bearer {token_a}"})
+    assert resp_a2.status_code == 429  # user A is now over their limit of 1
+
+    resp_b1 = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4},
+                           headers={"Authorization": f"Bearer {token_b}"})
+    assert resp_b1.status_code == 200  # user B's own limit is untouched by A's usage
+
+
+# -- Workspaces (ADR-044, v3 Phase 4) -------------------------------------
+
+def _register_and_login(client, email="user@example.com", password="password123"):
+    client.post("/auth/register", json={"email": email, "password": password})
+    return client.post("/auth/login", json={"email": email, "password": password}).json()["session_token"]
+
+
+def test_create_workspace_requires_auth(client):
+    resp = client.post("/workspaces", json={"name": "Marketing"})
+    assert resp.status_code == 401
+
+
+def test_create_and_list_workspace(client):
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    create_resp = client.post("/workspaces", json={"name": "Marketing"}, headers=headers)
+    assert create_resp.status_code == 200
+    workspace_id = create_resp.json()["workspace_id"]
+
+    list_resp = client.get("/workspaces", headers=headers)
+    assert list_resp.status_code == 200
+    names = [w["name"] for w in list_resp.json()]
+    assert names == ["Marketing"]
+    assert list_resp.json()[0]["workspace_id"] == workspace_id
+
+
+def test_create_workspace_requires_a_name(client):
+    token = _register_and_login(client)
+    resp = client.post("/workspaces", json={"name": "   "},
+                        headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 400
+
+
+def test_workspace_list_is_isolated_per_user(client):
+    token_a = _register_and_login(client, "a@example.com")
+    token_b = _register_and_login(client, "b@example.com")
+    client.post("/workspaces", json={"name": "A's workspace"}, headers={"Authorization": f"Bearer {token_a}"})
+
+    resp_b = client.get("/workspaces", headers={"Authorization": f"Bearer {token_b}"})
+    assert resp_b.json() == []  # user B sees nothing of user A's
+
+
+def test_rename_workspace(client):
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Old Name"}, headers=headers).json()["workspace_id"]
+
+    resp = client.patch(f"/workspaces/{workspace_id}", json={"name": "New Name"}, headers=headers)
+    assert resp.status_code == 200
+
+    detail = client.get(f"/workspaces/{workspace_id}", headers=headers)
+    assert detail.json()["name"] == "New Name"
+
+
+def test_rename_unknown_workspace_returns_404(client):
+    token = _register_and_login(client)
+    resp = client.patch("/workspaces/not-a-real-id", json={"name": "X"},
+                         headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 404
+
+
+def test_generation_can_be_assigned_to_a_workspace_at_creation(client):
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Pitch Decks"}, headers=headers).json()["workspace_id"]
+
+    gen_resp = client.post("/generate/topic",
+                            json={"topic": "Volcanoes", "slide_count": 4, "workspace_id": workspace_id},
+                            headers=headers)
+    assert gen_resp.status_code == 200
+
+    detail = client.get(f"/workspaces/{workspace_id}", headers=headers)
+    assert detail.status_code == 200
+    assert len(detail.json()["projects"]) == 1
+
+
+def test_generation_with_unowned_workspace_id_is_rejected(client):
+    """A caller can't attach their generation to a workspace_id they
+    don't own — checked BEFORE any generation work happens."""
+    token_a = _register_and_login(client, "a@example.com")
+    token_b = _register_and_login(client, "b@example.com")
+    workspace_id = client.post("/workspaces", json={"name": "A's private workspace"},
+                                headers={"Authorization": f"Bearer {token_a}"}).json()["workspace_id"]
+
+    resp = client.post("/generate/topic",
+                        json={"topic": "Volcanoes", "slide_count": 4, "workspace_id": workspace_id},
+                        headers={"Authorization": f"Bearer {token_b}"})
+    assert resp.status_code == 404
+
+
+def test_projects_endpoint_filters_by_workspace_id(client):
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    ws1 = client.post("/workspaces", json={"name": "Workspace 1"}, headers=headers).json()["workspace_id"]
+    ws2 = client.post("/workspaces", json={"name": "Workspace 2"}, headers=headers).json()["workspace_id"]
+
+    client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4, "workspace_id": ws1}, headers=headers)
+    client.post("/generate/topic", json={"topic": "Rivers", "slide_count": 4, "workspace_id": ws2}, headers=headers)
+    client.post("/generate/topic", json={"topic": "Mountains", "slide_count": 4}, headers=headers)  # ungrouped
+
+    all_projects = client.get("/projects", headers=headers).json()
+    assert len(all_projects) == 3  # unfiltered still sees everything, pre-ADR-044 behavior
+
+    ws1_projects = client.get(f"/projects?workspace_id={ws1}", headers=headers).json()
+    assert len(ws1_projects) == 1
+    assert ws1_projects[0]["workspace_id"] == ws1
+
+
+def test_deleting_workspace_does_not_delete_its_projects(client):
+    """The core design guarantee of ADR-044, tested end to end through
+    the real API: a project's actual content must survive its
+    workspace being deleted, just landing back in the ungrouped list."""
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Temporary"}, headers=headers).json()["workspace_id"]
+    gen_resp = client.post("/generate/topic",
+                            json={"topic": "Volcanoes", "slide_count": 4, "workspace_id": workspace_id},
+                            headers=headers)
+    project_id = _poll_job_until_done(
+        client,
+        client.post("/generate/topic/async",
+                     json={"topic": "Volcanoes", "slide_count": 4, "workspace_id": workspace_id},
+                     headers=headers).json()["job_id"],
+    )["project_id"]
+
+    delete_resp = client.delete(f"/workspaces/{workspace_id}", headers=headers)
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+
+    # workspace itself is gone
+    assert client.get(f"/workspaces/{workspace_id}", headers=headers).status_code == 404
+
+    # but the project the workspace contained is very much still there,
+    # just ungrouped now
+    project_detail = client.get(f"/projects/{project_id}", headers=headers)
+    assert project_detail.status_code == 200
+
+    all_projects = client.get("/projects", headers=headers).json()
+    matching = [p for p in all_projects if p["project_id"] == project_id]
+    assert len(matching) == 1
+    assert matching[0]["workspace_id"] is None
+
+
+def test_delete_unknown_workspace_returns_404(client):
+    token = _register_and_login(client)
+    resp = client.delete("/workspaces/not-a-real-id", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 404
+
+
+# -- Brand Memory (ADR-045, v3 Phase 5) ------------------------------------
+
+def test_get_brand_profile_before_ever_setting_one_returns_empty_not_404(client):
+    """A workspace that's never had a brand profile set is a normal
+    state (200, all-blank fields), not an error — only an unowned or
+    nonexistent WORKSPACE is a 404."""
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Fresh"}, headers=headers).json()["workspace_id"]
+
+    resp = client.get(f"/workspaces/{workspace_id}/brand", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["name"] == ""
+    assert resp.json()["colors"] == ""
+
+
+def test_set_and_get_brand_profile(client):
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Acme"}, headers=headers).json()["workspace_id"]
+
+    set_resp = client.put(f"/workspaces/{workspace_id}/brand",
+                           json={"name": "Acme Corp", "colors": "Blue and purple", "tone": "Playful",
+                                 "audience": "Investors", "visual_style": "Minimal"},
+                           headers=headers)
+    assert set_resp.status_code == 200
+    assert set_resp.json()["name"] == "Acme Corp"
+
+    get_resp = client.get(f"/workspaces/{workspace_id}/brand", headers=headers)
+    assert get_resp.json()["colors"] == "Blue and purple"
+    assert get_resp.json()["tone"] == "Playful"
+
+
+def test_brand_endpoints_require_workspace_ownership(client):
+    token_a = _register_and_login(client, "a@example.com")
+    token_b = _register_and_login(client, "b@example.com")
+    workspace_id = client.post("/workspaces", json={"name": "A's workspace"},
+                                headers={"Authorization": f"Bearer {token_a}"}).json()["workspace_id"]
+
+    resp = client.put(f"/workspaces/{workspace_id}/brand", json={"name": "Hijacked"},
+                       headers={"Authorization": f"Bearer {token_b}"})
+    assert resp.status_code == 404
+
+
+def test_brand_endpoints_require_auth(client):
+    resp = client.get("/workspaces/some-id/brand")
+    assert resp.status_code == 401
+
+
+def test_delete_brand_profile(client):
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Acme"}, headers=headers).json()["workspace_id"]
+    client.put(f"/workspaces/{workspace_id}/brand", json={"name": "Acme Corp"}, headers=headers)
+
+    delete_resp = client.delete(f"/workspaces/{workspace_id}/brand", headers=headers)
+    assert delete_resp.status_code == 200
+
+    get_resp = client.get(f"/workspaces/{workspace_id}/brand", headers=headers)
+    assert get_resp.json()["name"] == ""  # back to the never-set state
+
+
+def test_generation_into_a_branded_workspace_still_succeeds(client):
+    """End-to-end proof that setting a brand profile and then
+    generating into that workspace doesn't break anything — the
+    actual prompt content isn't observable from the HTTP layer (no
+    real AI provider is configured in this hermetic suite), but the
+    whole request path (fetch brand -> thread into GenerationRequest
+    -> deterministic fallback since no AI configured) must complete
+    normally end to end."""
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Branded"}, headers=headers).json()["workspace_id"]
+    client.put(f"/workspaces/{workspace_id}/brand",
+               json={"name": "Acme Corp", "tone": "Playful"}, headers=headers)
+
+    resp = client.post("/generate/topic",
+                        json={"topic": "Volcanoes", "slide_count": 4, "workspace_id": workspace_id},
+                        headers=headers)
+    assert resp.status_code == 200
+
+
+def test_generation_into_workspace_with_no_brand_set_still_succeeds(client):
+    """The far more common case — a workspace with no brand profile at
+    all — must be entirely unaffected by ADR-045 existing."""
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Unbranded"}, headers=headers).json()["workspace_id"]
+
+    resp = client.post("/generate/topic",
+                        json={"topic": "Volcanoes", "slide_count": 4, "workspace_id": workspace_id},
+                        headers=headers)
+    assert resp.status_code == 200
+
+
+def test_generation_into_branded_workspace_async_full_round_trip(client):
+    """Confirms the job-payload serialize/reconstruct path (BrandProfile
+    dict -> job.payload["brand"] -> reconstructed dataclass in the
+    worker) works end to end through async generation, not just sync."""
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Branded Async"}, headers=headers).json()["workspace_id"]
+    client.put(f"/workspaces/{workspace_id}/brand", json={"tone": "Playful"}, headers=headers)
+
+    enqueue_resp = client.post("/generate/topic/async",
+                                json={"topic": "Volcanoes", "slide_count": 4, "workspace_id": workspace_id},
+                                headers=headers)
+    assert enqueue_resp.status_code == 200
+    job_id = enqueue_resp.json()["job_id"]
+    result = _poll_job_until_done(client, job_id)
+    assert result["structure_source"] == "deterministic-topic"
+
+
+def test_document_upload_generation_into_branded_workspace_succeeds(client):
+    """ADR-045's document-mode gap closure — a document-upload
+    generation into a workspace WITH a brand profile must complete
+    normally end to end (sync path), proving the brand fetch/thread-
+    through added to /generate doesn't break the existing upload flow."""
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Branded Docs"}, headers=headers).json()["workspace_id"]
+    client.put(f"/workspaces/{workspace_id}/brand", json={"tone": "Playful"}, headers=headers)
+
+    resp = client.post(
+        f"/generate?workspace_id={workspace_id}",
+        files={"file": ("water_cycle.txt", SAMPLE_TEXT_DOC, "text/plain")},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+
+def test_document_upload_generation_into_branded_workspace_async_full_round_trip(client):
+    """Same as above but through the async/job-payload path — proves
+    the serialize-brand-into-payload / reconstruct-in-worker round
+    trip works for document uploads too, not just topic generation."""
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    workspace_id = client.post("/workspaces", json={"name": "Branded Docs Async"},
+                                headers=headers).json()["workspace_id"]
+    client.put(f"/workspaces/{workspace_id}/brand", json={"tone": "Playful"}, headers=headers)
+
+    enqueue_resp = client.post(
+        f"/generate/async?workspace_id={workspace_id}",
+        files={"file": ("water_cycle.txt", SAMPLE_TEXT_DOC, "text/plain")},
+        headers=headers,
+    )
+    assert enqueue_resp.status_code == 200
+    job_id = enqueue_resp.json()["job_id"]
+    result = _poll_job_until_done(client, job_id)
+    assert result["structure_source"] in ("rule-based", "ai-generated")
+
+
+# -- Real PDF end to end, all 5 export formats (ADR-050) -------------------
+# Closes a real, previously-untested gap: the v3 roadmap had CLAIMED
+# "convert PDF into X already works, no new extraction logic needed"
+# across Phase 3/6, but every prior HTTP test used a .txt fixture —
+# the only PDF ever sent through the real HTTP layer before this was
+# the deliberately-corrupt one in test_generate_corrupt_pdf_returns_422.
+# A real, valid PDF had never actually been proven to work end to end
+# through the API until now.
+
+def test_generate_from_real_pdf_sync(client):
+    resp = client.post("/generate", files={"file": ("water_cycle.pdf", SAMPLE_PDF_DOC, "application/pdf")})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+
+
+@pytest.mark.parametrize("export_format", [
+    "document_docx", "infographic_svg", "diagram_svg", "poster_svg",
+])
+def test_generate_from_real_pdf_every_non_pptx_format(client, export_format):
+    resp = client.post(
+        "/generate",
+        files={"file": ("water_cycle.pdf", SAMPLE_PDF_DOC, "application/pdf")},
+        params={"export_format": export_format},
+    )
+    assert resp.status_code == 200
+
+
+# -- Document Q&A (ADR-050, v3 Phase 7) -------------------------------------
+
+def test_ask_document_requires_a_question(client):
+    resp = client.post("/documents/ask", files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")})
+    assert resp.status_code == 400
+
+
+def test_ask_document_returns_an_answer_field(client):
+    """Hermetic suite has no AI configured, so this exercises the
+    NullAdapter degradation path specifically — still a real 200 with
+    a real (honest) answer field, not an error."""
+    resp = client.post(
+        "/documents/ask",
+        files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")},
+        params={"question": "What causes precipitation?"},
+    )
+    assert resp.status_code == 200
+    assert "answer" in resp.json()
+    assert "not configured" in resp.json()["answer"].lower()
+
+
+def test_ask_document_works_with_a_real_pdf(client):
+    resp = client.post(
+        "/documents/ask",
+        files={"file": ("water_cycle.pdf", SAMPLE_PDF_DOC, "application/pdf")},
+        params={"question": "What is this document about?"},
+    )
+    assert resp.status_code == 200
+    assert "answer" in resp.json()
+
+
+def test_ask_document_unsupported_filetype_returns_400(client):
+    resp = client.post(
+        "/documents/ask",
+        files={"file": ("data.xyz", b"whatever content", "application/octet-stream")},
+        params={"question": "test?"},
+    )
+    assert resp.status_code == 400
+
+
+def test_ask_document_corrupt_pdf_returns_422(client):
+    resp = client.post(
+        "/documents/ask",
+        files={"file": ("broken.pdf", b"this is not a real pdf file at all", "application/pdf")},
+        params={"question": "test?"},
+    )
+    assert resp.status_code == 422
+
+
+def test_ask_document_gated_by_its_own_quota_not_generation_quota(client, monkeypatch):
+    """ADR-050's whole point in having a SEPARATE quota bucket from
+    generation, proven — a generation-quota env var set to 0 must NOT
+    block Q&A, and vice versa."""
+    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "0")
+    resp = client.post(
+        "/documents/ask",
+        files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")},
+        params={"question": "test?"},
+    )
+    assert resp.status_code == 200  # generation's cap being 0 doesn't touch Q&A
+
+
+def test_ask_document_blocked_after_its_own_daily_limit(client, monkeypatch):
+    monkeypatch.setenv("OPENPRESENT_DAILY_QA_LIMIT_ANON", "2")
+    for _ in range(2):
+        resp = client.post(
+            "/documents/ask",
+            files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")},
+            params={"question": "test?"},
+        )
+        assert resp.status_code == 200
+    blocked = client.post(
+        "/documents/ask",
+        files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")},
+        params={"question": "test?"},
+    )
+    assert blocked.status_code == 429
+
+
+def test_generate_topic_as_document_docx_sync(client):
+    """Same engine, same request shape — only export_format differs.
+    No new endpoint was needed for this format, by design."""
+    resp = client.post("/generate/topic", json={
+        "topic": "Renewable Energy Adoption", "slide_count": 4,
+        "export_format": "document_docx",
+    })
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert 'filename="document.docx"' in resp.headers["content-disposition"]
+    doc = Document(io.BytesIO(resp.content))  # a real, parseable docx
+    assert len(doc.paragraphs) > 0
+
+
+def test_generate_topic_as_document_docx_is_not_bundled_with_speaker_notes(client):
+    """The pptx path bundles a speaker_notes.docx companion by default —
+    that guard is keyed on export_format == 'pptx', so a document
+    export must come back as a bare .docx, never a .zip."""
+    resp = client.post("/generate/topic", json={
+        "topic": "Renewable Energy Adoption", "slide_count": 4,
+        "export_format": "document_docx", "bundle_speaker_notes": True,
+    })
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] != "application/zip"
+
+
+def test_generate_topic_document_docx_async_full_round_trip(client):
+    enqueue_resp = client.post("/generate/topic/async", json={
+        "topic": "Renewable Energy Adoption", "slide_count": 4,
+        "export_format": "document_docx",
+    })
+    assert enqueue_resp.status_code == 200
+    job_id = enqueue_resp.json()["job_id"]
+
+    result = _poll_job_until_done(client, job_id)
+    assert result["structure_source"] == "deterministic-topic"
+
+    download_resp = client.get(f"/jobs/{job_id}/download")
+    assert download_resp.status_code == 200
+    assert download_resp.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert 'filename="document.docx"' in download_resp.headers["content-disposition"]
+    doc = Document(io.BytesIO(download_resp.content))
+    assert len(doc.paragraphs) > 0
+
+
+# -- Infographics, first Phase 6 render target (ADR-046) -------------------
+
+def test_generate_topic_as_infographic_svg_sync(client):
+    """Same engine, same request shape — only export_format differs,
+    same pattern document_docx established in ADR-041."""
+    resp = client.post("/generate/topic", json={
+        "topic": "Renewable Energy Adoption", "slide_count": 4,
+        "export_format": "infographic_svg",
+    })
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/svg+xml"
+    assert 'filename="infographic.svg"' in resp.headers["content-disposition"]
+    assert resp.content.strip().startswith(b"<svg")
+
+
+def test_generate_topic_as_infographic_svg_is_not_bundled(client):
+    resp = client.post("/generate/topic", json={
+        "topic": "Renewable Energy Adoption", "slide_count": 4,
+        "export_format": "infographic_svg", "bundle_speaker_notes": True,
+    })
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] != "application/zip"
+
+
+def test_generate_topic_infographic_svg_async_full_round_trip(client):
+    enqueue_resp = client.post("/generate/topic/async", json={
+        "topic": "Renewable Energy Adoption", "slide_count": 4,
+        "export_format": "infographic_svg",
+    })
+    assert enqueue_resp.status_code == 200
+    job_id = enqueue_resp.json()["job_id"]
+
+    result = _poll_job_until_done(client, job_id)
+    assert result["structure_source"] == "deterministic-topic"
+
+    download_resp = client.get(f"/jobs/{job_id}/download")
+    assert download_resp.status_code == 200
+    assert download_resp.headers["content-type"] == "image/svg+xml"
+    assert 'filename="infographic.svg"' in download_resp.headers["content-disposition"]
+    assert download_resp.content.strip().startswith(b"<svg")
+
+
+def test_generate_document_upload_as_infographic_svg(client):
+    """Document-upload mode can target infographic_svg too — no format-
+    specific gating anywhere, it's a normal ExportPort choice on any
+    generation entry point, same as document_docx before it."""
+    resp = client.post(
+        "/generate",
+        files={"file": ("water_cycle.txt", SAMPLE_TEXT_DOC, "text/plain")},
+        params={"export_format": "infographic_svg"},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/svg+xml"
+
+
+# -- Diagrams, second Phase 6 render target (ADR-047) -----------------------
+
+def test_generate_topic_as_diagram_svg_sync(client):
+    resp = client.post("/generate/topic", json={
+        "topic": "Customer Onboarding Process", "slide_count": 4,
+        "export_format": "diagram_svg",
+    })
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/svg+xml"
+    assert 'filename="diagram.svg"' in resp.headers["content-disposition"]
+    assert resp.content.strip().startswith(b"<svg")
+
+
+def test_generate_topic_as_diagram_svg_is_not_bundled(client):
+    resp = client.post("/generate/topic", json={
+        "topic": "Customer Onboarding Process", "slide_count": 4,
+        "export_format": "diagram_svg", "bundle_speaker_notes": True,
+    })
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] != "application/zip"
+
+
+def test_generate_topic_diagram_svg_async_full_round_trip(client):
+    enqueue_resp = client.post("/generate/topic/async", json={
+        "topic": "Customer Onboarding Process", "slide_count": 4,
+        "export_format": "diagram_svg",
+    })
+    assert enqueue_resp.status_code == 200
+    job_id = enqueue_resp.json()["job_id"]
+
+    result = _poll_job_until_done(client, job_id)
+    assert result["structure_source"] == "deterministic-topic"
+
+    download_resp = client.get(f"/jobs/{job_id}/download")
+    assert download_resp.status_code == 200
+    assert download_resp.headers["content-type"] == "image/svg+xml"
+    assert 'filename="diagram.svg"' in download_resp.headers["content-disposition"]
+    assert download_resp.content.strip().startswith(b"<svg")
+
+
+def test_generate_document_upload_as_diagram_svg(client):
+    resp = client.post(
+        "/generate",
+        files={"file": ("water_cycle.txt", SAMPLE_TEXT_DOC, "text/plain")},
+        params={"export_format": "diagram_svg"},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/svg+xml"
+
+
+# -- Posters, third and final Phase 6 render target (ADR-048) --------------
+
+def test_generate_topic_as_poster_svg_sync(client):
+    resp = client.post("/generate/topic", json={
+        "topic": "Renewable Energy Adoption", "slide_count": 4,
+        "export_format": "poster_svg",
+    })
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/svg+xml"
+    assert 'filename="poster.svg"' in resp.headers["content-disposition"]
+    assert resp.content.strip().startswith(b"<svg")
+
+
+def test_generate_topic_as_poster_svg_is_not_bundled(client):
+    resp = client.post("/generate/topic", json={
+        "topic": "Renewable Energy Adoption", "slide_count": 4,
+        "export_format": "poster_svg", "bundle_speaker_notes": True,
+    })
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] != "application/zip"
+
+
+def test_generate_topic_poster_svg_async_full_round_trip(client):
+    enqueue_resp = client.post("/generate/topic/async", json={
+        "topic": "Renewable Energy Adoption", "slide_count": 4,
+        "export_format": "poster_svg",
+    })
+    assert enqueue_resp.status_code == 200
+    job_id = enqueue_resp.json()["job_id"]
+
+    result = _poll_job_until_done(client, job_id)
+    assert result["structure_source"] == "deterministic-topic"
+
+    download_resp = client.get(f"/jobs/{job_id}/download")
+    assert download_resp.status_code == 200
+    assert download_resp.headers["content-type"] == "image/svg+xml"
+    assert 'filename="poster.svg"' in download_resp.headers["content-disposition"]
+    assert download_resp.content.strip().startswith(b"<svg")
+
+
+def test_generate_document_upload_as_poster_svg(client):
+    resp = client.post(
+        "/generate",
+        files={"file": ("water_cycle.txt", SAMPLE_TEXT_DOC, "text/plain")},
+        params={"export_format": "poster_svg"},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/svg+xml"
 
 
 def test_jobs_endpoint_surfaces_stage_while_running(client):

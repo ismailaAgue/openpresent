@@ -21,9 +21,11 @@ would undermine the classifier/recipe system from ADR-020.
 """
 
 import uuid
+from typing import Callable
 from backend.adapters import registry
 from backend.models.recipe import Recipe
 from backend.monitoring.sentry_setup import capture_exception
+from backend.ports.brand import BrandProfile
 
 MAX_REWRITTEN_TITLE_LENGTH = 80
 TITLE_REWRITE_INSTRUCTIONS = (
@@ -32,24 +34,49 @@ TITLE_REWRITE_INSTRUCTIONS = (
     "no explanation."
 )
 
+# ADR-040 — same stage vocabulary as engines/ai_generate.py's topic
+# pipeline, so the frontend's step indicator works identically for both
+# job types. This pipeline is single-pass rule-based structure + optional
+# AI enhancement (not the topic pipeline's separate outline/content/layout
+# calls), so only 4 of the 6 shared labels apply here — deliberately not
+# padded out with stages that don't correspond to real work in this path.
+STAGE_UNDERSTANDING = "understanding_request"
+STAGE_OUTLINE = "building_outline"
+STAGE_CONTENT = "generating_content"
+STAGE_DESIGN = "applying_design"
+
+
+def _report(on_stage: Callable[[str], None] | None, stage: str) -> None:
+    if on_stage is None:
+        return
+    try:
+        on_stage(stage)
+    except Exception as e:
+        capture_exception(e, tags={"stage": "progress_report"})
+
 
 def generate_presentation(file_bytes: bytes, filename: str, export_format: str = "pptx",
                            audience_type: str = "student_school", language: str = "en",
                            target_slide_count: int | None = None,
-                           project_id: str | None = None) -> tuple[Recipe, bytes]:
+                           project_id: str | None = None,
+                           on_stage: Callable[[str], None] | None = None,
+                           brand: BrandProfile | None = None) -> tuple[Recipe, bytes]:
     project_id = project_id or str(uuid.uuid4())
 
+    _report(on_stage, STAGE_UNDERSTANDING)
     ingestion = registry.get_ingestion_adapter(filename)
     source_text = ingestion.extract_text(file_bytes, filename)
 
+    _report(on_stage, STAGE_OUTLINE)
     structure = registry.get_structure_adapter()
     outline = structure.build_outline(source_text, audience_type)
 
     ai = registry.get_ai_adapter()
     if ai.is_available():
+        _report(on_stage, STAGE_CONTENT)
         try:
             outline = ai.propose_structure(outline, source_text, target_slide_count=target_slide_count)
-            _apply_title_enhancement(outline, ai)
+            _apply_title_enhancement(outline, ai, brand)
         except Exception as e:
             # AIPort methods are contractually never supposed to raise
             # (they should self-degrade), but this is the last line of
@@ -70,6 +97,7 @@ def generate_presentation(file_bytes: bytes, filename: str, export_format: str =
     # engine produced it — no error, no block, no visible difference
     # to the calling code. This is the enforced guarantee, not a hope.
 
+    _report(on_stage, STAGE_DESIGN)
     design = registry.get_design_adapter()
     from backend.models.recipe import Theme
     recipe = design.apply_theme(
@@ -106,17 +134,34 @@ def _apply_translation(outline, ai, language: str) -> None:
                 block.text = ai.translate(block.text, language) or block.text
 
 
-def _apply_title_enhancement(outline, ai) -> None:
+def _apply_title_enhancement(outline, ai, brand: BrandProfile | None = None) -> None:
     """Improve only the title slide's title via AI rewrite, in place.
     Never raises, never leaves the outline in a worse state than
     before — an empty, absurdly long, or otherwise unusable AI result
-    is silently discarded in favor of the original rule-based title."""
+    is silently discarded in favor of the original rule-based title.
+
+    ADR-045 (Brand Memory, closing the document-mode gap left open
+    when Brand Memory first shipped): if the workspace has a brand
+    profile, its tone/visual_style — the two fields actually about
+    phrasing rather than content — are appended to the rewrite
+    instructions. This is the ONE AI touchpoint in this pipeline about
+    phrasing/tone (propose_structure is about document structure, not
+    style, so it's not a natural fit for brand tone the way this is —
+    same reasoning the topic pipeline's Strategy stage used to decide
+    where brand context belongs)."""
     if not outline.slides:
         return
     title_slide = outline.slides[0]
     original = title_slide.title
+    instructions = TITLE_REWRITE_INSTRUCTIONS
+    if brand and not brand.is_empty() and (brand.tone or brand.visual_style):
+        brand_hint = " ".join(filter(None, [
+            f"Match this brand's tone: {brand.tone}." if brand.tone else "",
+            f"Visual style direction: {brand.visual_style}." if brand.visual_style else "",
+        ]))
+        instructions = f"{TITLE_REWRITE_INSTRUCTIONS} {brand_hint}"
     try:
-        rewritten = ai.rewrite(original, instructions=TITLE_REWRITE_INSTRUCTIONS)
+        rewritten = ai.rewrite(original, instructions=instructions)
     except Exception:
         return  # AI Port methods shouldn't raise, but never trust that blindly here
 

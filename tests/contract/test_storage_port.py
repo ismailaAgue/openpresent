@@ -70,3 +70,88 @@ def test_delete_respects_ownership():
     assert storage.delete_recipe(project_id, "user2") is False  # wrong owner
     assert storage.delete_recipe(project_id, "user1") is True   # correct owner
     assert storage.get_recipe(project_id, "user1") is None
+
+
+# -- workspace_id (ADR-044) -----------------------------------------------
+
+def test_save_recipe_with_workspace_id_is_reflected_in_list_projects():
+    storage = SqliteStorageAdapter(":memory:")
+    storage.save_recipe("user1", make_recipe("p1"), "Deck A", workspace_id="ws1")
+    projects = storage.list_projects("user1")
+    assert projects[0].workspace_id == "ws1"
+
+
+def test_save_recipe_without_workspace_id_defaults_to_none():
+    """Pre-ADR-044 behavior, unchanged: omitting workspace_id entirely
+    saves an ungrouped project, same as before this field existed."""
+    storage = SqliteStorageAdapter(":memory:")
+    storage.save_recipe("user1", make_recipe("p1"), "Deck A")
+    projects = storage.list_projects("user1")
+    assert projects[0].workspace_id is None
+
+
+def test_list_projects_filters_by_workspace_id():
+    storage = SqliteStorageAdapter(":memory:")
+    storage.save_recipe("user1", make_recipe("p1"), "In Workspace", workspace_id="ws1")
+    storage.save_recipe("user1", make_recipe("p2"), "Ungrouped")
+    storage.save_recipe("user1", make_recipe("p3"), "Different Workspace", workspace_id="ws2")
+
+    ws1_only = storage.list_projects("user1", workspace_id="ws1")
+    assert len(ws1_only) == 1
+    assert ws1_only[0].title == "In Workspace"
+
+    everything = storage.list_projects("user1")  # no filter -> pre-ADR-044 behavior, sees all 3
+    assert len(everything) == 3
+
+
+def test_re_saving_an_existing_project_without_workspace_id_does_not_unassign_it():
+    """A slide edit (re-save of an existing project) must never
+    silently un-assign a project from its workspace just because the
+    edit call site doesn't happen to know/pass workspace_id."""
+    storage = SqliteStorageAdapter(":memory:")
+    recipe = make_recipe("p1")
+    storage.save_recipe("user1", recipe, "Deck A", workspace_id="ws1")
+
+    storage.save_recipe("user1", recipe, "Deck A (edited)")  # no workspace_id passed this time
+
+    projects = storage.list_projects("user1")
+    assert projects[0].workspace_id == "ws1"  # still assigned, not wiped out
+    assert projects[0].title == "Deck A (edited)"  # the actual edit did apply
+
+
+def test_re_saving_with_a_new_workspace_id_does_reassign_it():
+    storage = SqliteStorageAdapter(":memory:")
+    recipe = make_recipe("p1")
+    storage.save_recipe("user1", recipe, "Deck A", workspace_id="ws1")
+    storage.save_recipe("user1", recipe, "Deck A", workspace_id="ws2")
+    assert storage.list_projects("user1")[0].workspace_id == "ws2"
+
+
+def test_unassign_workspace_clears_workspace_id_on_matching_projects():
+    storage = SqliteStorageAdapter(":memory:")
+    storage.save_recipe("user1", make_recipe("p1"), "Deck A", workspace_id="ws1")
+    storage.save_recipe("user1", make_recipe("p2"), "Deck B", workspace_id="ws1")
+    storage.save_recipe("user1", make_recipe("p3"), "Deck C", workspace_id="ws2")
+
+    storage.unassign_workspace("ws1", "user1")
+
+    projects_by_title = {p.title: p.workspace_id for p in storage.list_projects("user1")}
+    assert projects_by_title["Deck A"] is None
+    assert projects_by_title["Deck B"] is None
+    assert projects_by_title["Deck C"] == "ws2"  # untouched — different workspace
+
+
+def test_unassign_workspace_respects_ownership():
+    """Must not be possible to unassign another user's projects by
+    guessing/reusing a workspace_id string."""
+    storage = SqliteStorageAdapter(":memory:")
+    storage.save_recipe("user1", make_recipe("p1"), "Deck A", workspace_id="ws1")
+
+    storage.unassign_workspace("ws1", "user2")  # wrong owner — must be a no-op
+
+    assert storage.list_projects("user1")[0].workspace_id == "ws1"  # untouched
+
+
+def test_unassign_workspace_with_no_matching_projects_is_a_silent_no_op():
+    storage = SqliteStorageAdapter(":memory:")
+    storage.unassign_workspace("nonexistent-workspace", "user1")  # must not raise

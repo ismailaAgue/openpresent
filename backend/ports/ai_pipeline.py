@@ -43,6 +43,7 @@ Five real stages now, five real (potential) AI calls per generation:
 from dataclasses import dataclass, field
 from typing import Protocol
 from backend.models.recipe import Outline
+from backend.ports.brand import BrandProfile
 
 
 @dataclass
@@ -52,6 +53,7 @@ class GenerationRequest:
     audience_type: str = "general"
     language: str = "en"
     tone: str = "professional"
+    brand: BrandProfile | None = None  # ADR-045 — optional; None is today's exact pre-existing behavior
 
 
 @dataclass

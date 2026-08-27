@@ -18,8 +18,23 @@ from backend.engines.generate import generate_presentation
 from backend.engines.ai_generate import generate_presentation_from_topic
 from backend.engines.export_bundle import build_export_bundle
 from backend.monitoring.sentry_setup import init_sentry, capture_exception
+from backend.ports.brand import BrandProfile
 
 init_sentry()  # no-op unless SENTRY_DSN is configured
+
+
+def _brand_from_payload(payload: dict) -> BrandProfile | None:
+    """ADR-045 — job payloads are plain JSON, so the enqueue side sends
+    the BrandProfile's fields as a dict (or None); this reconstructs
+    the actual dataclass the engine expects. workspace_id/owner_id/
+    timestamps aren't meaningful here (this is a transient, in-flight
+    value, not a stored record) so they're left at their dataclass
+    defaults — only the fields the prompt-builder actually reads
+    (name/colors/tone/audience/visual_style) matter."""
+    raw = payload.get("brand")
+    if not raw:
+        return None
+    return BrandProfile(workspace_id="", owner_id="", **raw)
 
 
 def process_one_job() -> bool:
@@ -43,6 +58,7 @@ def process_one_job() -> bool:
                 export_format=job.payload.get("export_format", "pptx"),
                 # ADR-040 — best-effort live progress for the studio UI.
                 on_stage=lambda stage: queue.update_stage(job.id, stage),
+                brand=_brand_from_payload(job.payload),  # ADR-045
             )
         else:
             file_bytes = base64.b64decode(job.payload["file_b64"])
@@ -53,6 +69,8 @@ def process_one_job() -> bool:
                 audience_type=job.payload.get("audience_type", "student_school"),
                 language=job.payload.get("language", "en"),
                 target_slide_count=job.payload.get("target_slide_count"),
+                on_stage=lambda stage: queue.update_stage(job.id, stage),
+                brand=_brand_from_payload(job.payload),  # ADR-045
             )
 
         project_id = None
@@ -64,7 +82,7 @@ def process_one_job() -> bool:
             # the no-account-required promise for quick use).
             storage = registry.get_storage_adapter()
             title = recipe.outline.slides[0].title if recipe.outline.slides else "Untitled"
-            project_id = storage.save_recipe(owner_id, recipe, title)
+            project_id = storage.save_recipe(owner_id, recipe, title, workspace_id=job.payload.get("workspace_id"))
 
         result = {
             "structure_source": recipe.outline.structure_source.value,

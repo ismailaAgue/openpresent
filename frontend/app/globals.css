@@ -310,6 +310,56 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
 }
 .op-project-item:hover { color: var(--op-violet); }
 
+.op-projects-label-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.op-projects-label-row .op-projects-label { margin-bottom: 0; }
+.op-workspace-add-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 5px; border: none;
+  background: none; color: var(--op-text-muted); cursor: pointer;
+}
+.op-workspace-add-btn:hover { background: var(--op-bg-panel); color: var(--op-violet); }
+.op-workspace-add-btn svg { width: 14px; height: 14px; }
+
+.op-workspace-row {
+  display: flex; align-items: center; gap: 5px;
+  padding: 6px 2px; border-radius: 6px; cursor: pointer; font-size: 13.5px;
+}
+.op-workspace-row:hover { background: var(--op-bg-panel); }
+.op-workspace-row svg { width: 14px; height: 14px; flex-shrink: 0; color: var(--op-text-muted); }
+.op-workspace-name {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--op-text);
+}
+.op-workspace-delete-btn {
+  display: none; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 5px; border: none; background: none; cursor: pointer;
+}
+.op-workspace-row:hover .op-workspace-delete-btn { display: flex; }
+.op-workspace-delete-btn:hover { background: var(--op-border); }
+.op-workspace-delete-btn svg { color: var(--op-text-muted); }
+.op-workspace-delete-btn:hover svg { color: #B3402A; }
+.op-workspace-projects { padding-left: 22px; margin-bottom: 4px; }
+
+.op-brand-toggle-btn {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--op-text-muted); background: none; border: none;
+  cursor: pointer; padding: 6px 0; width: 100%;
+}
+.op-brand-toggle-btn:hover { color: var(--op-violet); }
+.op-brand-toggle-btn svg { width: 13px; height: 13px; }
+
+.op-brand-form {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 10px; margin: 4px 0 8px 0;
+  background: var(--op-bg-panel); border-radius: 8px; border: 1px solid var(--op-border);
+}
+.op-brand-input {
+  font-size: 12.5px; padding: 6px 8px; border-radius: 6px;
+  border: 1px solid var(--op-border); background: #fff; color: var(--op-text);
+  font-family: var(--op-font);
+}
+.op-brand-input:focus { outline: none; border-color: var(--op-violet); }
+.op-brand-form-actions { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+
 .op-sidebar-bottom { display: flex; flex-direction: column; gap: 2px; }
 .op-account {
   display: flex;
@@ -431,6 +481,13 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   border: 1px solid var(--op-border); background: #fff; color: var(--op-text-muted); cursor: pointer;
 }
 .op-mode-pill.active { background: var(--op-bubble-user); color: var(--op-violet); border-color: var(--op-violet); }
+
+.op-workspace-select {
+  font-size: 12.5px; font-weight: 600; padding: 5px 10px; border-radius: 20px;
+  border: 1px solid var(--op-border); background: #fff; color: var(--op-text-muted);
+  margin-left: 4px; cursor: pointer;
+}
+.op-workspace-select:focus { outline: none; border-color: var(--op-violet); color: var(--op-violet); }
 .op-composer-box {
   display: flex; align-items: flex-end; gap: 8px;
   border: 1px solid var(--op-border); border-radius: 14px; padding: 8px 8px 8px 14px;
@@ -485,4 +542,14 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   position: absolute; top: 8px; left: 8px; font-size: 10px; opacity: 0.8;
   background: rgba(0,0,0,0.25); padding: 1px 6px; border-radius: 20px;
 }
+
+.op-infographic-preview {
+  margin: 12px 0 12px 32px;
+  max-width: 480px;
+  border: 1px solid var(--op-border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+.op-infographic-preview img { display: block; width: 100%; height: auto; }
 
