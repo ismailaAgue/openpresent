@@ -86,3 +86,74 @@ def test_clean_outline_has_no_issues_and_high_score():
     _, report = validate_and_fix(outline)
     assert report.issues == []
     assert report.score >= 8.0
+
+
+# -- Format-aware validation (ADR-054) --------------------------------------
+# "Paragraph-length bullet" and "layout overflow risk" are deck-specific
+# defects — a slide bullet SHOULD be short, a scrolling Word document has
+# no fixed layout region to overflow. Flagging either for document_docx
+# would feed a false "problem" into the AI revision pass, which would then
+# shrink real, correctly-generated prose paragraphs back into fragments.
+
+def _paragraph_length_bullet():
+    return bullet("This is a deliberately long bullet point that exceeds the two hundred "
+                   "character poor-hierarchy threshold by being written as a full paragraph "
+                   "of connected prose rather than a short, single-idea slide bullet fragment.")
+
+
+def test_paragraph_length_bullet_flagged_for_pptx():
+    outline = make_outline([
+        Slide(order=1, title="Intro", content_blocks=[_paragraph_length_bullet()]),
+        Slide(order=2, title="Thank You", content_blocks=[bullet("Questions?")]),
+    ])
+    _, report = validate_and_fix(outline, export_format="pptx")
+    assert any("paragraph-length bullet" in i for i in report.issues)
+
+
+def test_paragraph_length_bullet_not_flagged_for_document_docx():
+    """The exact same outline that trips the check for pptx must NOT
+    trip it for document_docx — same content, different format,
+    different verdict, by design."""
+    outline = make_outline([
+        Slide(order=1, title="Intro", content_blocks=[_paragraph_length_bullet()]),
+        Slide(order=2, title="Thank You", content_blocks=[bullet("Questions?")]),
+    ])
+    _, report = validate_and_fix(outline, export_format="document_docx")
+    assert not any("paragraph-length bullet" in i for i in report.issues)
+
+
+def test_format_defaults_to_pptx_behavior_when_unset():
+    """validate_and_fix(outline) with no export_format argument at all
+    (every pre-ADR-054 call site) must keep flagging this exactly as
+    it always did — additive, not a silent behavior change for
+    unmigrated callers."""
+    outline = make_outline([
+        Slide(order=1, title="Intro", content_blocks=[_paragraph_length_bullet()]),
+        Slide(order=2, title="Thank You", content_blocks=[bullet("Questions?")]),
+    ])
+    _, report = validate_and_fix(outline)  # no export_format passed
+    assert any("paragraph-length bullet" in i for i in report.issues)
+
+
+def _overflow_risk_slide():
+    # OVERFLOW_BUDGET_BY_LAYOUT defaults to 420 chars for "bullet_list"
+    # — comfortably exceeded by several long bullets combined. Must be
+    # DISTINCT text per bullet — identical repeated bullets get removed
+    # by the earlier dedupe-repeated-bullets check before this one ever
+    # runs, which would silently drop the total back under budget.
+    return Slide(order=1, title="Crowded", content_blocks=[
+        bullet("a" * 150), bullet("b" * 150), bullet("c" * 150),
+    ])
+
+
+def test_overflow_risk_flagged_for_pptx():
+    outline = make_outline([_overflow_risk_slide(), Slide(order=2, title="Thank You", content_blocks=[bullet("Questions?")])])
+    _, report = validate_and_fix(outline, export_format="pptx")
+    assert any("crowded" in i for i in report.issues)
+
+
+def test_overflow_risk_not_flagged_for_document_docx():
+    outline = make_outline([_overflow_risk_slide(), Slide(order=2, title="Thank You", content_blocks=[bullet("Questions?")])])
+    _, report = validate_and_fix(outline, export_format="document_docx")
+    assert not any("crowded" in i for i in report.issues)
+

@@ -87,7 +87,7 @@ def generate_presentation_from_topic(
     request = GenerationRequest(
         topic=topic.strip(), slide_count=slide_count,
         audience_type=audience_type, language=language, tone=tone,
-        brand=brand,
+        brand=brand, export_format=export_format,  # ADR-054
     )
 
     _report(on_stage, STAGE_UNDERSTANDING)
@@ -98,7 +98,7 @@ def generate_presentation_from_topic(
         outline = build_deterministic_outline(request)
 
     _report(on_stage, STAGE_VISUALS)
-    outline, quality_report = validate_and_fix(outline)
+    outline, quality_report = validate_and_fix(outline, export_format=export_format)
 
     pipeline = registry.get_ai_pipeline_adapter()
     if pipeline.is_available() and quality_report.issues:
@@ -107,7 +107,7 @@ def generate_presentation_from_topic(
                 break
             try:
                 revised = pipeline.review_and_revise(outline, quality_report, request)
-                outline, quality_report = validate_and_fix(revised)
+                outline, quality_report = validate_and_fix(revised, export_format=export_format)
                 add_breadcrumb("quality_review", "revision pass applied",
                                 data={"remaining_issues": len(quality_report.issues)})
             except Exception as e:

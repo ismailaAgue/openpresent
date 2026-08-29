@@ -944,3 +944,84 @@ def test_composite_regenerate_slide_cascades_to_working_provider():
     composite = CompositeAIAdapter([failing, working])
     title, bullets, notes = composite.regenerate_slide(make_regen_context())
     assert title == "Effects on Global Food Security"
+
+
+# -- Format-aware content generation (ADR-054) ------------------------------
+# Before this, _build_content_prompt always asked for terse slide-bullet
+# fragments regardless of export_format — the literal reason a generated
+# "document" read like a reformatted deck instead of a real document.
+
+def test_content_prompt_asks_for_prose_paragraphs_for_document_docx():
+    adapter = gemini_with(content_json())
+    request = GenerationRequest(topic="Photosynthesis", slide_count=3, export_format="document_docx")
+    prompt = adapter._build_content_prompt(request, make_strategy(), make_structure())
+    assert "paragraph" in prompt.lower()
+    assert "not a bullet list" in prompt.lower()
+    assert "terminal punctuation" in prompt.lower()
+
+
+def test_content_prompt_asks_for_bullets_for_pptx():
+    adapter = gemini_with(content_json())
+    request = GenerationRequest(topic="Photosynthesis", slide_count=3, export_format="pptx")
+    prompt = adapter._build_content_prompt(request, make_strategy(), make_structure())
+    assert "bullet point" in prompt.lower()
+    assert "paragraph" not in prompt.lower() or "not a paragraph" in prompt.lower()
+
+
+@pytest.mark.parametrize("fmt", ["infographic_svg", "diagram_svg", "poster_svg"])
+def test_content_prompt_asks_for_punchy_claims_for_visual_formats(fmt):
+    adapter = gemini_with(content_json())
+    request = GenerationRequest(topic="Photosynthesis", slide_count=3, export_format=fmt)
+    prompt = adapter._build_content_prompt(request, make_strategy(), make_structure())
+    assert "punchy" in prompt.lower() or "glance" in prompt.lower()
+
+
+def test_content_prompt_defaults_to_pptx_bullets_when_export_format_unset():
+    """GenerationRequest.export_format defaults to 'pptx', so any call
+    site that never learned about ADR-054 keeps its exact prior
+    behavior — this proves the default, not just that document_docx
+    works when explicitly requested."""
+    adapter = gemini_with(content_json())
+    request = GenerationRequest(topic="Photosynthesis", slide_count=3)  # export_format not set
+    prompt = adapter._build_content_prompt(request, make_strategy(), make_structure())
+    assert "bullet point" in prompt.lower()
+
+
+def test_document_docx_content_is_not_truncated_at_the_slide_bullet_length():
+    """MAX_BULLET_LENGTH (160 chars) is sized for a slide-bullet
+    fragment and would cut a real multi-sentence paragraph off
+    mid-sentence, destroying the trailing punctuation the document
+    renderer's paragraph-vs-list detection depends on. A long,
+    genuinely realistic paragraph must survive intact."""
+    long_paragraph = (
+        "Solar power costs have dropped by roughly eighty percent over the past decade, "
+        "making it the cheapest source of new electricity generation in most markets "
+        "worldwide, a trend driven by manufacturing scale, improved panel efficiency, "
+        "and falling costs for supporting infrastructure such as inverters and racking."
+    )
+    assert len(long_paragraph) > 160  # confirms this test actually exercises the old limit
+    response = json.dumps({"slides": [
+        {"title": "Slide 1", "bullets": [long_paragraph], "speaker_notes": "n"},
+    ]})
+    adapter = gemini_with(response)
+    request = GenerationRequest(topic="Solar", slide_count=1, export_format="document_docx")
+    outline = adapter.generate_slide_content(request, make_strategy(), make_structure(1))
+    stored_text = outline.slides[0].content_blocks[0].text
+    assert stored_text == long_paragraph  # survived whole, including the trailing period
+    assert stored_text.endswith(".")
+
+
+def test_pptx_content_is_still_truncated_at_the_original_bullet_length():
+    """The document-mode length increase must not leak into every
+    other format — pptx (and everything else) keeps the original,
+    deliberately-short fragment ceiling."""
+    long_text = "x" * 300
+    response = json.dumps({"slides": [
+        {"title": "Slide 1", "bullets": [long_text], "speaker_notes": "n"},
+    ]})
+    adapter = gemini_with(response)
+    request = GenerationRequest(topic="Test", slide_count=1, export_format="pptx")
+    outline = adapter.generate_slide_content(request, make_strategy(), make_structure(1))
+    stored_text = outline.slides[0].content_blocks[0].text
+    assert len(stored_text) == 160  # MAX_BULLET_LENGTH, unchanged for this format
+

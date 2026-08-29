@@ -1921,3 +1921,131 @@ suite; verification here was the build + real HTTP requests against
 the running production server, described above).
 
 *Next entry: ADR-054.*
+
+## ADR-054 — Content Actually Shaped for Its Format, Real Document
+Design, and No More Watermarks
+
+**Context:** direct, correct user feedback after living with the
+product for a while: every generated file "looks like a deck but
+with a different format," the design was mediocre, and every export
+carried a "Generated with OpenPresent" watermark. All three were
+real, not perception — this entry fixes all three, and in the
+process finds and fixes four additional bugs that would have
+undermined the fix if left alone.
+
+**1. Watermarks removed.** "Generated with OpenPresent" deleted from
+all three SVG adapters (infographic, diagram, poster) — it was never
+present in PPTX/DOCX to begin with. `FOOTER_HEIGHT` constants kept
+as reserved bottom margin (not deleted) so removing the text didn't
+reintroduce cramped layouts. Regression tests added asserting the
+text's absence explicitly, not just relying on nobody noticing it
+was gone.
+
+**2. Root cause of "looks like a deck": found in TWO separate code
+paths, both fixed.**
+
+*Path A — topic generation's AI pipeline.* `json_pipeline_base.py`'s
+Content-stage prompt was hardcoded to demand "3-5 concise bullet
+points... a single idea, not a paragraph," regardless of what format
+the output would actually become. `GenerationRequest` gained an
+`export_format` field (defaults to `"pptx"` — additive, every
+unmigrated call site keeps its exact prior behavior) and
+`_build_content_prompt` now branches: `document_docx` asks for 1-3
+genuine multi-sentence prose paragraphs ending in terminal
+punctuation; `infographic_svg`/`diagram_svg`/`poster_svg` ask for
+short punchy standalone claims (visual-card content, explicitly not
+slide bullets); `pptx` is unchanged.
+
+*Path B — document-upload's rule-based extractor,* a completely
+different mechanism producing the identical symptom: `rule_based.py`
+(`StructurePort`) split ANY plain prose with no bullet markers on
+sentence boundaries, one bullet per sentence — correct for a slide
+deck, but shattering a source document's own real paragraphs into a
+list that was never meant to be one. `StructurePort.build_outline`
+and every downstream call (`_chunk_body`, `_slides_from_sections`,
+`_known_shape_fallback`, `_minimal_slides_for_thin_content`) now
+thread `export_format` through; for `document_docx` with no bullet
+markers present, the whole section stays one connected paragraph.
+Content genuinely authored as a list (real bullet markers in the
+source) still splits per-item regardless of format — a real list
+stays a real list in a document too.
+
+**3. Two real bugs found while fixing Path A, before they could
+undermine it.** MAX_BULLET_LENGTH (160 chars, sized for a slide-
+bullet fragment) would have silently truncated real prose mid-
+sentence, destroying the trailing punctuation the document renderer
+depends on to detect "this is a paragraph, not a list item" — fixed
+with a format-aware ceiling (1200 chars for document_docx,
+unchanged elsewhere), verified with a test using a paragraph
+deliberately long enough to have tripped the old limit. Separately,
+`quality_validator.py`'s "paragraph-length bullet" and "layout
+overflow risk" checks are deck-specific defects (a slide bullet
+SHOULD be short; a scrolling Word document has no fixed layout
+region to overflow) that would have flagged the new, correctly-
+generated prose as a problem and fed it straight into the AI revision
+pass — which would have dutifully shrunk it back into fragments,
+silently undoing the whole fix. `validate_and_fix` gained the same
+`export_format` parameter and skips both checks for `document_docx`;
+tests prove the *same* input is flagged for `pptx` and not flagged
+for `document_docx`, not just that document mode scores clean by
+coincidence.
+
+**4. Document design, fixed by actually rendering to PDF and looking
+— not by trusting a green test suite, which had nothing to say about
+any of this.** Two more real, independent bugs found this way, not
+guessed at:
+- The title page's "centered" heading was visually left-anchored.
+  Root cause: python-docx's built-in `"Title"` style has a bottom-
+  border box sized to the style's own fixed width, not the page or
+  the actual centered text — confirmed by writing an isolated
+  minimal test file and rendering it before touching the real code.
+  Fixed by abandoning the built-in style for direct paragraph
+  formatting: a real centered run plus a hand-built OOXML paragraph
+  bottom border (`_set_bottom_border`) that spans the true page
+  margins, exactly matching this project's own docx skill's guidance
+  to use a paragraph border rather than a table for a horizontal
+  rule.
+- This adapter never used the project's theme at all — every
+  document rendered in Word's stock blue heading color regardless of
+  the chosen theme, unlike every other export format (pptx,
+  infographic, diagram, poster), which have all consistently applied
+  `_COLOR_SETS` since ADR-046. Now imports the same palette and
+  applies real theme colors to the title and every section heading.
+- Generalized `_should_run_as_paragraph` (singular, n=1 only) into
+  `_all_read_as_prose` (any count): the new content prompt asks for
+  1-3 *separate* paragraph-bullets per section, and the old
+  single-bullet-only heuristic would have rendered multiple real
+  paragraphs as a bulleted list of paragraph-length chunks — still
+  deck-shaped, quietly defeating the entire point. Now: if every
+  bullet in a section reads as a complete sentence, each one becomes
+  its own real paragraph regardless of how many there are; the
+  original single-bullet case is just the n=1 instance of this same
+  rule, not a separate case anymore.
+
+**Status:** Accepted. 26 new tests across 5 files: 3 watermark-
+absence (one per SVG format), 8 on the format-aware content prompt
+and truncation ceiling (document mode asks for prose, pptx keeps
+bullets, visual formats ask for punchy claims, the default is
+unchanged for unmigrated callers, long prose survives intact for
+document mode, pptx keeps the original short ceiling), 6 on the
+quality validator's format-aware skipping (both checks proven to
+fire for pptx and not fire for document_docx on identical input, plus
+the unset-format default), 4 on the structure adapter's prose-
+preservation (stays one paragraph for document_docx, still splits
+per-sentence for pptx, unset-format default unchanged, genuine
+source lists still split per-item even for document_docx), and 6 on
+the document adapter's design fixes (multiple paragraphs render as
+multiple real paragraphs not a list, heading color matches the
+theme, different themes produce genuinely different colors verified
+by direct RGB comparison, a real OOXML paragraph border exists on
+the title page checked at the XML level since python-docx has no
+high-level getter for it, the title paragraph is genuinely centered,
+title color matches the theme). Full suite: 484/484 passing, verified
+3 consecutive clean runs. Three real sample documents were generated
+and actually rendered to PDF via LibreOffice at each stage of this
+fix (before, after the content-shape fix, after the design fix) and
+visually inspected — this is what caught the border-box bug and the
+missing-theme-color bug, neither of which any automated test would
+have caught on its own.
+
+*Next entry: ADR-055.*

@@ -130,3 +130,12 @@ def test_special_characters_are_escaped_not_breaking_the_xml():
     ]
     output = InfographicSvgExportAdapter().export(make_recipe(slides=slides))
     parse(output)  # must not raise — proves escaping worked, not just "didn't crash by luck"
+
+
+def test_no_watermark_text_in_output():
+    """ADR-054 — 'Generated with OpenPresent' was removed from every
+    SVG format's rendered output. Explicit regression test, not just
+    an absence nobody happens to assert on."""
+    output = InfographicSvgExportAdapter().export(make_recipe())
+    assert b"OpenPresent" not in output
+    assert b"Generated with" not in output

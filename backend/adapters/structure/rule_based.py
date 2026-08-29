@@ -44,6 +44,7 @@ MAX_BULLETS_PER_SLIDE = 5
 # run-on sentence from breaking a slide's layout — it should almost
 # never actually trigger for normal prose.
 BULLET_SAFETY_CEILING = 400
+PARAGRAPH_SAFETY_CEILING = 3000  # ADR-054 — a whole section's prose, not a fragment; see _chunk_body
 MAX_TITLE_LENGTH = 60
 THIN_CONTENT_WORD_THRESHOLD = 40  # below this, don't pad into a fake multi-slide structure
 
@@ -141,7 +142,7 @@ class RuleBasedStructureAdapter(StructurePort):
     def __init__(self):
         self._classifier = DocumentClassifier()
 
-    def build_outline(self, source_text: str, audience_type: str) -> Outline:
+    def build_outline(self, source_text: str, audience_type: str, export_format: str = "pptx") -> Outline:
         text = source_text.strip()
         if not text:
             raise ValueError("source_text must not be empty")
@@ -165,10 +166,10 @@ class RuleBasedStructureAdapter(StructurePort):
         recipe = get_recipe(document_type)
 
         if len(sections) == 0:
-            slides = self._known_shape_fallback(text, recipe)
+            slides = self._known_shape_fallback(text, recipe, export_format)
         else:
             sections = self._reorder_sections(sections, recipe)
-            slides = self._slides_from_sections(sections, recipe)
+            slides = self._slides_from_sections(sections, recipe, export_format)
 
         return Outline(
             structure_source=StructureSource.RULE_BASED,
@@ -280,7 +281,8 @@ class RuleBasedStructureAdapter(StructurePort):
                 pieces[-1] = pieces[-1] + " " + line
         return "\n".join(pieces)
 
-    def _slides_from_sections(self, sections: list[tuple[str, str]], recipe: Recipe) -> list[Slide]:
+    def _slides_from_sections(self, sections: list[tuple[str, str]], recipe: Recipe,
+                               export_format: str = "pptx") -> list[Slide]:
         slides: list[Slide] = []
         doc_title = sections[0][0]
         slides.append(self._title_slide(doc_title))
@@ -294,7 +296,7 @@ class RuleBasedStructureAdapter(StructurePort):
                 # detail provided)" right after the title slide.
                 continue
             slide_title = "Overview" if (idx == 0 and heading == doc_title and len(sections) > 1) else heading
-            for chunk in self._chunk_body(body, recipe.max_bullets_per_slide):
+            for chunk in self._chunk_body(body, recipe.max_bullets_per_slide, export_format):
                 slides.append(Slide(
                     order=order,
                     title=slide_title,
@@ -308,7 +310,7 @@ class RuleBasedStructureAdapter(StructurePort):
             slides.append(closing)
         return slides
 
-    def _known_shape_fallback(self, text: str, recipe: Recipe) -> list[Slide]:
+    def _known_shape_fallback(self, text: str, recipe: Recipe, export_format: str = "pptx") -> list[Slide]:
         paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
         if not paragraphs:
             paragraphs = [text]
@@ -317,12 +319,12 @@ class RuleBasedStructureAdapter(StructurePort):
         title = self._guess_title(paragraphs[0])
 
         if word_count < THIN_CONTENT_WORD_THRESHOLD:
-            return self._minimal_slides_for_thin_content(title, text, recipe)
+            return self._minimal_slides_for_thin_content(title, text, recipe, export_format)
 
         slides = [self._title_slide(title)]
         order = 2
         for para in paragraphs:
-            for chunk in self._chunk_body(para, recipe.max_bullets_per_slide):
+            for chunk in self._chunk_body(para, recipe.max_bullets_per_slide, export_format):
                 slides.append(Slide(
                     order=order,
                     title=f"Key Point {order - 1}",
@@ -337,9 +339,10 @@ class RuleBasedStructureAdapter(StructurePort):
             slides.append(closing)
         return slides
 
-    def _minimal_slides_for_thin_content(self, title: str, full_text: str, recipe: Recipe) -> list[Slide]:
+    def _minimal_slides_for_thin_content(self, title: str, full_text: str, recipe: Recipe,
+                                          export_format: str = "pptx") -> list[Slide]:
         slides = [self._title_slide(title)]
-        chunks = self._chunk_body(full_text, recipe.max_bullets_per_slide)
+        chunks = self._chunk_body(full_text, recipe.max_bullets_per_slide, export_format)
         for i, chunk in enumerate(chunks):
             slides.append(Slide(
                 order=2 + i,
@@ -348,7 +351,7 @@ class RuleBasedStructureAdapter(StructurePort):
             ))
         return slides
 
-    def _chunk_body(self, body: str, max_bullets_per_slide: int) -> list[list[str]]:
+    def _chunk_body(self, body: str, max_bullets_per_slide: int, export_format: str = "pptx") -> list[list[str]]:
         """Split a body of text into bullet points, then group into
         slide-sized chunks of at most max_bullets_per_slide (recipe-
         controlled density — Phase 3.5 Step 2).
@@ -356,7 +359,22 @@ class RuleBasedStructureAdapter(StructurePort):
         Splits on explicit bullet markers first (each '\\n'-separated
         line from _rejoin_lines is already one logical item if the
         source used bullet points); falls back to sentence-boundary
-        splitting only for plain prose with no bullet structure."""
+        splitting only for plain prose with no bullet structure.
+
+        ADR-054: that sentence-boundary fallback is correct when the
+        target is a slide deck (each sentence really should become its
+        own bullet) but was silently applying to EVERY export format,
+        including document_docx — shattering a source document's own
+        real prose into one-bullet-per-sentence fragments, which is
+        why a generated Word document read like a reformatted deck
+        even when the uploaded source was written in normal paragraphs.
+        For document_docx with no bullet markers present, the body is
+        kept as ONE connected paragraph instead (document_docx_adapter
+        renders a lone bullet ending in terminal punctuation as a real
+        paragraph, not a list item). Content that genuinely IS a list
+        in the source (explicit bullet markers) still splits per-item
+        regardless of export_format — a real list stays a real list in
+        a document too."""
         if not body.strip():
             return [["(No additional detail provided)"]]
 
@@ -369,6 +387,13 @@ class RuleBasedStructureAdapter(StructurePort):
                 cleaned = _BULLET_MARKER.sub("", line).strip()
                 if cleaned:
                     bullets.append(_smart_truncate(cleaned, BULLET_SAFETY_CEILING))
+        elif export_format == "document_docx":
+            # Keep the whole section as one paragraph rather than
+            # exploding it into per-sentence fragments. A much higher
+            # ceiling than the slide-bullet case — this is meant to be
+            # a real paragraph, not a fragment, and getting truncated
+            # here would cut a real document's own content short.
+            bullets.append(_smart_truncate(body.strip(), PARAGRAPH_SAFETY_CEILING))
         else:
             raw_sentences = re.split(r"(?<=[.!?])\s+", body.strip())
             for s in raw_sentences:
@@ -378,6 +403,12 @@ class RuleBasedStructureAdapter(StructurePort):
 
         if not bullets:
             bullets = [_smart_truncate(body, BULLET_SAFETY_CEILING)]
+
+        # ADR-054: a document paragraph must never be split across
+        # multiple slides/sections the way overflow slide bullets are —
+        # one section's prose stays one paragraph, one chunk, full stop.
+        if export_format == "document_docx" and not has_bullet_structure:
+            return [bullets]
 
         return [
             bullets[i:i + max_bullets_per_slide]

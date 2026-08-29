@@ -54,6 +54,20 @@ class GenerationRequest:
     language: str = "en"
     tone: str = "professional"
     brand: BrandProfile | None = None  # ADR-045 — optional; None is today's exact pre-existing behavior
+    export_format: str = "pptx"
+    """ADR-054 — which ExportPort target this content is actually for.
+    Before this field existed, every export format (document, poster,
+    infographic, diagram) received identically-shaped content: terse
+    slide bullet fragments, because the Content stage prompt was
+    hardcoded to ask for slide bullets regardless of what the output
+    would actually be. That's why a generated "document" read like a
+    reformatted deck — it structurally was one. This field lets
+    _build_content_prompt (and _build_structure_prompt) ask for
+    content genuinely shaped for the target format instead of always
+    assuming a slide deck. Defaults to "pptx" so every existing call
+    site that never set this explicitly keeps its exact prior
+    behavior — this is additive, not a silent behavior change for
+    code that hasn't been updated to pass it."""
 
 
 @dataclass

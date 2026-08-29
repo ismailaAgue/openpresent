@@ -254,4 +254,89 @@ def test_academic_and_business_and_lecture_recipes_apply_correct_closer(adapter)
     assert lecture.slides[-1].title == "Summary"
 
 
+# -- Format-aware content shape (ADR-054) -----------------------------------
+# Before this, plain prose with no bullet markers was ALWAYS split on
+# sentence boundaries into one-bullet-per-sentence fragments — correct for
+# a slide deck, but it shattered a source document's own real paragraphs
+# into a list that was never meant to be one, which is why a generated
+# Word document read like a reformatted deck even when the uploaded
+# source was written in normal connected prose.
+
+PROSE_SECTION = (
+    "Introduction\n"
+    "Solar power costs have dropped by roughly eighty percent over the past decade. "
+    "This dramatic decline has been driven by manufacturing scale and improved panel "
+    "efficiency. Residential adoption has nearly doubled year over year in several "
+    "major markets as a result.\n"
+)
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS)
+def test_plain_prose_stays_one_paragraph_for_document_docx(adapter):
+    outline = adapter.build_outline(PROSE_SECTION, "general", export_format="document_docx")
+    # With only one detected section matching the doc title, the title
+    # slide and content slide legitimately share the same "Introduction"
+    # title, and a closing slide ("Questions?") gets auto-added too —
+    # filter specifically to slides carrying real BULLET content (not
+    # just any content_blocks, which the closing slide's NOTE satisfies
+    # too), rather than assuming a fixed total slide count.
+    bullet_slides = [
+        s for s in outline.slides
+        if any(b.type.value == "bullet" for b in s.content_blocks)
+    ]
+    assert len(bullet_slides) == 1  # not split across multiple slides/sections
+    bullets = [b.text for b in bullet_slides[0].content_blocks if b.type.value == "bullet"]
+    assert len(bullets) == 1  # the whole section is ONE connected paragraph, not one bullet per sentence
+    assert bullets[0].endswith(".")
+    assert "eighty percent" in bullets[0] and "Residential adoption" in bullets[0]
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS)
+def test_plain_prose_still_splits_per_sentence_for_pptx(adapter):
+    """The exact same source text must produce the ORIGINAL
+    sentence-per-bullet behavior for pptx — same content, different
+    target format, different shape, by design. Confirms this is a
+    genuine format branch, not an accidental global behavior change."""
+    outline = adapter.build_outline(PROSE_SECTION, "general", export_format="pptx")
+    intro_slides = [s for s in outline.slides if s.title == "Introduction"]
+    all_bullets = [
+        b.text for s in intro_slides for b in s.content_blocks if b.type.value == "bullet"
+    ]
+    assert len(all_bullets) == 3  # three sentences -> three separate bullets, unchanged behavior
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS)
+def test_format_defaults_to_pptx_behavior_when_unset(adapter):
+    """build_outline(text, audience) with no export_format argument at
+    all (every pre-ADR-054 call site) must keep splitting sentences
+    exactly as it always did."""
+    outline = adapter.build_outline(PROSE_SECTION, "general")  # export_format not passed
+    intro_slides = [s for s in outline.slides if s.title == "Introduction"]
+    all_bullets = [
+        b.text for s in intro_slides for b in s.content_blocks if b.type.value == "bullet"
+    ]
+    assert len(all_bullets) == 3
+
+
+GENUINE_LIST_SECTION = (
+    "Key Deliverables\n"
+    "- Ship the new onboarding flow\n"
+    "- Launch mobile app beta\n"
+    "- Complete SOC 2 audit\n"
+)
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS)
+def test_genuine_bullet_list_still_splits_per_item_for_document_docx(adapter):
+    """A real list in the SOURCE document (explicit bullet markers)
+    must stay a real list even when the target is document_docx — the
+    prose-preservation fix only applies to sentence-splitting of plain
+    prose, never to content that was genuinely authored as a list."""
+    outline = adapter.build_outline(GENUINE_LIST_SECTION, "general", export_format="document_docx")
+    deliverable_slides = [s for s in outline.slides if s.title == "Key Deliverables"]
+    all_bullets = [
+        b.text for s in deliverable_slides for b in s.content_blocks if b.type.value == "bullet"
+    ]
+    assert len(all_bullets) == 3
+    assert "Ship the new onboarding flow" in all_bullets
 

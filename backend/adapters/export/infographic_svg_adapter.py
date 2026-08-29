@@ -43,7 +43,7 @@ NUMBER_CIRCLE_R = 18
 TITLE_LINE_HEIGHT = 30
 BULLET_LINE_HEIGHT = 24
 CARD_TITLE_TO_BULLETS_GAP = 12
-FOOTER_HEIGHT = 40
+FOOTER_HEIGHT = 40  # ADR-054 — no longer a visible watermark, just reserved bottom breathing room
 MAX_BULLETS_PER_CARD = 6  # an infographic card, not a full slide — stay skimmable
 
 # Rough estimate: at 15px bullet-text size, an average character is
@@ -151,10 +151,6 @@ class InfographicSvgExportAdapter(ExportPort):
 
             cursor_y = card_top + card_height + CARD_GAP
 
-        parts.append(
-            f'<text x="{MARGIN}" y="{total_height - MARGIN + 10}" font-family="sans-serif" '
-            f'font-size="11" fill="{text_color}" fill-opacity="0.6">Generated with OpenPresent</text>'
-        )
         parts.append("</svg>")
 
         return "\n".join(parts).encode("utf-8")
