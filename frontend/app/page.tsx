@@ -147,9 +147,7 @@ function JobBubble({ jobId, outputFormat }: { jobId: string; outputFormat: Expor
   }> = {
     pptx: { label: "presentation", icon: "PPTX", downloadLabel: "Download .zip", sectionsNoun: "slides", isSvg: false },
     document_docx: { label: "document", icon: "DOCX", downloadLabel: "Download .docx", sectionsNoun: "sections", isSvg: false },
-    infographic_svg: { label: "infographic", icon: "SVG", downloadLabel: "Download .svg", sectionsNoun: "sections", isSvg: true },
-    diagram_svg: { label: "diagram", icon: "SVG", downloadLabel: "Download .svg", sectionsNoun: "steps", isSvg: true },
-    poster_svg: { label: "poster", icon: "SVG", downloadLabel: "Download .svg", sectionsNoun: "highlights", isSvg: true },
+    document_pdf: { label: "PDF", icon: "PDF", downloadLabel: "Download .pdf", sectionsNoun: "sections", isSvg: false },
   };
   const cfg = FORMAT_CONFIG[outputFormat];
 
@@ -345,25 +343,11 @@ export default function StudioPage() {
                   → Document
                 </button>
                 <button
-                  className={`op-mode-pill ${outputFormat === "infographic_svg" ? "active" : ""}`}
-                  onClick={() => setExportFormat("infographic_svg")}
-                  title="Generate a single-page visual summary (.svg) instead of a deck"
+                  className={`op-mode-pill ${outputFormat === "document_pdf" ? "active" : ""}`}
+                  onClick={() => setExportFormat("document_pdf")}
+                  title="Generate a PDF document (.pdf) instead of a deck"
                 >
-                  → Infographic
-                </button>
-                <button
-                  className={`op-mode-pill ${outputFormat === "diagram_svg" ? "active" : ""}`}
-                  onClick={() => setExportFormat("diagram_svg")}
-                  title="Generate a process-flow diagram (.svg) instead of a deck"
-                >
-                  → Diagram
-                </button>
-                <button
-                  className={`op-mode-pill ${outputFormat === "poster_svg" ? "active" : ""}`}
-                  onClick={() => setExportFormat("poster_svg")}
-                  title="Generate a shareable poster (.svg) instead of a deck"
-                >
-                  → Poster
+                  → PDF
                 </button>
                 {signedIn && workspaces.length > 0 && (
                   <select

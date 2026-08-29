@@ -968,12 +968,16 @@ def test_content_prompt_asks_for_bullets_for_pptx():
     assert "paragraph" not in prompt.lower() or "not a paragraph" in prompt.lower()
 
 
-@pytest.mark.parametrize("fmt", ["infographic_svg", "diagram_svg", "poster_svg"])
-def test_content_prompt_asks_for_punchy_claims_for_visual_formats(fmt):
+def test_content_prompt_asks_for_prose_for_document_pdf():
+    """ADR-055 — document_pdf shares document_docx's prose branch (the
+    two document formats differ only in the export adapter, never in
+    content), so it should get the exact same prompt shape."""
     adapter = gemini_with(content_json())
-    request = GenerationRequest(topic="Photosynthesis", slide_count=3, export_format=fmt)
+    request = GenerationRequest(topic="Photosynthesis", slide_count=3, export_format="document_pdf")
     prompt = adapter._build_content_prompt(request, make_strategy(), make_structure())
-    assert "punchy" in prompt.lower() or "glance" in prompt.lower()
+    assert "paragraph" in prompt.lower()
+    assert "not a bullet list" in prompt.lower()
+    assert "terminal punctuation" in prompt.lower()
 
 
 def test_content_prompt_defaults_to_pptx_bullets_when_export_format_unset():

@@ -2049,3 +2049,112 @@ missing-theme-color bug, neither of which any automated test would
 have caught on its own.
 
 *Next entry: ADR-055.*
+
+---
+
+## ADR-055 — Scope Narrowed to pptx / docx / pdf; Infographics, Diagrams, and Posters Removed
+
+**Status:** Accepted.
+
+**Decision:** `infographic_svg`, `diagram_svg`, and `poster_svg`
+(ADR-046/047/048, v3 Phase 6) are removed as export formats. OpenPresent
+now generates exactly three output formats: presentations (`.pptx`),
+documents (`.docx`), and documents (`.pdf`). This is a deliberate
+product scope decision, not a bug fix or a deprecation-for-technical-
+reasons — the three SVG formats worked, had no open bugs, and had just
+received the ADR-054 watermark-removal pass. They were cut because the
+product's focus is narrowing, not because anything was wrong with them.
+
+**What replaced them:** `document_pdf`, a new `ExportPort` adapter
+(`DocumentPdfExportAdapter`, built on `reportlab`) that renders directly
+from the same `Recipe`/`Outline` model every other format renders from
+— there is no docx-to-PDF conversion step and no LibreOffice/soffice
+dependency at runtime (soffice is still used, as before, only as a
+*testing* tool to rasterize docx output for visual inspection per this
+project's own "render and look" convention — see ADR-041/054). This
+keeps the load-bearing architectural decision of the whole project
+intact: one generation, N independent export adapters, a broken/slow
+adapter for one format never affecting the others (ADR-011).
+
+**Why a dedicated adapter instead of docx→PDF conversion:** a naive
+"convert the docx to PDF" step would have made `document_pdf` a
+second-class citizen of `document_docx` — dependent on it, unable to
+diverge in design without also changing the Word output, and requiring
+a LibreOffice binary in the production container at runtime (currently
+only present in the dev/test image for the docx-skill's own visual-QA
+tooling, not something this project has ever shipped to Render). A
+direct, independent adapter avoids all three problems and matches how
+every other format in this codebase already works.
+
+**Content shape:** PDF is treated as a "document" for content-shaping
+purposes, identically to `document_docx` — both now share the exact
+same branch in `json_pipeline_base.py`'s content prompt (real 2-4
+sentence prose paragraphs, not slide-bullet fragments) and the exact
+same `document_docx`/`document_pdf`-aware skip logic in
+`quality_validator.py` (the deck-specific "paragraph-length bullet" and
+"overflow risk" checks are structurally meaningless for a flowing
+document, whether it's rendered to `.docx` or `.pdf`) and
+`rule_based.py`'s deterministic no-AI fallback. The two formats differ
+*only* in the export/render step — never in what content gets
+generated — exactly matching how `pptx` and `document_docx` already
+relate to each other. Concretely: if this file changes, `document_pdf`
+gets it too, automatically, with no separate maintenance.
+
+**What was removed, precisely:**
+- `backend/adapters/export/infographic_svg_adapter.py`,
+  `diagram_svg_adapter.py`, `poster_svg_adapter.py`, and their shared
+  `svg_utils.py`
+- Their three format-branch entries in `registry.py`'s `_EXPORT_ADAPTERS`
+- Their `_MEDIA_TYPES` / `_FILE_EXTENSIONS` / `_FILE_BASENAMES` entries
+  in `api/main.py`
+- The "punchy claims" content-prompt branch in `json_pipeline_base.py`
+  that only those three formats used
+- 4 contract test files (`test_infographic_svg_adapter.py`,
+  `test_diagram_svg_adapter.py`, `test_poster_svg_adapter.py`,
+  `test_svg_utils.py`) and the SVG-format cases inside
+  `test_api_http.py` and `test_ai_pipeline_port.py`
+- The three SVG format pills, `FORMAT_CONFIG` entries, and
+  `EXPORT_FORMATS` entries in the frontend (`page.tsx`,
+  `export-formats.ts`) — the project editor (`projects/[id]/page.tsx`)
+  needed no changes at all, since it already reads format choices
+  generically from the shared `EXPORT_FORMATS` table (ADR-049)
+
+**What was added, precisely:**
+- `backend/adapters/export/document_pdf_adapter.py`
+  (`DocumentPdfExportAdapter`) — mirrors `document_docx_adapter.py`'s
+  theme-aware title page and prose/list rendering logic line-for-line
+  in intent (same `_all_read_as_prose` rule, kept as a literal copy
+  rather than a shared import, to keep every export adapter
+  independently self-contained per this project's existing
+  convention — see that file's module docstring for the one accepted
+  exception, `_COLOR_SETS`)
+- `reportlab` added to `requirements.txt` (pure-Python, no system
+  library dependency, unlike WeasyPrint)
+- `"document_pdf"` entries throughout the same set of files listed
+  above, plus a new `document_pdf` pill/config/format entry in the
+  frontend
+- `tests/contract/test_document_pdf_adapter.py` — mirrors
+  `test_document_docx_adapter.py`'s cases (title-page centering and
+  theme color, prose-vs-list detection, empty-outline handling,
+  speaker-notes exclusion) using `pypdf` to extract text back out for
+  assertions, since reportlab has no read-back API the way
+  python-docx does
+
+**Verification:** full backend suite green across 4 consecutive runs
+(427/427 — down from 484 as expected: -18 removed SVG-format tests,
++13 new PDF-format tests, net -5 plus a few consolidated
+parametrizations). A real sample document was generated end-to-end
+with the `blue_academic` theme, rendered via `pdftoppm`, and visually
+inspected on both pages: the title page shows a genuinely centered
+title in the theme's title color with a full-width accent rule (no
+reintroduction of the ADR-054 left-anchor bug), and the content page
+shows correctly-distinguished real prose paragraphs (Executive
+Summary) alongside a real bulleted list (Key Findings), both in the
+theme's colors.
+
+**Stated gap:** infographic/diagram/poster generation no longer
+exists in this codebase at all — reintroducing any of them later
+would mean writing a new adapter from scratch, not restoring removed
+code from history, since this ADR treats their removal as deliberate
+and permanent, not paused.
+

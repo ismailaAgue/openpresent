@@ -5,6 +5,14 @@ frontend, wired to your real, already-deployed backend. Everything
 below Phase 1 is backend work that doesn't exist yet — scoped and
 sequenced, not built.
 
+**Post-MVP update (ADR-055):** Phase 6 as scoped below (infographics,
+diagrams, posters) was built, shipped, and later removed — product
+scope was deliberately narrowed to pptx/docx/pdf only. See ADR-055 in
+`docs/ARCHITECTURE_DECISIONS.md` for the current, authoritative state
+of what export formats exist; the Phase 6 section below is left
+unedited as a historical planning record, not a description of what's
+currently in the codebase.
+
 ---
 
 ## Phase 1 — shipped in this zip

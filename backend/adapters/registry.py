@@ -42,9 +42,7 @@ from backend.adapters.design.rule_based import RuleBasedDesignAdapter
 from backend.adapters.export.pptx_adapter import PptxExportAdapter
 from backend.adapters.export.docx_notes_adapter import SpeakerNotesDocxExportAdapter
 from backend.adapters.export.document_docx_adapter import DocumentDocxExportAdapter
-from backend.adapters.export.infographic_svg_adapter import InfographicSvgExportAdapter
-from backend.adapters.export.diagram_svg_adapter import DiagramSvgExportAdapter
-from backend.adapters.export.poster_svg_adapter import PosterSvgExportAdapter
+from backend.adapters.export.document_pdf_adapter import DocumentPdfExportAdapter
 from backend.adapters.quota.sqlite_adapter import SqliteQuotaAdapter
 from backend.adapters.quota.postgres_quota import PostgresQuotaAdapter
 from backend.adapters.workspace.sqlite_adapter import SqliteWorkspaceAdapter
@@ -75,12 +73,11 @@ _EXPORT_ADAPTERS = {
     # just the notes_docx companion (which stays wired directly into
     # export_bundle.py, not this map, since it's never chosen on its own).
     "document_docx": DocumentDocxExportAdapter(),
-    # ADR-046 (v3 Phase 6) — first render target that isn't PPTX/DOCX.
-    "infographic_svg": InfographicSvgExportAdapter(),
-    # ADR-047 (v3 Phase 6) — second render target, linear process flow.
-    "diagram_svg": DiagramSvgExportAdapter(),
-    # ADR-048 (v3 Phase 6) — third and final render target, posters/social graphics.
-    "poster_svg": PosterSvgExportAdapter(),
+    # ADR-055 — infographic_svg/diagram_svg/poster_svg (ADR-046/047/048)
+    # removed; scope narrowed to pptx/docx/pdf. document_pdf renders
+    # directly from the Recipe (no docx->pdf conversion step) and shares
+    # document_docx's prose content-shaping, differing only in render.
+    "document_pdf": DocumentPdfExportAdapter(),
 }
 
 _ai_adapter_instance = None

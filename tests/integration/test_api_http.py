@@ -682,7 +682,7 @@ def test_generate_from_real_pdf_sync(client):
 
 
 @pytest.mark.parametrize("export_format", [
-    "document_docx", "infographic_svg", "diagram_svg", "poster_svg",
+    "document_docx", "document_pdf",
 ])
 def test_generate_from_real_pdf_every_non_pptx_format(client, export_format):
     resp = client.post(
@@ -821,34 +821,37 @@ def test_generate_topic_document_docx_async_full_round_trip(client):
     assert len(doc.paragraphs) > 0
 
 
-# -- Infographics, first Phase 6 render target (ADR-046) -------------------
+# -- PDF documents, third and final format (ADR-055) ------------------------
+# Replaces infographic_svg/diagram_svg/poster_svg (ADR-046/047/048) after the
+# scope narrowed to pptx/docx/pdf only. document_pdf renders directly from
+# the Recipe (see DocumentPdfExportAdapter) and shares document_docx's prose
+# content-shaping, so these tests mirror the document_docx tests above,
+# checking the PDF-specific bytes and headers instead of docx internals.
 
-def test_generate_topic_as_infographic_svg_sync(client):
-    """Same engine, same request shape — only export_format differs,
-    same pattern document_docx established in ADR-041."""
+def test_generate_topic_as_document_pdf_sync(client):
     resp = client.post("/generate/topic", json={
         "topic": "Renewable Energy Adoption", "slide_count": 4,
-        "export_format": "infographic_svg",
+        "export_format": "document_pdf",
     })
     assert resp.status_code == 200
-    assert resp.headers["content-type"] == "image/svg+xml"
-    assert 'filename="infographic.svg"' in resp.headers["content-disposition"]
-    assert resp.content.strip().startswith(b"<svg")
+    assert resp.headers["content-type"] == "application/pdf"
+    assert 'filename="document.pdf"' in resp.headers["content-disposition"]
+    assert resp.content.startswith(b"%PDF")  # a real, well-formed PDF
 
 
-def test_generate_topic_as_infographic_svg_is_not_bundled(client):
+def test_generate_topic_as_document_pdf_is_not_bundled_with_speaker_notes(client):
     resp = client.post("/generate/topic", json={
         "topic": "Renewable Energy Adoption", "slide_count": 4,
-        "export_format": "infographic_svg", "bundle_speaker_notes": True,
+        "export_format": "document_pdf", "bundle_speaker_notes": True,
     })
     assert resp.status_code == 200
     assert resp.headers["content-type"] != "application/zip"
 
 
-def test_generate_topic_infographic_svg_async_full_round_trip(client):
+def test_generate_topic_document_pdf_async_full_round_trip(client):
     enqueue_resp = client.post("/generate/topic/async", json={
         "topic": "Renewable Energy Adoption", "slide_count": 4,
-        "export_format": "infographic_svg",
+        "export_format": "document_pdf",
     })
     assert enqueue_resp.status_code == 200
     job_id = enqueue_resp.json()["job_id"]
@@ -858,122 +861,19 @@ def test_generate_topic_infographic_svg_async_full_round_trip(client):
 
     download_resp = client.get(f"/jobs/{job_id}/download")
     assert download_resp.status_code == 200
-    assert download_resp.headers["content-type"] == "image/svg+xml"
-    assert 'filename="infographic.svg"' in download_resp.headers["content-disposition"]
-    assert download_resp.content.strip().startswith(b"<svg")
+    assert download_resp.headers["content-type"] == "application/pdf"
+    assert 'filename="document.pdf"' in download_resp.headers["content-disposition"]
+    assert download_resp.content.startswith(b"%PDF")
 
 
-def test_generate_document_upload_as_infographic_svg(client):
-    """Document-upload mode can target infographic_svg too — no format-
-    specific gating anywhere, it's a normal ExportPort choice on any
-    generation entry point, same as document_docx before it."""
+def test_generate_document_upload_as_document_pdf(client):
     resp = client.post(
         "/generate",
         files={"file": ("water_cycle.txt", SAMPLE_TEXT_DOC, "text/plain")},
-        params={"export_format": "infographic_svg"},
+        params={"export_format": "document_pdf"},
     )
     assert resp.status_code == 200
-    assert resp.headers["content-type"] == "image/svg+xml"
-
-
-# -- Diagrams, second Phase 6 render target (ADR-047) -----------------------
-
-def test_generate_topic_as_diagram_svg_sync(client):
-    resp = client.post("/generate/topic", json={
-        "topic": "Customer Onboarding Process", "slide_count": 4,
-        "export_format": "diagram_svg",
-    })
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] == "image/svg+xml"
-    assert 'filename="diagram.svg"' in resp.headers["content-disposition"]
-    assert resp.content.strip().startswith(b"<svg")
-
-
-def test_generate_topic_as_diagram_svg_is_not_bundled(client):
-    resp = client.post("/generate/topic", json={
-        "topic": "Customer Onboarding Process", "slide_count": 4,
-        "export_format": "diagram_svg", "bundle_speaker_notes": True,
-    })
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] != "application/zip"
-
-
-def test_generate_topic_diagram_svg_async_full_round_trip(client):
-    enqueue_resp = client.post("/generate/topic/async", json={
-        "topic": "Customer Onboarding Process", "slide_count": 4,
-        "export_format": "diagram_svg",
-    })
-    assert enqueue_resp.status_code == 200
-    job_id = enqueue_resp.json()["job_id"]
-
-    result = _poll_job_until_done(client, job_id)
-    assert result["structure_source"] == "deterministic-topic"
-
-    download_resp = client.get(f"/jobs/{job_id}/download")
-    assert download_resp.status_code == 200
-    assert download_resp.headers["content-type"] == "image/svg+xml"
-    assert 'filename="diagram.svg"' in download_resp.headers["content-disposition"]
-    assert download_resp.content.strip().startswith(b"<svg")
-
-
-def test_generate_document_upload_as_diagram_svg(client):
-    resp = client.post(
-        "/generate",
-        files={"file": ("water_cycle.txt", SAMPLE_TEXT_DOC, "text/plain")},
-        params={"export_format": "diagram_svg"},
-    )
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] == "image/svg+xml"
-
-
-# -- Posters, third and final Phase 6 render target (ADR-048) --------------
-
-def test_generate_topic_as_poster_svg_sync(client):
-    resp = client.post("/generate/topic", json={
-        "topic": "Renewable Energy Adoption", "slide_count": 4,
-        "export_format": "poster_svg",
-    })
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] == "image/svg+xml"
-    assert 'filename="poster.svg"' in resp.headers["content-disposition"]
-    assert resp.content.strip().startswith(b"<svg")
-
-
-def test_generate_topic_as_poster_svg_is_not_bundled(client):
-    resp = client.post("/generate/topic", json={
-        "topic": "Renewable Energy Adoption", "slide_count": 4,
-        "export_format": "poster_svg", "bundle_speaker_notes": True,
-    })
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] != "application/zip"
-
-
-def test_generate_topic_poster_svg_async_full_round_trip(client):
-    enqueue_resp = client.post("/generate/topic/async", json={
-        "topic": "Renewable Energy Adoption", "slide_count": 4,
-        "export_format": "poster_svg",
-    })
-    assert enqueue_resp.status_code == 200
-    job_id = enqueue_resp.json()["job_id"]
-
-    result = _poll_job_until_done(client, job_id)
-    assert result["structure_source"] == "deterministic-topic"
-
-    download_resp = client.get(f"/jobs/{job_id}/download")
-    assert download_resp.status_code == 200
-    assert download_resp.headers["content-type"] == "image/svg+xml"
-    assert 'filename="poster.svg"' in download_resp.headers["content-disposition"]
-    assert download_resp.content.strip().startswith(b"<svg")
-
-
-def test_generate_document_upload_as_poster_svg(client):
-    resp = client.post(
-        "/generate",
-        files={"file": ("water_cycle.txt", SAMPLE_TEXT_DOC, "text/plain")},
-        params={"export_format": "poster_svg"},
-    )
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] == "image/svg+xml"
+    assert resp.headers["content-type"] == "application/pdf"
 
 
 def test_jobs_endpoint_surfaces_stage_while_running(client_no_worker):
