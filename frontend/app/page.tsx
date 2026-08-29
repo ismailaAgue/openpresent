@@ -213,6 +213,9 @@ export default function StudioPage() {
   const [busy, setBusy] = useState(false);
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string>("");  // "" = ungrouped
+  const [previewOpen, setPreviewOpen] = useState(true);
+  const [previewTab, setPreviewTab] = useState<"preview" | "edit">("preview");
+  const [previewProjectId, setPreviewProjectId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const threadRef = useRef<HTMLDivElement>(null);
   const signedIn = typeof window !== "undefined" && !!getSessionToken();
@@ -225,6 +228,16 @@ export default function StudioPage() {
     if (!signedIn) return;
     listWorkspaces().then(setWorkspaces).catch(() => setWorkspaces([]));
   }, [signedIn]);
+
+  useEffect(() => {
+    // Settings page (ADR-056) writes a preferred default format here;
+    // applied once on mount only, so switching formats mid-session via
+    // the composer pills is never silently overridden.
+    const preferred = window.localStorage.getItem("op_default_export_format");
+    if (preferred && ["pptx", "document_docx", "document_pdf"].includes(preferred)) {
+      setExportFormat(preferred as ExportFormat);
+    }
+  }, []);
 
   async function handleSend() {
     if (busy) return;
@@ -451,25 +464,53 @@ export default function StudioPage() {
         </div>
       </div>
 
-      <div className="op-preview-col">
-        <div className="op-preview-tabs">
-          <span className="op-preview-tab active">Preview</span>
-          <span className="op-preview-tab" title="Full slide-by-slide editing lives in the saved project view">
-            Edit
-          </span>
-        </div>
-        {!latestJob ? (
-          <div className="op-preview-empty">
-            <div style={{ fontSize: 28 }}>◇</div>
-            Your slides will appear here once generation starts.
-          </div>
+      <div className={`op-preview-col ${previewOpen ? "" : "closed"}`}>
+        {previewOpen ? (
+          <>
+            <div className="op-preview-tabs">
+              <button
+                className={`op-preview-tab ${previewTab === "preview" ? "active" : ""}`}
+                onClick={() => setPreviewTab("preview")}
+              >
+                Preview
+              </button>
+              {previewProjectId ? (
+                <Link href={`/projects/${previewProjectId}`} className="op-preview-tab" title="Full slide-by-slide editing">
+                  Edit
+                </Link>
+              ) : (
+                <span
+                  className="op-preview-tab disabled"
+                  title="Available once this generation is saved to a project (log in, then generate)"
+                >
+                  Edit
+                </span>
+              )}
+              <button className="op-preview-close-btn" onClick={() => setPreviewOpen(false)} title="Close preview">
+                ×
+              </button>
+            </div>
+            {!latestJob ? (
+              <div className="op-preview-empty">
+                <div style={{ fontSize: 28 }}>◇</div>
+                Your slides will appear here once generation starts.
+              </div>
+            ) : (
+              <div style={{ padding: 4 }}>
+                {/* The JobBubble already renders the slide grid inline in the
+                    thread; this column mirrors it for the currently-active job
+                    so the layout matches the reference design. */}
+                <JobBubblePreviewMirror key={latestJob.jobId} jobId={latestJob.jobId} onProjectId={setPreviewProjectId} />
+              </div>
+            )}
+          </>
         ) : (
-          <div style={{ padding: 4 }}>
-            {/* The JobBubble already renders the slide grid inline in the
-                thread; this column mirrors it for the currently-active job
-                so the layout matches the reference design. */}
-            <JobBubblePreviewMirror jobId={latestJob.jobId} />
-          </div>
+          <button className="op-preview-reopen-btn" onClick={() => setPreviewOpen(true)} title="Show preview">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <path d="M15 4v16" />
+            </svg>
+          </button>
         )}
       </div>
     </div>
@@ -478,7 +519,7 @@ export default function StudioPage() {
 
 // Small dedicated fetch for the right-hand preview column so it doesn't
 // depend on the chat bubble's internal state.
-function JobBubblePreviewMirror({ jobId }: { jobId: string }) {
+function JobBubblePreviewMirror({ jobId, onProjectId }: { jobId: string; onProjectId?: (id: string) => void }) {
   const [slides, setSlides] = useState<{ order: number; title: string }[] | null>(null);
   const [doneNoProject, setDoneNoProject] = useState(false);
 
@@ -491,7 +532,10 @@ function JobBubblePreviewMirror({ jobId }: { jobId: string }) {
         if (s.status === "done") {
           if (s.project_id) {
             const proj = await getProject(s.project_id);
-            if (!cancelled) setSlides(proj.slides);
+            if (!cancelled) {
+              setSlides(proj.slides);
+              onProjectId?.(s.project_id);
+            }
           } else {
             setDoneNoProject(true);
           }

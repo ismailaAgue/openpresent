@@ -217,6 +217,7 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   background: var(--op-bg);
   color: var(--op-text);
   font-family: var(--op-font);
+  position: relative;
 }
 .op-shell-content { flex: 1; min-width: 0; height: 100%; }
 
@@ -233,6 +234,7 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   height: 100%;
 }
 .op-sidebar-top { display: flex; flex-direction: column; gap: 4px; }
+.op-brand-row { display: flex; align-items: center; justify-content: space-between; }
 .op-brand {
   display: flex;
   align-items: center;
@@ -244,6 +246,24 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   text-decoration: none;
 }
 .op-brand-mark { border-radius: 7px; }
+
+.op-sidebar-close-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border-radius: 6px; border: none;
+  background: none; color: var(--op-text-muted); cursor: pointer;
+  margin-top: -12px;
+}
+.op-sidebar-close-btn:hover { background: var(--op-bg-panel); color: var(--op-text); }
+.op-sidebar-close-btn svg { width: 16px; height: 16px; }
+
+.op-sidebar-open-btn {
+  position: absolute; top: 16px; left: 12px; z-index: 5;
+  display: flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: 7px;
+  border: 1px solid var(--op-border); background: var(--op-bg);
+  color: var(--op-text-muted); cursor: pointer;
+}
+.op-sidebar-open-btn:hover { color: var(--op-text); border-color: var(--op-text-muted); }
 
 .op-new-btn {
   display: flex;
@@ -307,8 +327,25 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
+  min-width: 0;
 }
 .op-project-item:hover { color: var(--op-violet); }
+
+.op-project-row {
+  display: flex; align-items: center; gap: 4px;
+  border-radius: 6px;
+}
+.op-project-row:hover { background: var(--op-bg-panel); }
+.op-project-delete-btn {
+  display: none; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 5px; border: none; background: none;
+  cursor: pointer; flex-shrink: 0;
+}
+.op-project-row:hover .op-project-delete-btn { display: flex; }
+.op-project-delete-btn:hover { background: var(--op-border); }
+.op-project-delete-btn svg { width: 13px; height: 13px; color: var(--op-text-muted); }
+.op-project-delete-btn:hover svg { color: #B3402A; }
 
 .op-projects-label-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
 .op-projects-label-row .op-projects-label { margin-bottom: 0; }
@@ -521,15 +558,32 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   display: flex;
   flex-direction: column;
 }
+.op-preview-col.closed { width: 44px; overflow: visible; }
 .op-preview-tabs {
-  display: flex; gap: 18px; padding: 14px 20px 0 20px;
+  display: flex; align-items: center; gap: 18px; padding: 14px 20px 0 20px;
   border-bottom: 1px solid var(--op-border); background: var(--op-bg);
 }
 .op-preview-tab {
   font-size: 13.5px; font-weight: 600; color: var(--op-text-muted);
   padding-bottom: 12px; border-bottom: 2px solid transparent;
+  background: none; border-left: none; border-right: none; border-top: none;
+  cursor: pointer; text-decoration: none; display: inline-block;
 }
 .op-preview-tab.active { color: var(--op-text); border-bottom-color: var(--op-violet); }
+.op-preview-tab.disabled { cursor: default; opacity: 0.5; }
+.op-preview-close-btn {
+  margin-left: auto; margin-bottom: 12px;
+  display: flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; border-radius: 6px; border: none; background: none;
+  color: var(--op-text-muted); font-size: 18px; line-height: 1; cursor: pointer;
+}
+.op-preview-close-btn:hover { background: var(--op-border); color: var(--op-text); }
+.op-preview-reopen-btn {
+  width: 100%; height: 100%;
+  display: flex; align-items: flex-start; justify-content: center; padding-top: 16px;
+  border: none; background: none; color: var(--op-text-muted); cursor: pointer;
+}
+.op-preview-reopen-btn:hover { color: var(--op-text); }
 .op-preview-empty {
   flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
   color: var(--op-text-muted); font-size: 13.5px; text-align: center; padding: 40px;

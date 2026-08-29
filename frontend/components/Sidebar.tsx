@@ -5,7 +5,7 @@ import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import {
-  getSessionToken, listProjects, logout, ProjectSummary,
+  getSessionToken, listProjects, logout, ProjectSummary, deleteProject,
   listWorkspaces, createWorkspace, deleteWorkspace, getWorkspace, WorkspaceSummary,
   getBrandProfile, setBrandProfile, deleteBrandProfile, BrandProfile,
 } from "@/lib/api-client";
@@ -41,6 +41,8 @@ function Icon({ name }: { name: string }) {
       return <svg {...common}><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m-9 0 1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" /></svg>;
     case "settings":
       return <svg {...common}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" /></svg>;
+    case "panel-close":
+      return <svg {...common}><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /><path d="m14 9-3 3 3 3" /></svg>;
     default:
       return null;
   }
@@ -132,7 +134,7 @@ function WorkspaceBrandForm({ workspaceId }: { workspaceId: string }) {
   );
 }
 
-export default function Sidebar() {
+export default function Sidebar({ onClose }: { onClose?: () => void }) {
   const pathname = usePathname();
   const [signedIn, setSignedIn] = useState(false);
   const [recent, setRecent] = useState<ProjectSummary[]>([]);
@@ -207,17 +209,37 @@ export default function Sidebar() {
     }
   }
 
+  async function handleDeleteProject(e: React.MouseEvent, projectId: string, title: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!window.confirm(`Delete "${title || "Untitled presentation"}"? This can't be undone.`)) return;
+    try {
+      await deleteProject(projectId);
+      setRecent((prev) => prev.filter((p) => p.project_id !== projectId));
+      setExpandedProjects((prev) => prev?.filter((p) => p.project_id !== projectId) ?? prev);
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : "Could not delete this project");
+    }
+  }
+
   return (
     <aside className="op-sidebar">
       <div className="op-sidebar-top">
-        <Link href="/" className="op-brand">
-          <Image src="/logo.png" alt="OpenPresent" width={28} height={28} className="op-brand-mark" />
-          <span>OpenPresent</span>
-        </Link>
+        <div className="op-brand-row">
+          <Link href="/" className="op-brand">
+            <Image src="/logo.png" alt="OpenPresent" width={28} height={28} className="op-brand-mark" />
+            <span>OpenPresent</span>
+          </Link>
+          {onClose && (
+            <button className="op-sidebar-close-btn" onClick={onClose} title="Close sidebar">
+              <Icon name="panel-close" />
+            </button>
+          )}
+        </div>
 
         <Link href="/?new=1" className="op-new-btn">
           <Icon name="plus" />
-          New presentation
+          New
         </Link>
 
         <nav className="op-nav">
@@ -241,9 +263,18 @@ export default function Sidebar() {
             <div className="op-projects-label">Recent</div>
             {recent.length === 0 && <div className="op-projects-empty">No projects yet</div>}
             {recent.map((p) => (
-              <Link key={p.project_id} href={`/projects/${p.project_id}`} className="op-project-item">
-                {p.title || "Untitled presentation"}
-              </Link>
+              <div key={p.project_id} className="op-project-row">
+                <Link href={`/projects/${p.project_id}`} className="op-project-item">
+                  {p.title || "Untitled presentation"}
+                </Link>
+                <button
+                  className="op-project-delete-btn"
+                  onClick={(e) => handleDeleteProject(e, p.project_id, p.title)}
+                  title="Delete this chat"
+                >
+                  <Icon name="trash" />
+                </button>
+              </div>
             ))}
           </div>
         )}
@@ -280,9 +311,18 @@ export default function Sidebar() {
                       <div className="op-projects-empty">Empty — generate into this workspace from the composer below</div>
                     )}
                     {expandedProjects?.map((p) => (
-                      <Link key={p.project_id} href={`/projects/${p.project_id}`} className="op-project-item">
-                        {p.title || "Untitled"}
-                      </Link>
+                      <div key={p.project_id} className="op-project-row">
+                        <Link href={`/projects/${p.project_id}`} className="op-project-item">
+                          {p.title || "Untitled"}
+                        </Link>
+                        <button
+                          className="op-project-delete-btn"
+                          onClick={(e) => handleDeleteProject(e, p.project_id, p.title)}
+                          title="Delete this chat"
+                        >
+                          <Icon name="trash" />
+                        </button>
+                      </div>
                     ))}
                     <button
                       className="op-brand-toggle-btn"
@@ -304,7 +344,7 @@ export default function Sidebar() {
       </div>
 
       <div className="op-sidebar-bottom">
-        <Link href="/settings" className="op-nav-item disabled" title="Coming soon in v3" onClick={(e) => e.preventDefault()}>
+        <Link href="/settings" className="op-nav-item">
           <Icon name="settings" />
           <span>Settings</span>
         </Link>

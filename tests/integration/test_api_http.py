@@ -965,6 +965,31 @@ def test_login_wrong_password_returns_401(client):
     assert resp.status_code == 401
 
 
+# -- /auth/me (ADR-056) -----------------------------------------------------
+# Login previously only ever returned a bare session token, never the
+# user's own email — the frontend Settings page needed a real way to
+# answer "who am I logged in as" without decoding the (intentionally
+# opaque) session token itself.
+
+def test_auth_me_requires_auth(client):
+    resp = client.get("/auth/me")
+    assert resp.status_code == 401
+
+
+def test_auth_me_returns_the_logged_in_users_email(client):
+    token = _register_and_login(client, email="dana@example.com")
+    resp = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["email"] == "dana@example.com"
+    assert "user_id" in body
+
+
+def test_auth_me_rejects_an_invalid_token(client):
+    resp = client.get("/auth/me", headers={"Authorization": "Bearer not-a-real-token"})
+    assert resp.status_code == 401
+
+
 def test_anonymous_generate_still_works_no_account_required(client):
     """Core product promise, verified over real HTTP: generation never
     requires an account — only saving/reusing a project does."""
@@ -1078,6 +1103,55 @@ def test_get_slide_unknown_order_returns_404(client):
     headers, project_id = _register_login_and_generate_project(client)
     resp = client.get(f"/projects/{project_id}/slides/999", headers=headers)
     assert resp.status_code == 404
+
+
+# -- DELETE /projects/{id} (ADR-056) -----------------------------------------
+# StoragePort.delete_recipe() existed since Phase 4 but was never wired to
+# an HTTP route — this is the frontend's "delete a previous chat" gap and
+# the backend's missing route, closed together.
+
+def test_delete_project_requires_auth(client):
+    resp = client.delete("/projects/some-id")
+    assert resp.status_code == 401
+
+
+def test_delete_project_removes_it(client):
+    headers, project_id = _register_login_and_generate_project(client)
+
+    resp = client.delete(f"/projects/{project_id}", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": True}
+
+    reget = client.get(f"/projects/{project_id}", headers=headers)
+    assert reget.status_code == 404  # actually gone, not just hidden
+
+
+def test_delete_project_no_longer_appears_in_the_list(client):
+    headers, project_id = _register_login_and_generate_project(client)
+    client.delete(f"/projects/{project_id}", headers=headers)
+    listing = client.get("/projects", headers=headers)
+    assert project_id not in [p["project_id"] for p in listing.json()]
+
+
+def test_delete_unknown_project_returns_404(client):
+    token = _register_and_login(client, email="erin@example.com")
+    resp = client.delete("/projects/does-not-exist", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 404
+
+
+def test_cannot_delete_another_users_project(client):
+    """Per-owner isolation (Blueprint Section 11) applies to delete just
+    like every other project route — a project_id that's real, just not
+    yours, must come back as 404, not 403 (existence isn't leaked)."""
+    headers_a, project_id = _register_login_and_generate_project(client)
+
+    token_b = _register_and_login(client, email="frank@example.com", password="hunter22")
+    resp = client.delete(f"/projects/{project_id}", headers={"Authorization": f"Bearer {token_b}"})
+    assert resp.status_code == 404
+
+    # Confirm it's genuinely untouched, not soft-deleted by the failed attempt
+    still_there = client.get(f"/projects/{project_id}", headers=headers_a)
+    assert still_there.status_code == 200
 
 
 def test_get_slide_requires_auth(client):
