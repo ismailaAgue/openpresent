@@ -60,7 +60,7 @@ HIGHLIGHT_FONT_SIZE = 21
 HIGHLIGHT_TICK_SIZE = 10
 HIGHLIGHT_TICK_GAP = 16
 MAX_HIGHLIGHTS = 4  # a poster has room for a handful of claims, not a list
-FOOTER_HEIGHT = 44
+FOOTER_HEIGHT = 44  # ADR-054 — no longer a visible watermark, just reserved bottom breathing room
 
 CHARS_PER_LINE_HEADLINE = int((CANVAS_WIDTH - 2 * MARGIN) / 26)  # large bold text, wide average glyph
 CHARS_PER_LINE_HIGHLIGHT = int((CANVAS_WIDTH - 2 * MARGIN - HIGHLIGHT_TICK_SIZE - HIGHLIGHT_TICK_GAP) / 11)
@@ -182,11 +182,6 @@ class PosterSvgExportAdapter(ExportPort):
             hy += 10  # extra breathing room between distinct highlights
 
         parts.append(f'<rect x="0" y="{CANVAS_HEIGHT - 6}" width="{CANVAS_WIDTH}" height="6" fill="{accent_color}"/>')
-        parts.append(
-            f'<text x="{CANVAS_WIDTH / 2}" y="{CANVAS_HEIGHT - MARGIN + 16}" font-family="sans-serif" '
-            f'font-size="12" fill="{text_color}" fill-opacity="0.55" text-anchor="middle">'
-            f"Generated with OpenPresent</text>"
-        )
         parts.append("</svg>")
 
         return "\n".join(parts).encode("utf-8")

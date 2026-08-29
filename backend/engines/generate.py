@@ -69,7 +69,7 @@ def generate_presentation(file_bytes: bytes, filename: str, export_format: str =
 
     _report(on_stage, STAGE_OUTLINE)
     structure = registry.get_structure_adapter()
-    outline = structure.build_outline(source_text, audience_type)
+    outline = structure.build_outline(source_text, audience_type, export_format=export_format)
 
     ai = registry.get_ai_adapter()
     if ai.is_available():

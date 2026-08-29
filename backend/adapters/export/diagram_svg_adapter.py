@@ -40,7 +40,7 @@ TITLE_TO_SUBLINE_GAP = 8
 ARROW_LENGTH = 44  # vertical gap between boxes, filled by the connecting arrow
 HEADER_TITLE_LINE_HEIGHT = 36
 HEADER_BOTTOM_GAP = 28
-FOOTER_HEIGHT = 36
+FOOTER_HEIGHT = 36  # ADR-054 — no longer a visible watermark, just reserved bottom breathing room
 MAX_SUBLINE_LINES = 2
 
 CHARS_PER_LINE_TITLE = int((BOX_WIDTH - 2 * BOX_PADDING) / 9)   # 17px bold text
@@ -137,10 +137,6 @@ class DiagramSvgExportAdapter(ExportPort):
 
             cursor_y += box_height + ARROW_LENGTH
 
-        parts.append(
-            f'<text x="{MARGIN}" y="{total_height - MARGIN + 8}" font-family="sans-serif" '
-            f'font-size="11" fill="{text_color}" fill-opacity="0.6">Generated with OpenPresent</text>'
-        )
         parts.append("</svg>")
 
         return "\n".join(parts).encode("utf-8")

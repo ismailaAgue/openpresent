@@ -47,7 +47,7 @@ CLOSING_TITLE_HINTS = (
 )
 
 
-def validate_and_fix(outline: Outline) -> tuple[Outline, QualityReport]:
+def validate_and_fix(outline: Outline, export_format: str = "pptx") -> tuple[Outline, QualityReport]:
     issues: list[str] = []
     auto_fixed: list[str] = []
 
@@ -77,7 +77,15 @@ def validate_and_fix(outline: Outline) -> tuple[Outline, QualityReport]:
         issues.append(f"Slide(s) with very little content, may feel sparse: "
                        f"{', '.join(str(n) for n in thin)}")
 
-    hierarchy_issues = _find_poor_hierarchy(outline)
+    hierarchy_issues = _find_poor_hierarchy(outline) if export_format != "document_docx" else []
+    # ADR-054 — "paragraph-length bullet" is a deck-specific defect (a
+    # slide bullet SHOULD be short; a paragraph in that role means
+    # something's wrong). For document_docx, multi-sentence paragraphs
+    # are the intended, correctly-generated content (see json_pipeline_
+    # base.py's format-aware content prompt) — flagging them here would
+    # feed a false "problem" straight into the AI revision pass, which
+    # would then dutifully shrink real prose back into fragments,
+    # undoing the whole point of generating prose in the first place.
     if hierarchy_issues:
         issues.append(f"Slide(s) with a paragraph-length bullet (poor hierarchy, consider "
                        f"splitting into separate points): {', '.join(str(n) for n in hierarchy_issues)}")
@@ -87,7 +95,14 @@ def validate_and_fix(outline: Outline) -> tuple[Outline, QualityReport]:
         issues.append("Possibly inconsistent terminology (same term used with different "
                        "capitalization/spelling): " + "; ".join(terminology_issues))
 
-    overflow_risk = _find_overflow_risk(outline)
+    # ADR-054 — "overflow risk" is a per-layout character budget
+    # specifically about whether text will visually fit a FIXED slide
+    # region (see this module's own docstring on the check). A
+    # scrolling Word document has no such fixed region — the check is
+    # structurally meaningless for document_docx, not just usually
+    # a non-issue, so it's skipped outright rather than just often
+    # scoring clean.
+    overflow_risk = _find_overflow_risk(outline) if export_format != "document_docx" else []
     if overflow_risk:
         issues.append(f"Slide(s) with enough combined text that they may feel crowded for "
                        f"their layout: {', '.join(str(n) for n in overflow_risk)}")

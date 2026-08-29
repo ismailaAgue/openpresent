@@ -240,30 +240,71 @@ class _JSONPipelineMixin:
         prompt = self._build_content_prompt(request, strategy, structure)
         raw = self._call_model(prompt, max_tokens=_token_budget(len(structure)),
                                 timeout=_read_timeout(len(structure)))
-        return self._parse_content_json(raw, structure)
+        return self._parse_content_json(raw, structure, request.export_format)
 
     def _build_content_prompt(self, request: GenerationRequest, strategy: PresentationStrategy,
                                structure: list[SlideOutlineItem]) -> str:
         structure_block = "\n".join(
             f"{i+1}. \"{s.title}\" — purpose: {s.purpose}" for i, s in enumerate(structure)
         )
+        # ADR-054 — content shape now depends on what this is actually
+        # FOR, not always assumed to be a slide deck. Before this
+        # branch existed, every export format (including document_docx,
+        # infographic_svg, diagram_svg, poster_svg) received identical
+        # terse bullet-fragment content, because this prompt always
+        # asked for slide bullets regardless of the real target — the
+        # literal reason a generated "document" read like a
+        # reformatted deck instead of a real document.
+        if request.export_format == "document_docx":
+            content_instructions = (
+                "For each section, write 1-3 short paragraphs of genuine connected "
+                "prose (2-4 full sentences each) that thoroughly cover its stated "
+                "purpose — real sentences with transitions, not sentence fragments, "
+                "and NOT a bullet list. Every paragraph you write MUST end with "
+                "terminal punctuation (a period, question mark, or exclamation "
+                "point) — this is how the document renderer distinguishes prose "
+                "paragraphs from a list, so a paragraph missing its final period "
+                "will be misrendered as a list fragment. Also write 1-2 sentences "
+                "of internal notes on this section's role in the document (not "
+                "shown to the reader, this is not a repeat of the paragraphs)."
+            )
+            items_key_note = 'Put each paragraph as its own string in "bullets" — the key name is a holdover from the shared format, but here each entry is a full paragraph, not a fragment.'
+        elif request.export_format in ("infographic_svg", "diagram_svg", "poster_svg"):
+            content_instructions = (
+                f"For each section, write 1-3 short, punchy, standalone claims (max "
+                f"{MAX_BULLETS_PER_SLIDE}) that fulfill its stated purpose — each one "
+                "a single complete idea a reader can grasp in a glance, not a "
+                "sentence fragment and not a full paragraph. This content will "
+                "appear in a compact visual layout with very limited space per "
+                "section, so prioritize the single most important claim per line "
+                "over covering everything. Also write 1-2 sentences of internal "
+                "notes on this section's role (not shown to the reader)."
+            )
+            items_key_note = ""
+        else:
+            content_instructions = (
+                "For each slide, write 3-5 concise bullet points (max "
+                f"{MAX_BULLETS_PER_SLIDE}, fewer for the title slide) that fulfill its "
+                "stated purpose — each bullet a single idea, not a paragraph. Also write "
+                "1-2 sentences of speaker notes: what the presenter should actually say, "
+                "not a repeat of the bullets."
+            )
+            items_key_note = ""
         return (
-            f"Write the content for every slide in this presentation outline about "
+            f"Write the content for every section in this outline about "
             f"\"{request.topic}\" (audience: {request.audience_type}, "
             f"language: {request.language}, tone: {request.tone}):\n\n{structure_block}\n\n"
-            "For each slide, write 3-5 concise bullet points (max "
-            f"{MAX_BULLETS_PER_SLIDE}, fewer for the title slide) that fulfill its "
-            "stated purpose — each bullet a single idea, not a paragraph. Also write "
-            "1-2 sentences of speaker notes: what the presenter should actually say, "
-            "not a repeat of the bullets. Use consistent terminology for key terms "
-            "across every slide (don't call the same thing two different names).\n\n"
+            f"{content_instructions} Use consistent terminology for key terms "
+            "across every section (don't call the same thing two different names).\n\n"
             "Respond with ONLY valid JSON, same order as the outline above:\n"
             '{"slides": [{"title": "string", "bullets": ["string", ...], '
             '"speaker_notes": "string"}]}\n'
             f"The array must have exactly {len(structure)} items."
+            + (f" {items_key_note}" if items_key_note else "")
         )
 
-    def _parse_content_json(self, raw: str, structure: list[SlideOutlineItem]) -> Outline:
+    def _parse_content_json(self, raw: str, structure: list[SlideOutlineItem],
+                             export_format: str = "pptx") -> Outline:
         data = json.loads(_strip_markdown_fences(raw))
         if not isinstance(data, dict) or "slides" not in data:
             raise ValueError("content response missing 'slides' key")
@@ -271,6 +312,17 @@ class _JSONPipelineMixin:
         if not isinstance(raw_slides, list) or len(raw_slides) != len(structure):
             raise ValueError(f"expected {len(structure)} slides, got "
                               f"{len(raw_slides) if isinstance(raw_slides, list) else 'non-list'}")
+
+        # ADR-054 — document_docx content is genuine multi-sentence
+        # prose, not fragments, per _build_content_prompt's branch for
+        # this format; MAX_BULLET_LENGTH (160 chars) is sized for a
+        # slide-bullet fragment and would routinely cut a real
+        # paragraph off mid-sentence, destroying the trailing
+        # punctuation the document renderer's paragraph-vs-list
+        # detection depends on (document_docx_adapter.py). A document
+        # paragraph gets a much longer ceiling; every other format
+        # keeps the original fragment-sized limit unchanged.
+        max_len = 1200 if export_format == "document_docx" else MAX_BULLET_LENGTH
 
         slides = []
         for i, item in enumerate(raw_slides):
@@ -284,7 +336,7 @@ class _JSONPipelineMixin:
             if not isinstance(bullets, list):
                 bullets = [str(bullets)]
             blocks = [
-                ContentBlock(type=BlockType.BULLET, text=str(b).strip()[:MAX_BULLET_LENGTH])
+                ContentBlock(type=BlockType.BULLET, text=str(b).strip()[:max_len])
                 for b in bullets[:MAX_BULLETS_PER_SLIDE] if str(b).strip()
             ]
             notes = str(item.get("speaker_notes", "")).strip()[:MAX_NOTE_LENGTH]
