@@ -387,7 +387,7 @@ class RuleBasedStructureAdapter(StructurePort):
                 cleaned = _BULLET_MARKER.sub("", line).strip()
                 if cleaned:
                     bullets.append(_smart_truncate(cleaned, BULLET_SAFETY_CEILING))
-        elif export_format == "document_docx":
+        elif export_format in ("document_docx", "document_pdf"):
             # Keep the whole section as one paragraph rather than
             # exploding it into per-sentence fragments. A much higher
             # ceiling than the slide-bullet case — this is meant to be
@@ -407,7 +407,7 @@ class RuleBasedStructureAdapter(StructurePort):
         # ADR-054: a document paragraph must never be split across
         # multiple slides/sections the way overflow slide bullets are —
         # one section's prose stays one paragraph, one chunk, full stop.
-        if export_format == "document_docx" and not has_bullet_structure:
+        if export_format in ("document_docx", "document_pdf") and not has_bullet_structure:
             return [bullets]
 
         return [

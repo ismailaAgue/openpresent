@@ -249,13 +249,17 @@ class _JSONPipelineMixin:
         )
         # ADR-054 — content shape now depends on what this is actually
         # FOR, not always assumed to be a slide deck. Before this
-        # branch existed, every export format (including document_docx,
-        # infographic_svg, diagram_svg, poster_svg) received identical
-        # terse bullet-fragment content, because this prompt always
-        # asked for slide bullets regardless of the real target — the
-        # literal reason a generated "document" read like a
+        # branch existed, every export format (including document_docx)
+        # received identical terse bullet-fragment content, because this
+        # prompt always asked for slide bullets regardless of the real
+        # target — the literal reason a generated "document" read like a
         # reformatted deck instead of a real document.
-        if request.export_format == "document_docx":
+        # ADR-055 — document_pdf renders the same prose Recipe as
+        # document_docx (only the export adapter differs, not the
+        # content), so it shares this branch rather than getting its
+        # own; infographic_svg/diagram_svg/poster_svg's branch was
+        # removed entirely along with those formats.
+        if request.export_format in ("document_docx", "document_pdf"):
             content_instructions = (
                 "For each section, write 1-3 short paragraphs of genuine connected "
                 "prose (2-4 full sentences each) that thoroughly cover its stated "
@@ -269,18 +273,6 @@ class _JSONPipelineMixin:
                 "shown to the reader, this is not a repeat of the paragraphs)."
             )
             items_key_note = 'Put each paragraph as its own string in "bullets" — the key name is a holdover from the shared format, but here each entry is a full paragraph, not a fragment.'
-        elif request.export_format in ("infographic_svg", "diagram_svg", "poster_svg"):
-            content_instructions = (
-                f"For each section, write 1-3 short, punchy, standalone claims (max "
-                f"{MAX_BULLETS_PER_SLIDE}) that fulfill its stated purpose — each one "
-                "a single complete idea a reader can grasp in a glance, not a "
-                "sentence fragment and not a full paragraph. This content will "
-                "appear in a compact visual layout with very limited space per "
-                "section, so prioritize the single most important claim per line "
-                "over covering everything. Also write 1-2 sentences of internal "
-                "notes on this section's role (not shown to the reader)."
-            )
-            items_key_note = ""
         else:
             content_instructions = (
                 "For each slide, write 3-5 concise bullet points (max "
@@ -322,7 +314,7 @@ class _JSONPipelineMixin:
         # detection depends on (document_docx_adapter.py). A document
         # paragraph gets a much longer ceiling; every other format
         # keeps the original fragment-sized limit unchanged.
-        max_len = 1200 if export_format == "document_docx" else MAX_BULLET_LENGTH
+        max_len = 1200 if export_format in ("document_docx", "document_pdf") else MAX_BULLET_LENGTH
 
         slides = []
         for i, item in enumerate(raw_slides):

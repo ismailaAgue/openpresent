@@ -77,7 +77,7 @@ def validate_and_fix(outline: Outline, export_format: str = "pptx") -> tuple[Out
         issues.append(f"Slide(s) with very little content, may feel sparse: "
                        f"{', '.join(str(n) for n in thin)}")
 
-    hierarchy_issues = _find_poor_hierarchy(outline) if export_format != "document_docx" else []
+    hierarchy_issues = _find_poor_hierarchy(outline) if export_format not in ("document_docx", "document_pdf") else []
     # ADR-054 — "paragraph-length bullet" is a deck-specific defect (a
     # slide bullet SHOULD be short; a paragraph in that role means
     # something's wrong). For document_docx, multi-sentence paragraphs
@@ -102,7 +102,7 @@ def validate_and_fix(outline: Outline, export_format: str = "pptx") -> tuple[Out
     # structurally meaningless for document_docx, not just usually
     # a non-issue, so it's skipped outright rather than just often
     # scoring clean.
-    overflow_risk = _find_overflow_risk(outline) if export_format != "document_docx" else []
+    overflow_risk = _find_overflow_risk(outline) if export_format not in ("document_docx", "document_pdf") else []
     if overflow_risk:
         issues.append(f"Slide(s) with enough combined text that they may feel crowded for "
                        f"their layout: {', '.join(str(n) for n in overflow_risk)}")

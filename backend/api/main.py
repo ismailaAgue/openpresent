@@ -138,12 +138,8 @@ _MEDIA_TYPES = {
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     # ADR-041 (v3 Phase 3)
     "document_docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    # ADR-046 (v3 Phase 6)
-    "infographic_svg": "image/svg+xml",
-    # ADR-047 (v3 Phase 6)
-    "diagram_svg": "image/svg+xml",
-    # ADR-048 (v3 Phase 6)
-    "poster_svg": "image/svg+xml",
+    # ADR-055 (v3 scope narrowing: pptx/docx/pdf only)
+    "document_pdf": "application/pdf",
 }
 
 # export_format is used as both the ExportPort lookup key AND, until now,
@@ -151,8 +147,8 @@ _MEDIA_TYPES = {
 # was the only format (files.pptx), wrong once a format id isn't also a
 # valid bare extension ("presentation.document_docx" is not a file
 # anyone recognizes). This is the one place that distinction is made.
-_FILE_EXTENSIONS = {"document_docx": "docx", "infographic_svg": "svg", "diagram_svg": "svg", "poster_svg": "svg"}  # anything absent: format_id IS the extension
-_FILE_BASENAMES = {"document_docx": "document", "infographic_svg": "infographic", "diagram_svg": "diagram", "poster_svg": "poster"}  # anything absent: "presentation"
+_FILE_EXTENSIONS = {"document_docx": "docx", "document_pdf": "pdf"}  # anything absent: format_id IS the extension
+_FILE_BASENAMES = {"document_docx": "document", "document_pdf": "document"}  # anything absent: "presentation"
 
 
 def _download_filename(export_format: str) -> str:
