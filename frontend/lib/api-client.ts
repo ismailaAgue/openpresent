@@ -55,6 +55,20 @@ export function logout() {
   clearSessionToken();
 }
 
+export async function getCurrentUser(): Promise<{ user_id: string; email: string } | null> {
+  if (!getSessionToken()) return null;
+  const res = await fetch(`${API_BASE}/auth/me`, { headers: authHeaders() });
+  if (res.status === 401) {
+    // Stale/expired token — clear it so the rest of the app stops
+    // treating this as a signed-in session (Settings page's own read
+    // of this function is what surfaces the problem to the user).
+    clearSessionToken();
+    return null;
+  }
+  if (!res.ok) return null;
+  return res.json();
+}
+
 export interface DocumentGenerateOptions {
   exportFormat?: string;
   audienceType?: string;
@@ -310,6 +324,15 @@ export async function getProject(projectId: string) {
     project_id: string; language: string; audience_type: string;
     slide_count: number; slides: { order: number; title: string }[];
   }>;
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/projects/${projectId}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Could not delete this project");
 }
 
 export function projectExportUrl(projectId: string, format = "pptx") {

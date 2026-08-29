@@ -2158,3 +2158,107 @@ would mean writing a new adapter from scratch, not restoring removed
 code from history, since this ADR treats their removal as deliberate
 and permanent, not paused.
 
+*Next entry: ADR-057.*
+
+---
+
+## ADR-056 — Studio Shell Frontend Gaps Closed: Collapsible Panels, Project Deletion, a Real Settings Page
+
+**Status:** Accepted.
+
+**Decision:** Five real, independently-reported frontend gaps in the
+studio shell (`/`) are closed together, since three of them shared the
+same root cause (a UI element existed but had no `onClick`/route/close
+affordance behind it — decorative, not broken):
+
+1. **Sidebar has no close button.** Added. `AppShell.tsx` now owns
+   `sidebarOpen` state (persisted in `localStorage` under
+   `op_sidebar_open`, so a closed sidebar stays closed across reloads
+   within the studio shell) and renders a floating reopen button when
+   collapsed. `Sidebar.tsx` takes an optional `onClose` prop and
+   renders a close button next to the logo.
+
+2. **Preview/Edit panel has no close button, and "Edit" was dead UI.**
+   Both fixed together, since they're the same panel. The preview
+   column now has a close (×) button and a slim reopen affordance when
+   collapsed, mirroring the sidebar's pattern. Separately: "Edit" was
+   previously a `<span>` with no `onClick` — clicking it did nothing.
+   It's now a real link to the saved project's editor
+   (`/projects/{id}`) once a generation resolves to a project, or a
+   genuinely disabled state (not just visually inert) with a tooltip
+   explaining why, when there's no project yet (anonymous generation,
+   or still in progress). `JobBubblePreviewMirror` now takes an
+   `onProjectId` callback to surface the resolved project id up to the
+   panel that needs it for the link.
+
+3. **No way to delete a previous chat (saved project).** This was a
+   real gap in both layers, not just the frontend:
+   `StoragePort.delete_recipe()` has existed since Phase 4 (used
+   internally by workspace-delete's tests) but was never wired to an
+   HTTP route, so there was no way to delete a project at all,
+   frontend or otherwise. Added `DELETE /projects/{project_id}` (owner-
+   scoped, 404 for both "doesn't exist" and "not yours" — same
+   isolation contract as every other project route, existence is
+   never leaked) and `deleteProject()` in `api-client.ts`. Delete
+   (trash icon) buttons added everywhere a project is listed: the
+   sidebar's Recent list, inside expanded workspaces, and the
+   `/dashboard` project grid — three UI locations, one shared backend
+   route and one shared frontend function.
+
+4. **Settings does nothing.** The nav link previously called
+   `preventDefault()` and did nothing at all — worse than not being
+   there, since it looked clickable. `/settings` is now a real route.
+   Deliberately kept small and, more importantly, **entirely
+   functional** — nothing on the page is decorative:
+   - Account email, via a new `GET /auth/me` route. This didn't exist
+     before either — `/auth/login` only ever returned a bare session
+     token, so the frontend had no way to answer "who am I logged in
+     as" without decoding the (intentionally opaque, per
+     `ports/auth.py`) token itself.
+   - Sign out (reuses the existing `logout()`).
+   - **Default output format** — a real preference, stored in
+     `localStorage` under `op_default_export_format`, read once on
+     mount by `app/page.tsx` and applied to the composer's format
+     selection. Chosen over decorative "settings" (e.g. a fake theme
+     toggle) specifically because it does something observable the
+     next time the person opens a new chat.
+   - Workspaces/brand profiles are explicitly *not* duplicated here —
+     a one-line note points back to the sidebar, where they already
+     live per-workspace (ADR-045). Settings pages that re-host
+     functionality already available elsewhere tend to drift out of
+     sync with the real thing; not doing that here was deliberate.
+
+5. **"New presentation" renamed to "New."** One-line copy change in
+   the sidebar's primary action button — the product generates three
+   formats now (pptx/docx/pdf, ADR-055), so a button that only ever
+   says "presentation" was stale copy left over from before that
+   change, not a UI bug exactly, but worth fixing alongside everything
+   else here.
+
+**What was added, precisely:**
+- Backend: `GET /auth/me`, `DELETE /projects/{project_id}` — both in
+  `api/main.py`, no new port methods needed (`StoragePort.delete_recipe`
+  already existed; `AuthPort` already returns `User(id, email)` from
+  `get_user_from_session`).
+- Frontend: `app/settings/page.tsx` (new). `AppShell.tsx` (sidebar
+  open/close state). `Sidebar.tsx` (close button, delete buttons,
+  Settings link enabled, "New" copy). `app/page.tsx` (preview panel
+  close/reopen, working Edit tab, reads the default-format
+  preference). `app/dashboard/page.tsx` (delete buttons). `lib/api-
+  client.ts` (`getCurrentUser`, `deleteProject`). New CSS in
+  `globals.css` for every new interactive element above.
+
+**Verification:** full backend suite green across 4 consecutive runs
+(435/435 — 427 from ADR-055 plus 8 new: 3 for `/auth/me`, 5 for
+`DELETE /projects/{id}` including a per-owner-isolation test mirroring
+the existing pattern for every other project route). Frontend:
+`tsc --noEmit` clean, `next build` succeeds and now emits 9 static
+routes (up from 8 — `/settings` is real now, not a dead link).
+
+**Stated gap, left alone deliberately:** there is still no confirm-
+before-navigate-away or undo for project deletion beyond the
+`window.confirm()` dialog already used for workspace deletion (ADR-044)
+— consistent with that existing pattern, not a new gap introduced
+here. A styled confirmation modal (replacing every `window.confirm`/
+`window.prompt` in the sidebar, not just this one) would be a real,
+separate piece of work, not invented here just for this one button.

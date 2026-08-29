@@ -409,6 +409,23 @@ def login(req: LoginRequest):
     return {"session_token": token}
 
 
+@app.get("/auth/me")
+def get_current_user(authorization: str | None = Header(default=None)):
+    """ADR-056 — the login response only ever returned a bare session
+    token, never the user's own email, so the frontend had no way to
+    show 'who am I logged in as' without decoding the token itself
+    (which auth ports aren't required to make possible — SimpleAuth's
+    tokens are opaque on purpose). This is the one missing read the
+    Settings page needs; kept intentionally minimal (just id/email,
+    the same two fields /auth/register already returns) rather than
+    growing into a general profile endpoint nothing has asked for yet.
+    """
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return {"user_id": user.id, "email": user.email}
+
+
 # -- Generation (sync — no account required, keeps quick-use free) -----
 
 @app.post("/generate")
@@ -851,6 +868,29 @@ def get_project(project_id: str, authorization: str | None = Header(default=None
         "slide_count": len(recipe.outline.slides),
         "slides": [{"order": s.order, "title": s.title} for s in recipe.outline.slides],
     }
+
+
+@app.delete("/projects/{project_id}")
+def delete_project(project_id: str, authorization: str | None = Header(default=None)):
+    """ADR-056 — StoragePort.delete_recipe() has existed since Phase 4
+    (needed internally for workspace-delete's project reassignment
+    tests) but was never wired to an HTTP route, so there was no way
+    for a user to actually delete a saved project ('previous chat' in
+    the studio UI's language) — the frontend gap and the backend gap
+    are the same missing piece. delete_recipe already enforces
+    per-owner isolation (returns False rather than deleting/raising if
+    project_id doesn't belong to this owner — see storage.py's own
+    docstring), so this route doesn't need to re-check ownership
+    itself; a False result and a "doesn't exist" result are
+    indistinguishable from the outside on purpose, same as every other
+    per-owner lookup in this file (get_project above included)."""
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    deleted = registry.get_storage_adapter().delete_recipe(project_id, user.id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="project not found")
+    return {"deleted": True}
 
 
 def _slide_detail(slide) -> dict:
