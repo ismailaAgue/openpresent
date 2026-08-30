@@ -2262,3 +2262,104 @@ before-navigate-away or undo for project deletion beyond the
 here. A styled confirmation modal (replacing every `window.confirm`/
 `window.prompt` in the sidebar, not just this one) would be a real,
 separate piece of work, not invented here just for this one button.
+
+*Next entry: ADR-058.*
+
+---
+
+## ADR-057 — Q&A Feature Removed; One Consistent Shell for the Whole App; Real Slide Content in Preview
+
+**Status:** Accepted.
+
+**Decision:** Three more real, reported gaps closed together:
+
+1. **Document Q&A ("Ask a question about a document") removed as a
+   product feature**, a deliberate scope decision matching ADR-055's
+   pattern, not a bug fix. `POST /documents/ask` and its dedicated
+   quota bucket (`_enforce_qa_quota`, `_qa_limit_user`/`_qa_limit_anon`)
+   are gone from `api/main.py`, along with the frontend's third
+   composer mode (`Mode` is now just `"topic" | "document"`) and
+   `askDocument()` from `api-client.ts`. **Stated, deliberate gap:**
+   `AIPort.answer_question` and its implementation across every AI
+   adapter (`local_model.py`, `openai_compatible_base.py`,
+   `gemini_adapter.py`, `composite_adapter.py`, `null_adapter.py`,
+   `json_pipeline_base.py`'s `_answer_question_raising`) are left in
+   place — removing a port method touches every adapter file for a
+   codepath nothing calls anymore, which is real, separate work from
+   closing the one frontend-reachable gap that was actually reported.
+   If document Q&A comes back later, or the port method's removal
+   becomes worth doing on its own, that's new work, not a revert.
+
+2. **One consistent shell for the whole app**, closing what "clicking
+   Recent/Settings/Edit/Sign out sends me to the old page" actually
+   was: `/dashboard`, `/settings`, and `/projects/[id]` never got the
+   Claude-style sidebar shell that `/` got in ADR-053 — they still
+   rendered inside the original pre-redesign `NavBar`/plain-page
+   layout. Every link into those routes from inside the sidebar
+   (Recent, Settings, Edit) genuinely did drop the person into a
+   different, older-looking product, which is exactly what it looked
+   like from the outside. `AppShell.tsx`'s `isStudioShell` check now
+   covers those three routes too — they keep the sidebar, just with
+   different content in the main panel. `/login` and `/register`
+   deliberately keep the plain layout (a centered auth form doesn't
+   need a sidebar with nothing meaningful to show yet). Settings'
+   sign-out now redirects to `/` instead of `/login` — logging out
+   should return you to the app in its logged-out state, not force an
+   immediate login prompt. The sidebar's "Recent presentations" label
+   is shortened to "Recent" (product generates 3 formats, not just
+   presentations — same reasoning as ADR-056's "New" rename, just a
+   spot that edit missed).
+
+3. **Collapsed-sidebar button was visually "misplaced."** Root cause:
+   it was a `position: absolute` floating overlay (ADR-056), which
+   sits ON TOP of whatever's underneath rather than making room for
+   itself — exactly the kind of thing that reads as misplaced once
+   real page content is behind it (this became visible once fix #2
+   above put real content on more routes behind it). Replaced with
+   `.op-sidebar-collapsed`, a slim 48px strip that's part of the
+   normal flex row alongside `.op-shell-content`, the same way the
+   full-width sidebar already is. No more overlap possible by
+   construction, not by tuning z-index/position values.
+
+**Also closed — reported together, same investigation:**
+
+4. **"New presentation" hardcoded text.** ADR-056's rename covered the
+   sidebar's primary button and the sidebar's Recent-list label but
+   missed a static `op-chat-header` div at the top of a fresh chat —
+   now "New chat".
+
+5. **Preview appeared twice (chatbox and preview/edit tab), and neither
+   one actually showed what the deck looks like** — both true and both
+   the same root cause. `JobBubble` (the chat-thread message) and
+   `JobBubblePreviewMirror` (the right-hand panel) each independently
+   rendered their own title-only slide grid from the same data.
+   Fixed by:
+   - Removing the slide grid from `JobBubble` entirely — the chat
+     message now only confirms the result (icon, "ready", section
+     count, download/edit actions), never duplicating what the panel
+     right next to it already shows.
+   - `GET /projects/{id}` now returns each slide's `bullets` (notes
+     excluded — see the route's own docstring for why that has to
+     match what every export adapter already does) and the project's
+     `theme.color_set_id`, not just `order`/`title`. This is what
+     "can't really see what the deck looks like without downloading"
+     needed: titles alone were never going to answer that question,
+     regardless of how they were laid out.
+   - `JobBubblePreviewMirror` renders real cards — title, up to 3 real
+     bullet lines, theme-colored border/background/accent — instead of
+     a grid of title-only chips. `THEME_COLORS` in `page.tsx` is a
+     small, deliberate frontend copy of backend `pptx_adapter.py`'s
+     `_COLOR_SETS` (title/accent/background only) rather than a shared
+     source of truth across the language boundary; if a color set is
+     ever added on the backend, it needs adding here too — not a
+     silent gap, an explicit, documented duplication.
+   This is still a content preview, not a pixel-accurate render of the
+   exported file (no fonts/layout/images match the real .pptx/.docx/
+   .pdf) — a real visual renderer is a genuinely different, much larger
+   piece of work than this fix, not attempted here.
+
+**Verification:** full backend suite green across 4 consecutive runs
+(430/430 — 428 from removing 7 Q&A tests off ADR-056's 435, plus 2 new
+tests for the `bullets`/`theme` fields on `GET /projects/{id}`).
+Frontend: `tsc --noEmit` clean, `next build` succeeds (still 9 routes —
+no routes added or removed this time, only what renders inside them).

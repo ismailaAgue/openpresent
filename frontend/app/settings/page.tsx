@@ -49,7 +49,7 @@ export default function SettingsPage() {
 
   function handleSignOut() {
     logout();
-    router.push("/login");
+    router.push("/");
   }
 
   if (loading) {

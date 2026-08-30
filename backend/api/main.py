@@ -195,25 +195,9 @@ def _enforce_generation_quota(user, request: Request) -> None:
                           limit_user=_generation_limit_user(), limit_anon=_generation_limit_anon())
 
 
-# ADR-050 (v3 Phase 7, PDF/document Q&A) — a SEPARATE, lighter quota
-# bucket from generation, not the same one. A single Q&A call is one
-# AI request; a single generation is 6+ (per ADR-043's own reasoning).
-# Sharing one bucket would make whichever cap is reused wrong for the
-# other feature — either generation's cap is too generous for how
-# cheap Q&A actually is, or Q&A inherits a cap sized for something 6x
-# more expensive per use. Same QuotaPort/adapter, different key
-# namespace and separate, more generous limits.
-def _qa_limit_user() -> int:
-    return int(os.environ.get("OPENPRESENT_DAILY_QA_LIMIT_USER", "100"))
-
-
-def _qa_limit_anon() -> int:
-    return int(os.environ.get("OPENPRESENT_DAILY_QA_LIMIT_ANON", "15"))
-
-
-def _enforce_qa_quota(user, request: Request) -> None:
-    _enforce_daily_quota(user, request, key_prefix="qa_", noun="questions",
-                          limit_user=_qa_limit_user(), limit_anon=_qa_limit_anon())
+# ADR-057 removed the frontend feature (and the /documents/ask route
+# this quota gated) — see ADR-057. The generation quota above and its
+# helpers are untouched; only the Q&A-specific bucket is gone.
 
 
 def _enforce_daily_quota(user, request: Request, key_prefix: str, noun: str,
@@ -628,37 +612,13 @@ async def generate_async(request: Request, file: UploadFile = File(...), export_
     return {"job_id": job_id, "status": "pending"}
 
 
-# -- Document Q&A (ADR-050, v3 Phase 7) -------------------------------------
-
-@app.post("/documents/ask")
-async def ask_document(request: Request, file: UploadFile = File(...), question: str = "",
-                        authorization: str | None = Header(default=None)):
-    """Answers a question grounded in an uploaded document's text —
-    reuses the exact same IngestionPort extraction step every
-    generation endpoint already uses (no new extraction logic, per the
-    v3 roadmap's own note on this phase), routed to AIPort.
-    answer_question instead of into the generation pipeline. Always
-    200 with an `answer` field, even when AI isn't configured — see
-    AIPort.answer_question's docstring for why this is the one AIPort
-    method where the degraded response is an explicit, honest sentence
-    rather than a silent pass-through, and api/main.py follows that
-    same contract at the HTTP layer rather than special-casing a 503
-    for it."""
-    if not question or not question.strip():
-        raise HTTPException(status_code=400, detail="question is required")
-    user = _current_user(authorization)
-    _enforce_qa_quota(user, request)  # ADR-050 — separate, lighter cap than generation (see _enforce_qa_quota)
-    file_bytes = await file.read()
-    try:
-        ingestion = registry.get_ingestion_adapter(file.filename or "upload.txt")
-        source_text = ingestion.extract_text(file_bytes, file.filename or "upload.txt")
-    except UnsupportedFileTypeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except CorruptFileError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    answer = registry.get_ai_adapter().answer_question(source_text, question.strip())
-    return {"answer": answer}
+# ADR-057 — Document Q&A (/documents/ask, ADR-050/v3 Phase 7) removed
+# as a frontend-reachable feature; see ADR-057 for scope. AIPort.
+# answer_question and its implementations across every AI adapter are
+# left in place (a stated, deliberate gap — see that ADR) rather than
+# torn out along with the route, since removing a port method touches
+# every adapter file for a codepath nothing calls anymore, which is a
+# separate piece of work from closing the frontend-reachable gap.
 
 
 @app.get("/jobs/{job_id}")
@@ -866,7 +826,23 @@ def get_project(project_id: str, authorization: str | None = Header(default=None
         "language": recipe.language,
         "audience_type": recipe.audience_type,
         "slide_count": len(recipe.outline.slides),
-        "slides": [{"order": s.order, "title": s.title} for s in recipe.outline.slides],
+        # ADR-057 — bullets/notes and theme were added so the studio
+        # preview panel could show what a section actually SAYS, not
+        # just its title (that was the reported gap: "can't really see
+        # what the deck looks like without downloading"). Notes are
+        # deliberately excluded from "bullets" here — they're
+        # speaker-notes/internal content never meant to be shown as
+        # visible slide content, same rule the export adapters already
+        # follow (see e.g. document_docx_adapter/document_pdf_adapter).
+        "theme": {"color_set_id": recipe.theme.color_set_id},
+        "slides": [
+            {
+                "order": s.order,
+                "title": s.title,
+                "bullets": [b.text for b in s.content_blocks if b.type == BlockType.BULLET and b.text],
+            }
+            for s in recipe.outline.slides
+        ],
     }
 
 

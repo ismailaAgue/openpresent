@@ -694,82 +694,10 @@ def test_generate_from_real_pdf_every_non_pptx_format(client, export_format):
 
 
 # -- Document Q&A (ADR-050, v3 Phase 7) -------------------------------------
+# Document Q&A (/documents/ask, ADR-050) was removed as a
+# frontend-reachable feature in ADR-057 — its route-level tests went
+# with it. See ADR-057 in docs/ARCHITECTURE_DECISIONS.md.
 
-def test_ask_document_requires_a_question(client):
-    resp = client.post("/documents/ask", files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")})
-    assert resp.status_code == 400
-
-
-def test_ask_document_returns_an_answer_field(client):
-    """Hermetic suite has no AI configured, so this exercises the
-    NullAdapter degradation path specifically — still a real 200 with
-    a real (honest) answer field, not an error."""
-    resp = client.post(
-        "/documents/ask",
-        files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")},
-        params={"question": "What causes precipitation?"},
-    )
-    assert resp.status_code == 200
-    assert "answer" in resp.json()
-    assert "not configured" in resp.json()["answer"].lower()
-
-
-def test_ask_document_works_with_a_real_pdf(client):
-    resp = client.post(
-        "/documents/ask",
-        files={"file": ("water_cycle.pdf", SAMPLE_PDF_DOC, "application/pdf")},
-        params={"question": "What is this document about?"},
-    )
-    assert resp.status_code == 200
-    assert "answer" in resp.json()
-
-
-def test_ask_document_unsupported_filetype_returns_400(client):
-    resp = client.post(
-        "/documents/ask",
-        files={"file": ("data.xyz", b"whatever content", "application/octet-stream")},
-        params={"question": "test?"},
-    )
-    assert resp.status_code == 400
-
-
-def test_ask_document_corrupt_pdf_returns_422(client):
-    resp = client.post(
-        "/documents/ask",
-        files={"file": ("broken.pdf", b"this is not a real pdf file at all", "application/pdf")},
-        params={"question": "test?"},
-    )
-    assert resp.status_code == 422
-
-
-def test_ask_document_gated_by_its_own_quota_not_generation_quota(client, monkeypatch):
-    """ADR-050's whole point in having a SEPARATE quota bucket from
-    generation, proven — a generation-quota env var set to 0 must NOT
-    block Q&A, and vice versa."""
-    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "0")
-    resp = client.post(
-        "/documents/ask",
-        files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")},
-        params={"question": "test?"},
-    )
-    assert resp.status_code == 200  # generation's cap being 0 doesn't touch Q&A
-
-
-def test_ask_document_blocked_after_its_own_daily_limit(client, monkeypatch):
-    monkeypatch.setenv("OPENPRESENT_DAILY_QA_LIMIT_ANON", "2")
-    for _ in range(2):
-        resp = client.post(
-            "/documents/ask",
-            files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")},
-            params={"question": "test?"},
-        )
-        assert resp.status_code == 200
-    blocked = client.post(
-        "/documents/ask",
-        files={"file": ("doc.txt", SAMPLE_TEXT_DOC, "text/plain")},
-        params={"question": "test?"},
-    )
-    assert blocked.status_code == 429
 
 
 def test_generate_topic_as_document_docx_sync(client):
@@ -1152,6 +1080,33 @@ def test_cannot_delete_another_users_project(client):
     # Confirm it's genuinely untouched, not soft-deleted by the failed attempt
     still_there = client.get(f"/projects/{project_id}", headers=headers_a)
     assert still_there.status_code == 200
+
+
+# -- GET /projects/{id} bullets + theme (ADR-057) ----------------------------
+# Added so the studio preview panel can show what a section actually says,
+# not just its title — the reported gap was "can't see what the deck looks
+# like without downloading."
+
+def test_get_project_includes_bullets_and_theme(client):
+    headers, project_id = _register_login_and_generate_project(client)
+    project = client.get(f"/projects/{project_id}", headers=headers).json()
+
+    assert "theme" in project and "color_set_id" in project["theme"]
+    assert len(project["slides"]) > 0
+    for slide in project["slides"]:
+        assert "bullets" in slide
+        assert isinstance(slide["bullets"], list)
+
+
+def test_get_project_bullets_exclude_speaker_notes(client):
+    """Notes are internal, never meant to render as visible slide
+    content — the export adapters already follow this rule, and the
+    preview response has to match it or the preview would show
+    something the exported deck itself never shows."""
+    headers, project_id = _register_login_and_generate_project(client)
+    project = client.get(f"/projects/{project_id}", headers=headers).json()
+    all_bullets = " ".join(b for s in project["slides"] for b in s["bullets"])
+    assert "speaker note" not in all_bullets.lower()  # NullAdapter's own note text, if any slipped through
 
 
 def test_get_slide_requires_auth(client):

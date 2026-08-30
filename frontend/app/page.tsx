@@ -11,11 +11,10 @@ import {
   getSessionToken,
   listWorkspaces,
   WorkspaceSummary,
-  askDocument,
 } from "@/lib/api-client";
 import { ExportFormat } from "@/lib/export-formats";
 
-type Mode = "topic" | "document" | "ask";
+type Mode = "topic" | "document";
 
 type Msg =
   | { kind: "assistant-text"; id: string; text: string }
@@ -143,14 +142,19 @@ function JobBubble({ jobId, outputFormat }: { jobId: string; outputFormat: Expor
   }
 
   const FORMAT_CONFIG: Record<ExportFormat, {
-    label: string; icon: string; downloadLabel: string; sectionsNoun: string; isSvg: boolean;
+    label: string; icon: string; downloadLabel: string; sectionsNoun: string;
   }> = {
-    pptx: { label: "presentation", icon: "PPTX", downloadLabel: "Download .zip", sectionsNoun: "slides", isSvg: false },
-    document_docx: { label: "document", icon: "DOCX", downloadLabel: "Download .docx", sectionsNoun: "sections", isSvg: false },
-    document_pdf: { label: "PDF", icon: "PDF", downloadLabel: "Download .pdf", sectionsNoun: "sections", isSvg: false },
+    pptx: { label: "presentation", icon: "PPTX", downloadLabel: "Download .zip", sectionsNoun: "slides" },
+    document_docx: { label: "document", icon: "DOCX", downloadLabel: "Download .docx", sectionsNoun: "sections" },
+    document_pdf: { label: "PDF", icon: "PDF", downloadLabel: "Download .pdf", sectionsNoun: "sections" },
   };
   const cfg = FORMAT_CONFIG[outputFormat];
 
+  // The full slide-by-slide preview (title + content) lives in the
+  // right-hand preview panel only (JobBubblePreviewMirror), not
+  // duplicated here too — this bubble just confirms the result and
+  // gets out of the way, matching how a chat message shouldn't repeat
+  // something already visible right next to it.
   return (
     <>
       <div className="op-result-card">
@@ -165,11 +169,6 @@ function JobBubble({ jobId, outputFormat }: { jobId: string; outputFormat: Expor
           </div>
         </div>
       </div>
-      {cfg.isSvg && (
-        <div className="op-infographic-preview">
-          <img src={jobDownloadUrl(jobId)} alt={`Generated ${cfg.label}`} />
-        </div>
-      )}
       <div className="op-result-actions">
         <a className="op-pill-btn primary" href={jobDownloadUrl(jobId)} download>
           {cfg.downloadLabel}
@@ -184,16 +183,6 @@ function JobBubble({ jobId, outputFormat }: { jobId: string; outputFormat: Expor
           </span>
         )}
       </div>
-      {!cfg.isSvg && slides && slides.length > 0 && (
-        <div className="op-slide-grid" style={{ paddingLeft: 32, gridTemplateColumns: "repeat(3, 1fr)" }}>
-          {slides.slice(0, 6).map((s) => (
-            <div key={s.order} className="op-slide-thumb">
-              <span className="op-slide-thumb-num">{s.order}</span>
-              {s.title}
-            </div>
-          ))}
-        </div>
-      )}
     </>
   );
 }
@@ -243,25 +232,12 @@ export default function StudioPage() {
     if (busy) return;
     if (mode === "topic" && !input.trim()) return;
     if (mode === "document" && !file) return;
-    if (mode === "ask" && (!file || !input.trim())) return;
 
-    const userLabel =
-      mode === "topic" ? input.trim() :
-      mode === "ask" ? `Asked about ${file?.name}: ${input.trim()}` :
-      `Uploaded: ${file?.name}`;
+    const userLabel = mode === "topic" ? input.trim() : `Uploaded: ${file?.name}`;
     setMessages((m) => [...m, { kind: "user-text", id: uid(), text: userLabel }]);
     setBusy(true);
 
     try {
-      if (mode === "ask") {
-        // Synchronous — no job/polling, unlike generation (ADR-050).
-        const result = await askDocument(file as File, input.trim());
-        setInput("");
-        setFile(null);
-        setMessages((m) => [...m, { kind: "assistant-text", id: uid(), text: result.answer }]);
-        return;
-      }
-
       let job: { job_id: string };
       const workspaceId = selectedWorkspaceId || undefined;  // ADR-044
       if (mode === "topic") {
@@ -273,10 +249,9 @@ export default function StudioPage() {
       setFile(null);
       setMessages((m) => [...m, { kind: "job", id: uid(), jobId: job.job_id, outputFormat }]);
     } catch (e) {
-      const verb = mode === "ask" ? "get an answer" : "start generation";
       setMessages((m) => [
         ...m,
-        { kind: "assistant-text", id: uid(), text: `Couldn't ${verb}: ${e instanceof Error ? e.message : "unknown error"}` },
+        { kind: "assistant-text", id: uid(), text: `Couldn't start generation: ${e instanceof Error ? e.message : "unknown error"}` },
       ]);
     } finally {
       setBusy(false);
@@ -288,7 +263,7 @@ export default function StudioPage() {
   return (
     <div className="op-studio">
       <div className="op-chat-col">
-        <div className="op-chat-header">New presentation</div>
+        <div className="op-chat-header">New chat</div>
         <div className="op-chat-thread" ref={threadRef}>
           {messages.map((m) => {
             if (m.kind === "assistant-text") {
@@ -335,19 +310,14 @@ export default function StudioPage() {
             <button className={`op-mode-pill ${mode === "document" ? "active" : ""}`} onClick={() => setMode("document")}>
               Upload a source document
             </button>
-            <button className={`op-mode-pill ${mode === "ask" ? "active" : ""}`} onClick={() => setMode("ask")}>
-              Ask a question about a document
+            <span style={{ width: 1, alignSelf: "stretch", background: "var(--op-border)", margin: "0 4px" }} />
+            <button
+              className={`op-mode-pill ${outputFormat === "pptx" ? "active" : ""}`}
+              onClick={() => setExportFormat("pptx")}
+              title="Generate a slide deck (.pptx)"
+            >
+              → Slides
             </button>
-            {mode !== "ask" && (
-              <>
-                <span style={{ width: 1, alignSelf: "stretch", background: "var(--op-border)", margin: "0 4px" }} />
-                <button
-                  className={`op-mode-pill ${outputFormat === "pptx" ? "active" : ""}`}
-                  onClick={() => setExportFormat("pptx")}
-                  title="Generate a slide deck (.pptx)"
-                >
-                  → Slides
-                </button>
                 <button
                   className={`op-mode-pill ${outputFormat === "document_docx" ? "active" : ""}`}
                   onClick={() => setExportFormat("document_docx")}
@@ -374,50 +344,10 @@ export default function StudioPage() {
                       <option key={w.workspace_id} value={w.workspace_id}>{w.name}</option>
                     ))}
                   </select>
-                )}
-              </>
             )}
           </div>
 
-          {mode === "ask" ? (
-            <div className="op-ask-box">
-              <div className="op-ask-file-row">
-                {file ? file.name : "Choose a .txt or .pdf file to ask about…"}
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".txt,.pdf"
-                  style={{ display: "none" }}
-                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                />
-                <button
-                  className="op-pill-btn"
-                  style={{ marginLeft: 10, padding: "3px 10px", fontSize: 12 }}
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  Browse
-                </button>
-              </div>
-              <div className="op-composer-box">
-                <textarea
-                  rows={1}
-                  placeholder="e.g. What does this document say about pricing?"
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSend();
-                    }
-                  }}
-                />
-                <button className="op-send-btn" onClick={handleSend} disabled={busy || !file || !input.trim()}>
-                  →
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="op-composer-box">
+          <div className="op-composer-box">
               {mode === "topic" ? (
                 <textarea
                   rows={1}
@@ -453,13 +383,11 @@ export default function StudioPage() {
               <button className="op-send-btn" onClick={handleSend} disabled={busy || (mode === "topic" ? !input.trim() : !file)}>
                 →
               </button>
-            </div>
-          )}
+          </div>
           <div className="op-composer-hint">
             {mode === "topic" && "Enter to send, Shift+Enter for a new line."}
             {mode === "document" && "Documents are enhanced with AI when a provider is configured, deterministic fallback otherwise."}
-            {mode === "ask" && "Answers are grounded in the uploaded document only — not general knowledge."}
-            {mode !== "ask" && outputFormat === "document_docx" ? " Building a Word document, not a slide deck." : ""}
+            {outputFormat === "document_docx" ? " Building a Word document, not a slide deck." : ""}
           </div>
         </div>
       </div>
@@ -519,8 +447,21 @@ export default function StudioPage() {
 
 // Small dedicated fetch for the right-hand preview column so it doesn't
 // depend on the chat bubble's internal state.
+// Mirrors backend/adapters/export/pptx_adapter.py's _COLOR_SETS (title/
+// accent/background only — text color isn't needed here since this is
+// a compact preview, not a full render). Kept as a small, deliberate
+// duplication rather than a shared source of truth across languages;
+// if a color set is added on the backend, add its match here too.
+const THEME_COLORS: Record<string, { title: string; accent: string; background: string }> = {
+  neutral: { title: "#222222", accent: "#2E5C8A", background: "#F7F7F4" },
+  blue_academic: { title: "#1B3A5C", accent: "#C86B2E", background: "#F1F4F8" },
+  warm_editorial: { title: "#3D251A", accent: "#D96C2E", background: "#FBF3EA" },
+  modern_dark: { title: "#F2F2F0", accent: "#5DC9B0", background: "#1E2124" },
+};
+
 function JobBubblePreviewMirror({ jobId, onProjectId }: { jobId: string; onProjectId?: (id: string) => void }) {
-  const [slides, setSlides] = useState<{ order: number; title: string }[] | null>(null);
+  const [slides, setSlides] = useState<{ order: number; title: string; bullets: string[] }[] | null>(null);
+  const [colorSetId, setColorSetId] = useState("neutral");
   const [doneNoProject, setDoneNoProject] = useState(false);
 
   useEffect(() => {
@@ -534,6 +475,7 @@ function JobBubblePreviewMirror({ jobId, onProjectId }: { jobId: string; onProje
             const proj = await getProject(s.project_id);
             if (!cancelled) {
               setSlides(proj.slides);
+              setColorSetId(proj.theme?.color_set_id || "neutral");
               onProjectId?.(s.project_id);
             }
           } else {
@@ -559,12 +501,31 @@ function JobBubblePreviewMirror({ jobId, onProjectId }: { jobId: string; onProje
   if (doneNoProject) {
     return <div className="op-preview-empty">Log in before generating to see a live slide preview here — anonymous generations are download-only.</div>;
   }
+
+  const colors = THEME_COLORS[colorSetId] || THEME_COLORS.neutral;
+
+  // Real content (title + a couple of real bullet lines), styled with
+  // the deck's actual theme colors — this is what actually answers
+  // "what does the deck look like" without downloading it, versus the
+  // title-only chips this replaced.
   return (
-    <div className="op-slide-grid">
+    <div className="op-preview-deck">
       {slides!.map((s) => (
-        <div key={s.order} className="op-slide-thumb">
-          <span className="op-slide-thumb-num">{s.order}</span>
-          {s.title}
+        <div
+          key={s.order}
+          className="op-preview-slide-card"
+          style={{ background: colors.background, borderColor: colors.accent }}
+        >
+          <div className="op-preview-slide-num" style={{ color: colors.accent }}>{s.order}</div>
+          <div className="op-preview-slide-title" style={{ color: colors.title }}>{s.title}</div>
+          {s.bullets.slice(0, 3).map((b, i) => (
+            <div key={i} className="op-preview-slide-bullet" style={{ color: colors.title }}>
+              <span style={{ color: colors.accent }}>—</span> {b}
+            </div>
+          ))}
+          {s.bullets.length > 3 && (
+            <div className="op-preview-slide-more">+{s.bullets.length - 3} more</div>
+          )}
         </div>
       ))}
     </div>
