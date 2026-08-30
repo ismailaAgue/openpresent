@@ -12,7 +12,7 @@ import {
 
 const NAV_ITEMS = [
   { href: "/", label: "Home", icon: "home" },
-  { href: "/dashboard", label: "Recent presentations", icon: "clock" },
+  { href: "/dashboard", label: "Recent", icon: "clock" },
   { href: "/templates", label: "Templates", icon: "grid", comingSoon: true },
   { href: "/brand", label: "Brand kits", icon: "palette", comingSoon: true },
   { href: "/assets", label: "Assets", icon: "image", comingSoon: true },
