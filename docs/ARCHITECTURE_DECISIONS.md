@@ -2452,3 +2452,103 @@ substitute for someone actually looking at it on a phone. **Do this
 before considering the mobile pass fully done**: open the deployed
 site on an actual phone (or Chrome DevTools' device toolbar) and check
 the sidebar drawer, the preview overlay, and the composer at minimum.
+
+*Next entry: ADR-060.*
+
+---
+
+## ADR-059 — Four Reference-Matched Themes; Real Data Instructions in Content Prompts
+
+**Status:** Accepted.
+
+**Decision:** Two separate, real gaps closed together, both from the
+same request: the visual design didn't match a set of reference
+templates the person supplied, and generated decks/documents read as
+data-sparse compared to those references.
+
+**Four new themes, each modeled on one reference image**, added to
+`pptx_adapter.py`'s `_COLOR_SETS` (the single source of truth every
+export format already reads from — docx and pdf needed zero code
+changes to pick these up, confirmed by rendering both, not assumed):
+
+- `gradient_violet` — soft purple-to-pink gradient corner blob, and
+  statistics rendered as colored "chip" cards (large number, small
+  label beneath) instead of plain text.
+- `minimal_mono` — grayscale/near-black, no corner decoration at all,
+  restraint as the actual design language.
+- `bold_violet_stats` — bold near-black headlines on a lavender
+  background, plain accent-colored circle (not a blob).
+- `clean_saas_blue` — modeled on OpenPresent's own concept mockup;
+  light, airy, blue accent, no corner decoration.
+
+**This required real per-theme rendering logic, not just new color
+values** — `_COLOR_SETS` entries now carry `corner_style` ("blob" /
+"circle" / "none") and `stat_chip` (bool), both new, theme-level
+controls that `_add_corner_decoration` and `_render_statistics_slide`
+branch on. Every pre-existing theme (`neutral`, `blue_academic`,
+`warm_editorial`, `modern_dark`) explicitly defaults to `corner_style:
+"circle"` and `stat_chip: False` — their rendered output is
+byte-for-byte unchanged; nothing about their visual behavior moved.
+
+**Two real bugs found by actually rendering the new stat-chip design**,
+not by code review — the "render and look" discipline this project
+already follows (ADR-046/048/054/058) caught both:
+1. Splitting a stat bullet into "number" + "label" initially reused
+   `layout_classifier.STATISTIC_PATTERN`, which only matches `$`
+   amounts and `%` — a bare magnitude like "415K" matched nothing, so
+   the whole bullet fell back to one oversized line that overflowed
+   off the card. Fixed with a new, deliberately broader
+   `CHIP_NUMBER_PATTERN` local to `pptx_adapter.py`, used only for
+   chip splitting — `layout_classifier`'s own pattern is intentionally
+   narrower to avoid false-positive statistics-layout detection (see
+   that module's own comments) and was correctly left alone.
+2. Even after the number matched, a trailing `\b` in the first version
+   of `CHIP_NUMBER_PATTERN` caused "90% client satisfaction rate" to
+   match only "90" — `%` followed by whitespace is a non-word-to-
+   non-word transition, so no boundary exists there, forcing the
+   regex engine to backtrack the optional suffix out of the match
+   entirely. Fixed by removing the trailing `\b`; confirmed by
+   re-rendering and reading the actual output, not just re-reading the
+   regex.
+
+**Wired into actual rotation**, not just reachable by an unused literal
+ID: added to `variety.py`'s `THEME_VARIANT_IDS` (the random-selection
+list topic-first generation actually draws from) and
+`rule_based.py`'s `_KNOWN_THEMES`.
+
+**"Generated documents lack data" — the content-prompt side:** three
+prompt changes in `json_pipeline_base.py`:
+- The topic-first pptx content prompt now explicitly asks for concrete
+  illustrative figures (percentages, dollar amounts, counts, dates)
+  wherever a bullet's point is naturally quantitative, instead of only
+  ever asking for generic bullet points with no data guidance at all.
+  Explicitly framed as illustrative example figures for a template,
+  internally consistent but not claims about real events — this tool
+  generates presentation content from a topic, the same way a
+  template deck ships with placeholder stats, not a factual-claims
+  assistant, so this framing is honest about what the numbers are.
+- The `document_docx`/`document_pdf` prose branch gets the same
+  instruction, adapted for paragraph form.
+- `build_structure_prompt` (the DOCUMENT-UPLOAD enhancement path —
+  where the source text may contain *real* data) previously had no
+  instruction at all about preserving it. A real number in an uploaded
+  document had no protection against being generalized into vaguer
+  language on the way to a shorter outline ("grew 43% in Q3" →
+  "grew significantly"). This is arguably the more important half of
+  the fix, since this path deals with real, not illustrative, data —
+  now explicitly instructed to carry specific numbers/dates/figures
+  through unchanged rather than paraphrasing them away.
+
+**Verification:** all 4 new themes rendered to real PPTX files,
+converted to PDF via `soffice`, rasterized, and visually inspected —
+gradient blob, stat chips (both bugs caught this way), minimal theme's
+lack of decoration, and the bold/clean themes' typography all
+confirmed by looking, not assumed from code. docx and PDF exports of
+the same new theme also rendered and inspected, confirming the
+shared-`_COLOR_SETS` architecture needed no additional code there.
+13 new contract tests (`test_pptx_theme_styles.py`) covering theme
+registration, per-theme output actually differing, corner-decoration
+presence/absence, and both chip-pattern regressions as explicit
+regression tests. 3 new tests for the content-prompt data instructions.
+Full backend suite green across 3 consecutive runs (446/446 — 430 +
+13 + 3).

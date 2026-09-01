@@ -20,27 +20,105 @@ visual anchor — the smallest addition that makes a deck read as
 """
 
 import io
+import re
 from backend.ports.export import ExportPort
 from backend.models.recipe import Recipe, BlockType
 from backend.layout.layout_classifier import PROCESS_BULLET_PATTERN
+
+# ADR-059 — deliberately broader than layout_classifier's own
+# STATISTIC_PATTERN, and used only here, not shared with it. The
+# classifier's pattern is tuned to avoid FALSE POSITIVES (only $ and %
+# count, so an incidental "3 things" in an ordinary bullet doesn't
+# wrongly flip a slide into the statistics layout — see that module's
+# own comments). But once a slide IS already a statistics slide, chip
+# rendering needs to find whatever number is actually there, including
+# a bare magnitude like "415K" with no $ or % attached — a real gap
+# found by rendering a real chip and seeing "415K happy customers
+# served" overflow off the card because nothing matched at all and the
+# whole string fell back to one oversized line. No trailing \b: it was
+# tried first, but "%"/"K"/"M"/"B" followed by whitespace is a
+# non-word-to-non-word transition (no boundary exists there), which
+# forced the engine to backtrack the optional suffix OUT of the match
+# — "90% client..." matched only "90", stranding the "%" in the label
+# half. Also confirmed by rendering, not just reasoned about.
+CHIP_NUMBER_PATTERN = re.compile(r"\$?\d[\d,]*(\.\d+)?\s*[%KMB]?")
+
+
+def _tint(rgb: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
+    """Lightens a color by blending it toward white. amount=0 returns
+    the original color, amount=1 returns white. Used for stat-chip
+    background boxes (ADR-059) — the chip needs to be visibly tinted
+    with the theme's accent color without being so saturated that the
+    dark number/label text inside it becomes hard to read."""
+    r, g, b = rgb
+    return (
+        int(r + (255 - r) * amount),
+        int(g + (255 - g) * amount),
+        int(b + (255 - b) * amount),
+    )
 
 _COLOR_SETS = {
     "neutral": {
         "title": (0x22, 0x22, 0x22), "accent": (0x2E, 0x5C, 0x8A),
         "background": (0xF7, 0xF7, 0xF4), "text": (0x33, 0x33, 0x33),
+        "corner_style": "circle", "stat_chip": False,
     },
     "blue_academic": {
         "title": (0x1B, 0x3A, 0x5C), "accent": (0xC8, 0x6B, 0x2E),
         "background": (0xF1, 0xF4, 0xF8), "text": (0x2A, 0x2A, 0x2A),
+        "corner_style": "circle", "stat_chip": False,
     },
     # ADR-029 (presentation variety, spec Section 10)
     "warm_editorial": {
         "title": (0x3D, 0x25, 0x1A), "accent": (0xD9, 0x6C, 0x2E),
         "background": (0xFB, 0xF3, 0xEA), "text": (0x3D, 0x2E, 0x24),
+        "corner_style": "circle", "stat_chip": False,
     },
     "modern_dark": {
         "title": (0xF2, 0xF2, 0xF0), "accent": (0x5D, 0xC9, 0xB0),
         "background": (0x1E, 0x21, 0x24), "text": (0xD8, 0xDA, 0xDC),
+        "corner_style": "circle", "stat_chip": False,
+    },
+    # ADR-059 — four template themes, each modeled on a reference image
+    # the person supplied. "corner_style"/"stat_chip"/"gradient_stops"
+    # are new, theme-level visual controls (not just color swaps) that
+    # _add_corner_decoration and _render_statistics_slide now read —
+    # see those methods for exactly what each value changes.
+    "gradient_violet": {
+        # Reference: purple/blue/pink AI-themed deck — a soft gradient
+        # blob in the corner and each key number in a colored "chip"
+        # box, not plain text.
+        "title": (0x24, 0x1B, 0x3D), "accent": (0xB0, 0x3D, 0xE8),
+        "background": (0xFC, 0xFB, 0xFF), "text": (0x33, 0x2B, 0x44),
+        "corner_style": "blob", "stat_chip": True,
+        "gradient_stops": ((0x6A, 0x3D, 0xE8), (0xE8, 0x4D, 0xB8)),
+    },
+    "minimal_mono": {
+        # Reference: grayscale/near-black minimal deck — no corner
+        # decoration at all, no stat chips, everything rests on
+        # typography and negative space alone.
+        "title": (0x14, 0x14, 0x14), "accent": (0x6B, 0x6B, 0x6B),
+        "background": (0xFF, 0xFF, 0xFF), "text": (0x2E, 0x2E, 0x2E),
+        "corner_style": "none", "stat_chip": False,
+    },
+    "bold_violet_stats": {
+        # Reference: bold black headlines on a violet/lavender palette
+        # with punchy stat numbers — a plain accent circle (not a
+        # gradient blob) and stat numbers in a strong accent color,
+        # but no chip box around them; the boldness comes from
+        # typography weight and color, not extra shapes.
+        "title": (0x18, 0x14, 0x24), "accent": (0x6E, 0x4A, 0xE8),
+        "background": (0xF7, 0xF5, 0xFD), "text": (0x2A, 0x24, 0x38),
+        "corner_style": "circle", "stat_chip": False,
+    },
+    "clean_saas_blue": {
+        # Reference: OpenPresent's own concept mockup — light, airy,
+        # card-like, restrained blue accent. Closest in spirit to
+        # "neutral" but with a distinct blue identity and no corner
+        # decoration, matching that mockup's clean edges.
+        "title": (0x1A, 0x22, 0x33), "accent": (0x3B, 0x6E, 0xF6),
+        "background": (0xFA, 0xFB, 0xFD), "text": (0x33, 0x3B, 0x47),
+        "corner_style": "none", "stat_chip": False,
     },
 }
 
@@ -107,6 +185,9 @@ class PptxExportAdapter(ExportPort):
         background_color = RGBColor(*colors["background"])
         text_color = RGBColor(*colors.get("text", colors["title"]))
         font_name = _FONT_SETS.get(recipe.theme.font_set_id, _FONT_SETS["sans"])
+        corner_style = colors.get("corner_style", "circle")
+        stat_chip = colors.get("stat_chip", False)
+        gradient_stops = colors.get("gradient_stops")
 
         # Lazy import to avoid a circular dependency — registry.py
         # imports this module to construct PptxExportAdapter, so this
@@ -118,6 +199,8 @@ class PptxExportAdapter(ExportPort):
             Inches=Inches, Pt=Pt, Emu=Emu, RGBColor=RGBColor, PP_ALIGN=PP_ALIGN,
             MSO_SHAPE=MSO_SHAPE, title_color=title_color, accent_color=accent_color,
             background_color=background_color, text_color=text_color, font_name=font_name, media=media,
+            corner_style=corner_style, stat_chip=stat_chip, gradient_stops=gradient_stops,
+            accent_rgb=colors["accent"],
         )
 
         prs = Presentation()
@@ -206,7 +289,33 @@ class PptxExportAdapter(ExportPort):
         in a slide corner — cheap to draw, adds visual interest without
         needing any image, and is a real (if modest) step toward the
         "don't create text-only slides" guidance, ahead of Tier 2's
-        real image integration."""
+        real image integration.
+
+        ADR-059 — three variants now, chosen per-theme rather than one
+        fixed look for every theme: "none" skips this entirely (for
+        minimal/restrained themes where an extra shape would work
+        against the point), "blob" draws a larger soft-edged gradient
+        shape (for themes modeled on gradient-heavy reference decks),
+        and "circle" is the original plain accent-colored oval,
+        unchanged, still the default for every pre-existing theme."""
+        if ctx.corner_style == "none":
+            return
+        if ctx.corner_style == "blob" and ctx.gradient_stops:
+            size = ctx.Inches(2.6)
+            shape = slide.shapes.add_shape(
+                ctx.MSO_SHAPE.OVAL, ctx.Inches(-0.8), ctx.Inches(-0.8), size, size
+            )
+            shape.fill.gradient()
+            shape.fill.gradient_angle = 45.0  # must be set before stop colors — see module notes
+            stops = shape.fill.gradient_stops
+            stops[0].color.rgb = ctx.RGBColor(*ctx.gradient_stops[0])
+            stops[0].position = 0.0
+            stops[1].color.rgb = ctx.RGBColor(*ctx.gradient_stops[1])
+            stops[1].position = 1.0
+            shape.line.fill.background()
+            shape.shadow.inherit = False
+            return
+
         size = ctx.Inches(0.9)
         shape = slide.shapes.add_shape(
             ctx.MSO_SHAPE.OVAL, ctx.Inches(-0.3), ctx.Inches(-0.3), size, size
@@ -401,7 +510,18 @@ class PptxExportAdapter(ExportPort):
     def _render_statistics_slide(self, prs, title_only_layout, title, body_texts, ctx):
         """Large, centered callouts arranged in a row instead of a
         bulleted list — appropriate for slides that are mostly a
-        handful of key numbers (Layout Classifier: ADR-022)."""
+        handful of key numbers (Layout Classifier: ADR-022).
+
+        ADR-059 — themes with stat_chip=True (modeled on a reference
+        deck that put every key number inside a colored card, not
+        plain text) get that treatment here: the number portion is
+        split out from the rest of the bullet text (via the same
+        STATISTIC_PATTERN the layout classifier itself uses to decide
+        a slide even qualifies as a statistics slide) and rendered
+        large inside a tinted rounded-rectangle card, with whatever
+        text remains as a smaller label beneath it. Themes with
+        stat_chip=False keep the original plain-text behavior,
+        unchanged."""
         slide = prs.slides.add_slide(title_only_layout)
         self._apply_background(slide, ctx)
         self._add_title_with_accent(slide, ctx, title)
@@ -410,18 +530,64 @@ class PptxExportAdapter(ExportPort):
         slide_width, slide_height = prs.slide_width, prs.slide_height
         margin = ctx.Inches(0.5)
         box_width = (slide_width - (2 * margin)) // len(stats)
-        box_top = int(slide_height * 0.42)
-        box_height = ctx.Inches(2.2)
+        box_top = int(slide_height * 0.40)
+        box_height = ctx.Inches(2.4)
 
+        if not ctx.stat_chip:
+            for idx, stat_text in enumerate(stats):
+                left = margin + (idx * box_width)
+                box = slide.shapes.add_textbox(left, box_top, box_width, box_height)
+                tf = box.text_frame
+                tf.word_wrap = True
+                p = tf.paragraphs[0]
+                p.text = stat_text
+                p.alignment = ctx.PP_ALIGN.CENTER
+                ctx.style_run(p, size=22, color=ctx.accent_color, bold=True)
+            return slide
+
+        chip_gap = ctx.Inches(0.15)
+        chip_fill = ctx.RGBColor(*_tint(ctx.accent_rgb, 0.85))  # a light tint, not the raw accent
         for idx, stat_text in enumerate(stats):
-            left = margin + (idx * box_width)
-            box = slide.shapes.add_textbox(left, box_top, box_width, box_height)
-            tf = box.text_frame
-            tf.word_wrap = True
-            p = tf.paragraphs[0]
-            p.text = stat_text
-            p.alignment = ctx.PP_ALIGN.CENTER
-            ctx.style_run(p, size=22, color=ctx.accent_color, bold=True)
+            left = margin + (idx * box_width) + chip_gap
+            chip_width = box_width - (2 * chip_gap)
+
+            chip = slide.shapes.add_shape(ctx.MSO_SHAPE.ROUNDED_RECTANGLE, left, box_top, chip_width, box_height)
+            chip.fill.solid()
+            chip.fill.fore_color.rgb = chip_fill
+            chip.line.fill.background()
+            chip.shadow.inherit = False
+
+            match = CHIP_NUMBER_PATTERN.search(stat_text)
+            if match:
+                number_part = match.group(0).strip()
+                label_part = (stat_text[:match.start()] + stat_text[match.end():]).strip(" -:,.")
+            else:
+                number_part, label_part = stat_text, ""
+
+            pad = ctx.Inches(0.2)
+            number_box = slide.shapes.add_textbox(left + pad, box_top + ctx.Inches(0.25), chip_width - (2 * pad), ctx.Inches(0.9))
+            ntf = number_box.text_frame
+            ntf.word_wrap = True
+            np_ = ntf.paragraphs[0]
+            np_.text = number_part
+            np_.alignment = ctx.PP_ALIGN.CENTER
+            # Long numbers ("$320,820M") need a smaller size than short
+            # ones ("90%") to have any chance of fitting one line in a
+            # card this width — same fitting-by-length idea as
+            # _fitting_title_font_size, just a much smaller range.
+            number_size = 26 if len(number_part) <= 6 else (20 if len(number_part) <= 10 else 16)
+            ctx.style_run(np_, size=number_size, color=ctx.accent_color, bold=True)
+
+            if label_part:
+                label_box = slide.shapes.add_textbox(
+                    left + pad, box_top + ctx.Inches(1.15), chip_width - (2 * pad), ctx.Inches(1.0)
+                )
+                lf = label_box.text_frame
+                lf.word_wrap = True
+                lp = lf.paragraphs[0]
+                lp.text = label_part
+                lp.alignment = ctx.PP_ALIGN.CENTER
+                ctx.style_run(lp, size=12, color=ctx.text_color)
         return slide
 
     def _render_comparison_slide(self, prs, title_only_layout, title, body_texts, ctx):
@@ -502,7 +668,8 @@ class _RenderContext:
 
     def __init__(self, Inches, Pt, Emu, RGBColor, PP_ALIGN, MSO_SHAPE,
                  title_color, accent_color, background_color, font_name,
-                 text_color=None, media=None):
+                 text_color=None, media=None, corner_style="circle",
+                 stat_chip=False, gradient_stops=None, accent_rgb=None):
         self.Inches = Inches
         self.Pt = Pt
         self.Emu = Emu
@@ -515,6 +682,16 @@ class _RenderContext:
         self.text_color = text_color or title_color
         self.font_name = font_name
         self.media = media
+        # ADR-059 — per-theme visual style controls, not just colors.
+        # corner_style: "blob" (gradient), "circle" (plain accent oval,
+        # the original/default look), or "none" (no corner decoration
+        # at all — for minimal themes where restraint IS the style).
+        # stat_chip: statistics-slide numbers get a colored background
+        # box instead of plain text, when the theme calls for it.
+        self.corner_style = corner_style
+        self.stat_chip = stat_chip
+        self.gradient_stops = gradient_stops
+        self.accent_rgb = accent_rgb  # raw (r,g,b) tuple, for _tint() — RGBColor itself isn't blendable
         # ADR-029: image_ids already used elsewhere in this deck — passed
         # to MediaPort.search_image(exclude_ids=...) so the same photo
         # never appears twice across one presentation's slides.

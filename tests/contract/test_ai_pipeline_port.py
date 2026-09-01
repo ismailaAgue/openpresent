@@ -991,6 +991,44 @@ def test_content_prompt_defaults_to_pptx_bullets_when_export_format_unset():
     assert "bullet point" in prompt.lower()
 
 
+def test_content_prompt_asks_for_concrete_figures_for_pptx():
+    """ADR-059 — 'generated documents lack data' traced partly to the
+    content prompt itself never asking for concrete numbers, only
+    generic bullet points. This doesn't guarantee the model complies,
+    but the instruction has to actually be in the prompt for that to
+    even be possible."""
+    adapter = gemini_with(content_json())
+    request = GenerationRequest(topic="Market Growth", slide_count=3, export_format="pptx")
+    prompt = adapter._build_content_prompt(request, make_strategy(), make_structure())
+    assert "specific illustrative figure" in prompt.lower()
+    assert "illustrative" in prompt.lower()  # not presented as claims about real events
+
+
+def test_content_prompt_asks_for_concrete_figures_for_documents_too():
+    adapter = gemini_with(content_json())
+    request = GenerationRequest(topic="Market Growth", slide_count=3, export_format="document_docx")
+    prompt = adapter._build_content_prompt(request, make_strategy(), make_structure())
+    assert "specific illustrative" in prompt.lower()
+
+
+def test_build_structure_prompt_asks_to_preserve_source_figures():
+    """ADR-059 — the document-upload enhancement prompt previously had
+    no instruction about preserving specific numbers/dates/figures
+    already present in the uploaded source text, meaning a real number
+    in the source had no protection against being paraphrased into
+    vaguer language on the way to a shorter outline. This is the
+    'generated documents lack data' fix for the upload path
+    specifically (the sibling fix above is for topic-first generation,
+    which has no source data to preserve in the first place)."""
+    from backend.adapters.ai.json_pipeline_base import build_structure_prompt
+    from backend.models.recipe import Outline, Slide, StructureSource as SS
+
+    outline = Outline(structure_source=SS.RULE_BASED, slides=[Slide(order=1, title="Overview", content_blocks=[])])
+    prompt = build_structure_prompt(outline, "Revenue grew 43% in Q3 2024, reaching $12.4M.")
+    assert "carry them through" in prompt.lower() or "precisely as given" in prompt.lower()
+    assert "numbers, statistics" in prompt.lower() or "specific numbers" in prompt.lower()
+
+
 def test_document_docx_content_is_not_truncated_at_the_slide_bullet_length():
     """MAX_BULLET_LENGTH (160 chars) is sized for a slide-bullet
     fragment and would cut a real multi-sentence paragraph off

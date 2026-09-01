@@ -264,22 +264,36 @@ class _JSONPipelineMixin:
                 "For each section, write 1-3 short paragraphs of genuine connected "
                 "prose (2-4 full sentences each) that thoroughly cover its stated "
                 "purpose — real sentences with transitions, not sentence fragments, "
-                "and NOT a bullet list. Every paragraph you write MUST end with "
-                "terminal punctuation (a period, question mark, or exclamation "
-                "point) — this is how the document renderer distinguishes prose "
-                "paragraphs from a list, so a paragraph missing its final period "
-                "will be misrendered as a list fragment. Also write 1-2 sentences "
-                "of internal notes on this section's role in the document (not "
-                "shown to the reader, this is not a repeat of the paragraphs)."
+                "and NOT a bullet list. Where the point being made would naturally "
+                "involve a number — a percentage, a figure, a date, a count — include "
+                "a specific illustrative one rather than staying purely qualitative; "
+                "these are example figures for a document template, plausible and "
+                "internally consistent with each other, not claims about real events. "
+                "Every paragraph you write MUST end with terminal punctuation (a "
+                "period, question mark, or exclamation point) — this is how the "
+                "document renderer distinguishes prose paragraphs from a list, so a "
+                "paragraph missing its final period will be misrendered as a list "
+                "fragment. Also write 1-2 sentences of internal notes on this "
+                "section's role in the document (not shown to the reader, this is "
+                "not a repeat of the paragraphs)."
             )
             items_key_note = 'Put each paragraph as its own string in "bullets" — the key name is a holdover from the shared format, but here each entry is a full paragraph, not a fragment.'
         else:
             content_instructions = (
                 "For each slide, write 3-5 concise bullet points (max "
                 f"{MAX_BULLETS_PER_SLIDE}, fewer for the title slide) that fulfill its "
-                "stated purpose — each bullet a single idea, not a paragraph. Also write "
-                "1-2 sentences of speaker notes: what the presenter should actually say, "
-                "not a repeat of the bullets."
+                "stated purpose — each bullet a single idea, not a paragraph. Wherever "
+                "the point being made would naturally involve a number — a percentage, "
+                "a dollar figure, a count, a date, a rate of change — include a specific "
+                "illustrative figure rather than a vague qualitative statement (\"grew "
+                "43% year over year\" instead of \"grew significantly\"; \"$2.4M in "
+                "savings\" instead of \"significant savings\"). These are illustrative "
+                "example figures for a presentation template, not claims about real "
+                "events, so pick numbers that are plausible and internally consistent "
+                "with each other across the deck, not necessarily real. Don't force a "
+                "number into every bullet — only where the underlying point is "
+                "actually quantitative. Also write 1-2 sentences of speaker notes: "
+                "what the presenter should actually say, not a repeat of the bullets."
             )
             items_key_note = ""
         return (
@@ -625,8 +639,14 @@ def build_structure_prompt(outline: Outline, source_text: str,
     document's own section structure — there was previously no way to
     ask for a specific count, unlike the topic-first flow. This is a
     soft hint given to the AI enhancement pass, not a hard guarantee:
-    if AI is unavailable or fails, the deck still renders at whatever
-    count the rule-based baseline produced."""
+    ADR-059 — this prompt previously had no instruction at all about
+    preserving concrete facts from the source text, which is the
+    likely real cause of "generated documents lack data": a source
+    document might contain real, specific numbers, dates, or named
+    figures, and a generic "base it on this source text" instruction
+    gives the model no reason not to paraphrase them into vaguer
+    qualitative language on the way to a shorter outline. Fixed with
+    an explicit preserve-don't-paraphrase instruction below."""
     slide_titles = [s.title for s in outline.slides]
     count_hint = ""
     if target_slide_count:
@@ -640,6 +660,10 @@ def build_structure_prompt(outline: Outline, source_text: str,
     return (
         "You are improving a presentation outline generated from a student's "
         "document. Current slide titles: " + ", ".join(slide_titles) + "." + count_hint + " "
+        "Any specific numbers, statistics, dates, names, or figures that appear "
+        "in the source text are important — carry them through into the bullets "
+        "precisely as given rather than generalizing them into vaguer language "
+        "(keep \"grew 43% in Q3\" as-is; don't flatten it to \"grew significantly\"). "
         "Respond ONLY with valid JSON: a list of objects with 'title' and "
         "'bullets' (list of strings). Base it on this source text: " + source_text[:2000]
     )
