@@ -1,10 +1,21 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import AppShell from "@/components/AppShell";
 
 export const metadata: Metadata = {
   title: "OpenPresent — Presentations, without the paywall",
   description: "Turn your notes into a real presentation. Free, always, for students. No credit limits, ever.",
+};
+
+// ADR-058 — this was missing entirely. Without it, mobile browsers
+// render the page at a virtual ~980px desktop viewport and scale the
+// whole thing down to fit, which is what actually produced "tiny,
+// overlapping text" — every element WAS laid out correctly, just at
+// desktop proportions squeezed into a phone screen. This single tag
+// is what makes the media queries below have any effect at all.
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
