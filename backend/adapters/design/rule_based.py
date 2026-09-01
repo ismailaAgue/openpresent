@@ -39,6 +39,16 @@ _KNOWN_THEMES = {
     # time — see backend/pipeline/variety.py for selection logic.
     "warm": Theme(layout_template_id="standard", color_set_id="warm_editorial", font_set_id="sans"),
     "modern_dark": Theme(layout_template_id="standard", color_set_id="modern_dark", font_set_id="sans"),
+    # ADR-059 — four more variants, each matching a reference template
+    # image the person supplied. Same rotation mechanism as the four
+    # above, nothing new structurally: only pptx_adapter.py's
+    # _COLOR_SETS needed genuinely new rendering logic (gradient
+    # corners, stat chips) for these to look meaningfully different,
+    # not just recolored — see that module.
+    "gradient_violet": Theme(layout_template_id="standard", color_set_id="gradient_violet", font_set_id="sans"),
+    "minimal_mono": Theme(layout_template_id="standard", color_set_id="minimal_mono", font_set_id="sans"),
+    "bold_violet_stats": Theme(layout_template_id="standard", color_set_id="bold_violet_stats", font_set_id="sans"),
+    "clean_saas_blue": Theme(layout_template_id="standard", color_set_id="clean_saas_blue", font_set_id="sans"),
 }
 
 _SERIF_DOCUMENT_TYPES = {"academic", "lecture"}
