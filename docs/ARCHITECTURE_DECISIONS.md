@@ -2363,3 +2363,92 @@ separate piece of work, not invented here just for this one button.
 tests for the `bullets`/`theme` fields on `GET /projects/{id}`).
 Frontend: `tsc --noEmit` clean, `next build` succeeds (still 9 routes —
 no routes added or removed this time, only what renders inside them).
+
+*Next entry: ADR-059.*
+
+---
+
+## ADR-058 — Mobile Responsiveness: Two Root Causes, Not One
+
+**Status:** Accepted.
+
+**Decision:** The app had zero responsive CSS anywhere before this —
+`grep -c "@media"` on `globals.css` found exactly one rule
+(`prefers-reduced-motion`), nothing width-based at all. "Overlapping
+text and everything" on phones traced to two separate, compounding
+root causes, not one bug:
+
+1. **No viewport meta tag existed at all**, anywhere in the app.
+   `app/layout.tsx` never set one. Without it, phone browsers render
+   the page at a virtual ~980px desktop viewport and scale the whole
+   thing down to fit the physical screen — every element WAS laid out
+   correctly, just at desktop proportions squeezed into a phone-sized
+   window, which reads exactly like "tiny, overlapping text." Fixed
+   with Next.js's typed `viewport` export (the current, non-deprecated
+   way to set this — putting `viewport` fields inside the `metadata`
+   object is what Next now warns against).
+
+2. **The studio shell layout was fixed-width by construction**: a
+   260px sidebar plus a 420px preview column is 680px of non-negotiable
+   width before the chat column gets anything — more than the entire
+   viewport on a ~375px phone. This is the deeper problem the viewport
+   tag alone doesn't fix; getting the *scale* right just makes 680px of
+   fixed layout visibly, correctly too wide for 375px, instead of
+   invisibly too wide.
+
+**The layout fix, at a `max-width: 860px` breakpoint:**
+- **Sidebar becomes a drawer**, not a column: `position: fixed`,
+  slides over content (`width: min(84vw, 300px)`), with a tap-to-close
+  backdrop (`.op-shell-backdrop`, new). `AppShell.tsx` now tracks
+  `isMobile` via `matchMedia`, defaults the sidebar closed on first
+  mobile visit (no stored preference yet — an always-open drawer
+  covering most of the screen on first load is a bad first
+  impression), and auto-closes it on every route change while on
+  mobile, matching how a mobile nav drawer conventionally behaves
+  (desktop keeps the sidebar open across navigation, unchanged).
+- **Preview/Edit panel becomes a full-screen overlay when open**, and
+  a small floating round button when closed — not a permanent 44px
+  strip stealing width from an already-narrow chat column. No new
+  React state or markup for this: it reuses the exact `previewOpen`
+  toggle and close/reopen buttons ADR-057 already built; only the CSS
+  position/sizing differs at this breakpoint.
+- **Studio column stacks and reflows**: `.op-studio` drops its
+  side-by-side assumption, chat bubbles go to `max-width: 100%`
+  instead of a fixed 640px, paddings shrink from 24px to 14-16px, the
+  mode-pill row becomes horizontally scrollable instead of wrapping
+  awkwardly, and the composer's textarea is explicitly kept at 16px+
+  font size — below that, iOS Safari auto-zooms on focus, which is its
+  own separate source of "everything looks broken" on exactly the
+  device class this fix targets.
+- A `max-width: 420px` tier trims a little further (narrower drawer,
+  chat bubble avatars hidden to reclaim ~30px) for the smallest phones
+  specifically, on top of the 860px tier.
+- `.container` (used by `/login`, `/register`, `/dashboard`,
+  `/settings`) gets reduced horizontal padding at the same breakpoint;
+  its `auto-fill`/`minmax` grids (dashboard's project cards) already
+  collapse to a single column on their own with no changes needed —
+  confirmed by inspection, not assumed.
+
+**Verification:** `tsc --noEmit` clean, `next build` succeeds (still 9
+routes). CSS brace-balance checked programmatically (0 net depth,
+catches structural mistakes a visual-only check might miss). The
+built output was fetched and inspected directly rather than assumed:
+confirmed the compiled CSS actually contains the new `max-width:860px`
+block with real, non-purged rules, and confirmed the served HTML's
+`<head>` actually contains `<meta name="viewport" content="width=
+device-width, initial-scale=1">`. Backend suite re-run for regression
+safety (430/430, 3 consecutive runs) even though this delivery is
+frontend-only.
+
+**Stated gap:** this delivery was **not** visually rendered and looked
+at on an actual or emulated phone screen, unlike this project's usual
+"render and look" discipline for visual changes (ADR-046/048/054) —
+no headless browser was available in the environment this work was
+done in to screenshot at a phone viewport, and installing one would
+have needed a Chromium binary from outside the sandbox's network
+allowlist. Verification here is real (built-output inspection, CSS
+structural validation, balanced media-query boundaries) but is not a
+substitute for someone actually looking at it on a phone. **Do this
+before considering the mobile pass fully done**: open the deployed
+site on an actual phone (or Chrome DevTools' device toolbar) and check
+the sidebar drawer, the preview overlay, and the composer at minimum.
