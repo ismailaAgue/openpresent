@@ -8,6 +8,7 @@ import {
   getJobStatus,
   jobDownloadUrl,
   getProject,
+  getProjectPreview,
   getSessionToken,
   listWorkspaces,
   WorkspaceSummary,
@@ -15,6 +16,23 @@ import {
 import { ExportFormat } from "@/lib/export-formats";
 
 type Mode = "topic" | "document";
+
+// ADR-060 — `language` was already accepted end-to-end by every
+// generation call and the AI prompts themselves; there was just never
+// a UI control to set it away from the "en" default. Matches
+// backend/validation/quality_validator.py's CLOSING_SLIDE_TEXT table —
+// if a language is added there, it should be addable here too.
+const LANGUAGE_OPTIONS = [
+  { code: "en", label: "English" },
+  { code: "fr", label: "Français" },
+  { code: "es", label: "Español" },
+  { code: "de", label: "Deutsch" },
+  { code: "it", label: "Italiano" },
+  { code: "pt", label: "Português" },
+  { code: "nl", label: "Nederlands" },
+  { code: "sv", label: "Svenska" },
+  { code: "pl", label: "Polski" },
+];
 
 type Msg =
   | { kind: "assistant-text"; id: string; text: string }
@@ -197,6 +215,11 @@ export default function StudioPage() {
   ]);
   const [mode, setMode] = useState<Mode>("topic");
   const [outputFormat, setExportFormat] = useState<ExportFormat>("pptx");
+  // ADR-060 — language was already a real, fully-wired parameter all
+  // the way through generateFromTopicAsync -> the AI prompt -> the
+  // closing-slide language fix, but the composer never exposed a way
+  // to set it away from the "en" default — this is that missing UI.
+  const [language, setLanguage] = useState("en");
   const [input, setInput] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
@@ -241,9 +264,9 @@ export default function StudioPage() {
       let job: { job_id: string };
       const workspaceId = selectedWorkspaceId || undefined;  // ADR-044
       if (mode === "topic") {
-        job = await generateFromTopicAsync({ topic: input.trim(), exportFormat: outputFormat, workspaceId });
+        job = await generateFromTopicAsync({ topic: input.trim(), exportFormat: outputFormat, workspaceId, language });
       } else {
-        job = await generateAsync(file as File, { exportFormat: outputFormat, workspaceId });
+        job = await generateAsync(file as File, { exportFormat: outputFormat, workspaceId, language });
       }
       setInput("");
       setFile(null);
@@ -304,13 +327,6 @@ export default function StudioPage() {
 
         <div className="op-composer">
           <div className="op-mode-row">
-            <button className={`op-mode-pill ${mode === "topic" ? "active" : ""}`} onClick={() => setMode("topic")}>
-              Describe a topic
-            </button>
-            <button className={`op-mode-pill ${mode === "document" ? "active" : ""}`} onClick={() => setMode("document")}>
-              Upload a source document
-            </button>
-            <span style={{ width: 1, alignSelf: "stretch", background: "var(--op-border)", margin: "0 4px" }} />
             <button
               className={`op-mode-pill ${outputFormat === "pptx" ? "active" : ""}`}
               onClick={() => setExportFormat("pptx")}
@@ -332,6 +348,16 @@ export default function StudioPage() {
                 >
                   → PDF
                 </button>
+                <select
+                  className="op-workspace-select"
+                  value={language}
+                  onChange={(e) => setLanguage(e.target.value)}
+                  title="Language to generate in"
+                >
+                  {LANGUAGE_OPTIONS.map((l) => (
+                    <option key={l.code} value={l.code}>{l.label}</option>
+                  ))}
+                </select>
                 {signedIn && workspaces.length > 0 && (
                   <select
                     className="op-workspace-select"
@@ -348,7 +374,44 @@ export default function StudioPage() {
           </div>
 
           <div className="op-composer-box">
-              {mode === "topic" ? (
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".txt,.pdf"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0] ?? null;
+                  setFile(f);
+                  setMode(f ? "document" : "topic");
+                }}
+              />
+              {/* Attach button, ChatGPT/Claude-style, instead of a separate
+                  "upload a document" mode the person has to switch into
+                  first — attaching a file IS the mode switch now. */}
+              <button
+                className="op-attach-btn"
+                onClick={() => fileInputRef.current?.click()}
+                title="Attach a .txt or .pdf to generate from"
+                type="button"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21.44 11.05 12.25 20.24a5.5 5.5 0 0 1-7.78-7.78l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95L9.41 17.41a1.5 1.5 0 0 1-2.12-2.12l8.49-8.49" />
+                </svg>
+              </button>
+
+              {file ? (
+                <div className="op-attachment-chip">
+                  <span className="op-attachment-name">{file.name}</span>
+                  <button
+                    className="op-attachment-remove"
+                    onClick={() => { setFile(null); setMode("topic"); }}
+                    title="Remove attachment"
+                    type="button"
+                  >
+                    ×
+                  </button>
+                </div>
+              ) : (
                 <textarea
                   rows={1}
                   placeholder="e.g. Create a 10-slide investor pitch deck for an AI healthcare startup"
@@ -361,24 +424,6 @@ export default function StudioPage() {
                     }
                   }}
                 />
-              ) : (
-                <div style={{ flex: 1, fontSize: 14.5, color: file ? "var(--op-text)" : "var(--op-text-muted)", padding: "6px 0" }}>
-                  {file ? file.name : "Choose a .txt or .pdf file…"}
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept=".txt,.pdf"
-                    style={{ display: "none" }}
-                    onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                  />
-                  <button
-                    className="op-pill-btn"
-                    style={{ marginLeft: 10, padding: "3px 10px", fontSize: 12 }}
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    Browse
-                  </button>
-                </div>
               )}
               <button className="op-send-btn" onClick={handleSend} disabled={busy || (mode === "topic" ? !input.trim() : !file)}>
                 →
@@ -447,21 +492,8 @@ export default function StudioPage() {
 
 // Small dedicated fetch for the right-hand preview column so it doesn't
 // depend on the chat bubble's internal state.
-// Mirrors backend/adapters/export/pptx_adapter.py's _COLOR_SETS (title/
-// accent/background only — text color isn't needed here since this is
-// a compact preview, not a full render). Kept as a small, deliberate
-// duplication rather than a shared source of truth across languages;
-// if a color set is added on the backend, add its match here too.
-const THEME_COLORS: Record<string, { title: string; accent: string; background: string }> = {
-  neutral: { title: "#222222", accent: "#2E5C8A", background: "#F7F7F4" },
-  blue_academic: { title: "#1B3A5C", accent: "#C86B2E", background: "#F1F4F8" },
-  warm_editorial: { title: "#3D251A", accent: "#D96C2E", background: "#FBF3EA" },
-  modern_dark: { title: "#F2F2F0", accent: "#5DC9B0", background: "#1E2124" },
-};
-
 function JobBubblePreviewMirror({ jobId, onProjectId }: { jobId: string; onProjectId?: (id: string) => void }) {
-  const [slides, setSlides] = useState<{ order: number; title: string; bullets: string[] }[] | null>(null);
-  const [colorSetId, setColorSetId] = useState("neutral");
+  const [previewSlides, setPreviewSlides] = useState<{ order: number; svg: string }[] | null>(null);
   const [doneNoProject, setDoneNoProject] = useState(false);
 
   useEffect(() => {
@@ -472,10 +504,14 @@ function JobBubblePreviewMirror({ jobId, onProjectId }: { jobId: string; onProje
         if (cancelled) return;
         if (s.status === "done") {
           if (s.project_id) {
-            const proj = await getProject(s.project_id);
+            // ADR-061 — real, themed slide previews (server-rendered
+            // SVG matching PptxExportAdapter's actual design
+            // decisions), not a generic title+bullets text mockup.
+            // See lib/api-client.ts's getProjectPreview for exactly
+            // what this does and doesn't match pixel-for-pixel.
+            const preview = await getProjectPreview(s.project_id);
             if (!cancelled) {
-              setSlides(proj.slides);
-              setColorSetId(proj.theme?.color_set_id || "neutral");
+              setPreviewSlides(preview.slides);
               onProjectId?.(s.project_id);
             }
           } else {
@@ -495,38 +531,25 @@ function JobBubblePreviewMirror({ jobId, onProjectId }: { jobId: string; onProje
     };
   }, [jobId]);
 
-  if (!slides && !doneNoProject) {
+  if (!previewSlides && !doneNoProject) {
     return <div className="op-preview-empty">Generating…</div>;
   }
   if (doneNoProject) {
     return <div className="op-preview-empty">Log in before generating to see a live slide preview here — anonymous generations are download-only.</div>;
   }
 
-  const colors = THEME_COLORS[colorSetId] || THEME_COLORS.neutral;
-
-  // Real content (title + a couple of real bullet lines), styled with
-  // the deck's actual theme colors — this is what actually answers
-  // "what does the deck look like" without downloading it, versus the
-  // title-only chips this replaced.
   return (
     <div className="op-preview-deck">
-      {slides!.map((s) => (
+      {previewSlides!.map((s) => (
         <div
           key={s.order}
-          className="op-preview-slide-card"
-          style={{ background: colors.background, borderColor: colors.accent }}
-        >
-          <div className="op-preview-slide-num" style={{ color: colors.accent }}>{s.order}</div>
-          <div className="op-preview-slide-title" style={{ color: colors.title }}>{s.title}</div>
-          {s.bullets.slice(0, 3).map((b, i) => (
-            <div key={i} className="op-preview-slide-bullet" style={{ color: colors.title }}>
-              <span style={{ color: colors.accent }}>—</span> {b}
-            </div>
-          ))}
-          {s.bullets.length > 3 && (
-            <div className="op-preview-slide-more">+{s.bullets.length - 3} more</div>
-          )}
-        </div>
+          className="op-preview-slide-svg"
+          // The backend renders trusted, server-generated SVG markup
+          // from the person's own project data — not arbitrary
+          // user-supplied HTML, so this is the same trust boundary as
+          // any other authenticated API response rendered in the UI.
+          dangerouslySetInnerHTML={{ __html: s.svg }}
+        />
       ))}
     </div>
   );

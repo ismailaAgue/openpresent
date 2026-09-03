@@ -284,7 +284,7 @@ class PptxExportAdapter(ExportPort):
         slide.background.fill.solid()
         slide.background.fill.fore_color.rgb = ctx.background_color
 
-    def _add_corner_decoration(self, slide, ctx):
+    def _add_corner_decoration(self, slide, ctx, prs, small=False):
         """Tier 1 visual improvement: a simple geometric accent shape
         in a slide corner — cheap to draw, adds visual interest without
         needing any image, and is a real (if modest) step toward the
@@ -297,14 +297,32 @@ class PptxExportAdapter(ExportPort):
         against the point), "blob" draws a larger soft-edged gradient
         shape (for themes modeled on gradient-heavy reference decks),
         and "circle" is the original plain accent-colored oval,
-        unchanged, still the default for every pre-existing theme."""
+        unchanged, still the default for every pre-existing theme.
+
+        ADR-061 — small=True gives every non-title slide a much
+        smaller version of the same shape, tucked into the bottom-
+        right corner (title slides keep the large top-left version,
+        unchanged), rather than skipping decoration on every slide
+        after the first. This was a real, reported gap: the reference
+        decks carry a consistent visual identity mark across every
+        slide, not just the cover, and a deck that's decorated only on
+        slide 1 reads as "handmade"/inconsistent by slide 3.
+
+        Takes `prs` explicitly (not assumed to be 13.333x7.5in
+        widescreen) — python-pptx's default blank Presentation() is
+        actually 10x7.5in (4:3); the first version of this method
+        hardcoded 16:9 dimensions for the small-variant's bottom-right
+        positioning, which would have placed it off-canvas entirely.
+        Caught before shipping, not after."""
         if ctx.corner_style == "none":
             return
+        slide_width, slide_height = prs.slide_width, prs.slide_height
         if ctx.corner_style == "blob" and ctx.gradient_stops:
-            size = ctx.Inches(2.6)
-            shape = slide.shapes.add_shape(
-                ctx.MSO_SHAPE.OVAL, ctx.Inches(-0.8), ctx.Inches(-0.8), size, size
-            )
+            size = ctx.Inches(1.0) if small else ctx.Inches(2.6)
+            offset = ctx.Inches(-0.35) if small else ctx.Inches(-0.8)
+            left = slide_width - size - offset if small else offset
+            top = slide_height - size - offset if small else offset
+            shape = slide.shapes.add_shape(ctx.MSO_SHAPE.OVAL, left, top, size, size)
             shape.fill.gradient()
             shape.fill.gradient_angle = 45.0  # must be set before stop colors — see module notes
             stops = shape.fill.gradient_stops
@@ -316,14 +334,57 @@ class PptxExportAdapter(ExportPort):
             shape.shadow.inherit = False
             return
 
-        size = ctx.Inches(0.9)
-        shape = slide.shapes.add_shape(
-            ctx.MSO_SHAPE.OVAL, ctx.Inches(-0.3), ctx.Inches(-0.3), size, size
-        )
+        size = ctx.Inches(0.35) if small else ctx.Inches(0.9)
+        offset = ctx.Inches(-0.12) if small else ctx.Inches(-0.3)
+        left = slide_width - size - offset if small else offset
+        top = slide_height - size - offset if small else offset
+        shape = slide.shapes.add_shape(ctx.MSO_SHAPE.OVAL, left, top, size, size)
         shape.fill.solid()
         shape.fill.fore_color.rgb = ctx.accent_color
         shape.line.fill.background()
         shape.shadow.inherit = False
+
+    def _disable_native_bullet(self, paragraph):
+        """ADR-061 — python-pptx 1.0.2 has no paragraph.bullet API (any
+        version's docs referencing it are for a different/newer
+        release — confirmed against the actual installed version, not
+        assumed), so the only way to stop a placeholder's inherited
+        bullet character from showing is direct XML: insert <a:buNone/>
+        into the paragraph's <a:pPr>. Without this, _add_colored_bullets'
+        own accent-colored marker run would show up ALONGSIDE the
+        native bullet instead of replacing it — a real, worse-than-
+        original double-bullet bug this was caught by testing, not
+        assumed to work from the (wrong) high-level API guess."""
+        from pptx.oxml.ns import qn
+        pPr = paragraph._p.get_or_add_pPr()
+        for tag in ("a:buChar", "a:buAutoNum", "a:buNone"):
+            existing = pPr.find(qn(tag))
+            if existing is not None:
+                pPr.remove(existing)
+        pPr.append(pPr.makeelement(qn("a:buNone"), {}))
+
+    def _add_colored_bullets(self, text_frame, texts, ctx, size=BODY_FONT_SIZE):
+        """ADR-061 — replaces the default black round-dot bullet (or,
+        on the native-placeholder path, whatever the inherited layout
+        happened to use) with an accent-colored square marker as its
+        own text run, ahead of the bullet text itself — a small,
+        cheap, but real "designed, not default" signal the reference
+        decks all share (every one of them uses a colored marker, none
+        use a plain black dot)."""
+        if not texts:
+            return
+        text_frame.word_wrap = True
+        for i, txt in enumerate(texts):
+            p = text_frame.paragraphs[0] if i == 0 else text_frame.add_paragraph()
+            p.text = ""
+            self._disable_native_bullet(p)
+            marker_run = p.add_run()
+            marker_run.text = "■  "
+            ctx.style_run_direct(marker_run, size=size, color=ctx.accent_color, bold=False)
+            text_run = p.add_run()
+            text_run.text = txt
+            ctx.style_run_direct(text_run, size=size, color=ctx.text_color, bold=False)
+            p.space_after = ctx.Pt(10)
 
     # -- layout renderers ------------------------------------------------
 
@@ -346,21 +407,14 @@ class PptxExportAdapter(ExportPort):
         # resized and so was never affected by the bug above.
         slide = prs.slides.add_slide(content_layout)
         self._apply_background(slide, ctx)
+        self._add_corner_decoration(slide, ctx, prs, small=True)
         self._add_title_with_accent(slide, ctx, title)
 
         if not body_texts or len(slide.placeholders) < 2:
             return slide
 
         body_placeholder = slide.placeholders[1]
-        tf = body_placeholder.text_frame
-        tf.word_wrap = True
-        tf.text = body_texts[0]
-        ctx.style_run(tf.paragraphs[0], size=BODY_FONT_SIZE, color=ctx.text_color)
-        for extra in body_texts[1:]:
-            p = tf.add_paragraph()
-            p.text = extra
-            p.level = 0
-            ctx.style_run(p, size=BODY_FONT_SIZE, color=ctx.text_color)
+        self._add_colored_bullets(body_placeholder.text_frame, body_texts, ctx)
         return slide
 
     def _render_bullet_slide_with_image(self, prs, title_only_layout, title, body_texts, image_result, ctx):
@@ -372,6 +426,7 @@ class PptxExportAdapter(ExportPort):
         collision bug found via real generated output)."""
         slide = prs.slides.add_slide(title_only_layout)
         self._apply_background(slide, ctx)
+        self._add_corner_decoration(slide, ctx, prs, small=True)
         self._add_title_with_accent(slide, ctx, title)
 
         title_shape = slide.shapes.title
@@ -388,14 +443,7 @@ class PptxExportAdapter(ExportPort):
         content_height = slide_height - content_top - bottom_margin
 
         text_box = slide.shapes.add_textbox(margin, content_top, text_width, content_height)
-        tf = text_box.text_frame
-        tf.word_wrap = True
-        tf.text = body_texts[0]
-        ctx.style_run(tf.paragraphs[0], size=BODY_FONT_SIZE, color=ctx.text_color)
-        for extra in body_texts[1:]:
-            p = tf.add_paragraph()
-            p.text = extra
-            ctx.style_run(p, size=BODY_FONT_SIZE, color=ctx.text_color)
+        self._add_colored_bullets(text_box.text_frame, body_texts, ctx)
 
         image_left = margin + text_width + gutter
         pic_bottom = self._add_picture_capped(slide, ctx, image_result.image_bytes,
@@ -470,7 +518,7 @@ class PptxExportAdapter(ExportPort):
         impossible rather than avoided by a lucky constant (ADR-026)."""
         slide = prs.slides.add_slide(title_only_layout)
         self._apply_background(slide, ctx)
-        self._add_corner_decoration(slide, ctx)
+        self._add_corner_decoration(slide, ctx, prs)
 
         image_result = self._maybe_fetch_image(ctx.media, getattr(slide_data, "image_query", None), ctx)
         image_bytes = image_result.image_bytes if image_result else None
@@ -524,6 +572,7 @@ class PptxExportAdapter(ExportPort):
         unchanged."""
         slide = prs.slides.add_slide(title_only_layout)
         self._apply_background(slide, ctx)
+        self._add_corner_decoration(slide, ctx, prs, small=True)
         self._add_title_with_accent(slide, ctx, title)
 
         stats = body_texts[:4]  # beyond 4, a row stops being readable at a glance
@@ -593,9 +642,18 @@ class PptxExportAdapter(ExportPort):
     def _render_comparison_slide(self, prs, title_only_layout, title, body_texts, ctx):
         """Two side-by-side text columns instead of one bulleted list —
         for slides whose title signals a direct comparison ('X vs Y'),
-        per the Layout Classifier (ADR-022)."""
+        per the Layout Classifier (ADR-022).
+
+        ADR-061 — each column now sits inside a light, tinted card
+        (using the same _tint() helper the statistics chips use), not
+        floating directly on the bare background — the reference decks
+        never present two comparison columns as plain unbounded text;
+        a visible card boundary is what actually reads as "a
+        comparison," where two paragraphs with no visual separation
+        just reads as two disconnected blocks of text."""
         slide = prs.slides.add_slide(title_only_layout)
         self._apply_background(slide, ctx)
+        self._add_corner_decoration(slide, ctx, prs, small=True)
         self._add_title_with_accent(slide, ctx, title)
 
         midpoint = max(1, len(body_texts) // 2) if len(body_texts) > 1 else len(body_texts)
@@ -606,47 +664,66 @@ class PptxExportAdapter(ExportPort):
         column_width = (slide_width - (2 * margin) - gutter) // 2
         top = int(slide_height * 0.36)
         height = ctx.Inches(3.5)
+        card_fill = ctx.RGBColor(*_tint(ctx.accent_rgb, 0.9)) if ctx.accent_rgb else None
 
         for items, left in ((left_items, margin), (right_items, margin + column_width + gutter)):
-            box = slide.shapes.add_textbox(left, top, column_width, height)
-            tf = box.text_frame
-            tf.word_wrap = True
+            if card_fill is not None:
+                card = slide.shapes.add_shape(ctx.MSO_SHAPE.ROUNDED_RECTANGLE, left, top, column_width, height)
+                card.fill.solid()
+                card.fill.fore_color.rgb = card_fill
+                card.line.fill.background()
+                card.shadow.inherit = False
             if not items:
                 continue
-            tf.text = items[0]
-            ctx.style_run(tf.paragraphs[0], size=16, color=ctx.text_color)
-            for extra in items[1:]:
-                p = tf.add_paragraph()
-                p.text = extra
-                ctx.style_run(p, size=16, color=ctx.text_color)
+            pad = ctx.Inches(0.25)
+            box = slide.shapes.add_textbox(left + pad, top + pad, column_width - (2 * pad), height - (2 * pad))
+            self._add_colored_bullets(box.text_frame, items, ctx, size=16)
         return slide
 
     def _render_process_slide(self, prs, title_only_layout, title, body_texts, ctx):
         """Numbered step boxes arranged left to right instead of a flat
-        bulleted list, per the Layout Classifier (ADR-023)."""
+        bulleted list, per the Layout Classifier (ADR-023).
+
+        ADR-061 — each step number now sits inside a solid accent-
+        colored circle badge instead of floating as plain colored
+        text — matches how every reference deck presents a numbered
+        process (a badge, never a bare digit), and gives the eye a
+        clear per-step anchor point in a row that otherwise has no
+        visual separation between steps."""
         slide = prs.slides.add_slide(title_only_layout)
         self._apply_background(slide, ctx)
+        self._add_corner_decoration(slide, ctx, prs, small=True)
         self._add_title_with_accent(slide, ctx, title)
 
         steps = body_texts[:5]  # beyond 5, a single row stops being readable
         slide_width, slide_height = prs.slide_width, prs.slide_height
         margin = ctx.Inches(0.4)
         box_width = (slide_width - (2 * margin)) // len(steps)
-        number_top = int(slide_height * 0.36)
-        number_height = ctx.Inches(0.6)
-        text_top = number_top + number_height
-        text_height = ctx.Inches(2.4)
+        number_top = int(slide_height * 0.34)
+        badge_size = ctx.Inches(0.55)
+        text_top = number_top + badge_size + ctx.Inches(0.15)
+        text_height = ctx.Inches(2.3)
 
         for idx, step_text in enumerate(steps):
             left = margin + (idx * box_width)
             cleaned_text = PROCESS_BULLET_PATTERN.sub("", step_text).lstrip(",: ").strip()
             cleaned_text = cleaned_text[0].upper() + cleaned_text[1:] if cleaned_text else step_text
 
-            number_box = slide.shapes.add_textbox(left, number_top, box_width, number_height)
-            np = number_box.text_frame.paragraphs[0]
-            np.text = str(idx + 1)
-            np.alignment = ctx.PP_ALIGN.CENTER
-            ctx.style_run(np, size=28, color=ctx.accent_color, bold=True)
+            badge_left = left + (box_width - badge_size) // 2
+            badge = slide.shapes.add_shape(ctx.MSO_SHAPE.OVAL, badge_left, number_top, badge_size, badge_size)
+            badge.fill.solid()
+            badge.fill.fore_color.rgb = ctx.accent_color
+            badge.line.fill.background()
+            badge.shadow.inherit = False
+            btf = badge.text_frame
+            btf.word_wrap = False
+            bp = btf.paragraphs[0]
+            bp.text = str(idx + 1)
+            bp.alignment = ctx.PP_ALIGN.CENTER
+            # White text on a solid accent-colored badge — always high
+            # contrast regardless of theme, unlike text-on-background
+            # (which has to match the theme's own text color).
+            ctx.style_run(bp, size=20, color=ctx.RGBColor(0xFF, 0xFF, 0xFF), bold=True)
 
             text_box = slide.shapes.add_textbox(left, text_top, box_width, text_height)
             tf = text_box.text_frame
@@ -709,3 +786,19 @@ class _RenderContext:
             paragraph.font.color.rgb = color
         if bold is not None:
             paragraph.font.bold = bold
+
+    def style_run_direct(self, run, size=None, color=None, bold=None):
+        """ADR-061 — same as style_run, but for an individual Run
+        object rather than a whole Paragraph. Needed wherever a single
+        paragraph has to mix two different colors in one line (the
+        colored bullet marker vs. the bullet text itself, in
+        _add_colored_bullets) — paragraph.font only ever applies one
+        color to the whole line, so those two runs each need their own
+        call to this instead."""
+        run.font.name = self.font_name
+        if size is not None:
+            run.font.size = self.Pt(size)
+        if color is not None:
+            run.font.color.rgb = color
+        if bold is not None:
+            run.font.bold = bold

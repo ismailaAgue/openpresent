@@ -846,6 +846,26 @@ def get_project(project_id: str, authorization: str | None = Header(default=None
     }
 
 
+@app.get("/projects/{project_id}/preview")
+def get_project_preview(project_id: str, authorization: str | None = Header(default=None)):
+    """ADR-061 — a real, themed visual preview (matching colors,
+    corner decoration, stat chips, bullet markers — the actual design
+    decisions PptxExportAdapter makes) without needing LibreOffice in
+    production. See backend/adapters/preview/svg_preview.py's module
+    docstring for the full reasoning on why this is SVG-rendered here
+    rather than a screenshot of the real exported file, and for the
+    stated layout-coverage limits (comparison/process fall back to a
+    themed bullet-list rendering, not a silent gap)."""
+    user = _current_user(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    recipe = registry.get_storage_adapter().get_recipe(project_id, user.id)
+    if recipe is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    from backend.adapters.preview.svg_preview import SvgPreviewAdapter
+    return {"slides": SvgPreviewAdapter().render(recipe)}
+
+
 @app.delete("/projects/{project_id}")
 def delete_project(project_id: str, authorization: str | None = Header(default=None)):
     """ADR-056 — StoragePort.delete_recipe() has existed since Phase 4

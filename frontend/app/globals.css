@@ -221,6 +221,61 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
 }
 .op-shell-content { flex: 1; min-width: 0; height: 100%; overflow-y: auto; }
 
+/* ADR-060 — /dashboard, /settings, and /projects/[id] all render
+   inside this element (see AppShell.tsx's isStudioShell), but their
+   actual page markup still uses the ORIGINAL pre-redesign component
+   classes (.container/.card/.index-card/.btn/etc.) and CSS variables
+   (--paper, --pencil, --highlighter, ...) — the "desk lamp at night"
+   warm-navy-and-yellow-highlighter identity this product had before
+   the Claude-style sidebar redesign (ADR-053). That old identity is
+   deliberately kept for /login and /register (see AppShell.tsx's own
+   comment on why), but those two routes never render inside this
+   element, so this override is safely scoped to exactly the three
+   routes it needs to reach: reported as "yellowish, like the former
+   page" — that's --highlighter, a literal bright yellow (#F2B705),
+   showing up on eyebrow labels, hover borders, and focus rings, on top
+   of --paper-bright's warm cream card backgrounds. Every old variable
+   these shared components read is re-pointed at its modern op-*
+   equivalent here — zero changes needed to dashboard/settings/project-
+   editor page code, since they already only ever read these variables
+   by name, never a hardcoded color. */
+.op-shell-content {
+  --paper-bright: #FFFFFF;
+  --paper: var(--op-text-muted);
+  --pencil: var(--op-text);
+  --ink: var(--op-bg);
+  --highlighter: var(--op-violet);
+  --highlighter-soft: #EDE4FC;
+  --accent-teal: var(--op-violet);
+  --border: var(--op-border);
+  --muted: var(--op-text-muted);
+  --font-display: var(--op-font);
+  --font-label: var(--op-font);
+  color: var(--op-text);
+}
+/* The "stack of physical note cards" tilt (ADR's own dashboard motif)
+   reads as a mismatched novelty next to a clean sidebar — flattened
+   here, not in the shared .index-card rule itself, so the tilt still
+   applies anywhere that class might be reused outside this shell. */
+.op-shell-content .index-card:nth-child(odd),
+.op-shell-content .index-card:nth-child(even) {
+  transform: none;
+}
+.op-shell-content .index-card:hover { transform: translateY(-2px); }
+/* .btn-primary's original design paired --highlighter (bright yellow)
+   with --pencil (near-black) text — good contrast for that pairing.
+   Re-pointing --highlighter at --op-violet (ADR-060, above) breaks
+   that contrast pairing specifically, so this one selector needs an
+   explicit fix rather than falling out of the variable override alone. */
+.op-shell-content .btn-primary { color: #FFFFFF; }
+/* .card's original box-shadow (0 8px 24px rgba(0,0,0,0.25)) was tuned
+   for a dark navy page background — noticeably heavy against the
+   modern shell's white/light-gray one. */
+.op-shell-content .card,
+.op-shell-content .index-card {
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+}
+
 /* ---- Sidebar ---- */
 .op-sidebar {
   width: 260px;
@@ -540,6 +595,29 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   font-family: var(--op-font); font-size: 14.5px;
 }
 .op-composer-box textarea:focus { outline: none; }
+
+.op-attach-btn {
+  width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--op-border);
+  background: none; color: var(--op-text-muted); display: flex; align-items: center;
+  justify-content: center; cursor: pointer; flex-shrink: 0;
+}
+.op-attach-btn:hover { background: var(--op-bg-panel); color: var(--op-text); }
+
+.op-attachment-chip {
+  flex: 1; display: flex; align-items: center; gap: 8px;
+  background: var(--op-bg-panel); border-radius: 10px; padding: 7px 12px;
+  min-height: 22px;
+}
+.op-attachment-name {
+  font-size: 13.5px; color: var(--op-text); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; flex: 1;
+}
+.op-attachment-remove {
+  border: none; background: none; color: var(--op-text-muted); font-size: 18px;
+  line-height: 1; cursor: pointer; flex-shrink: 0; width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center; border-radius: 50%;
+}
+.op-attachment-remove:hover { background: var(--op-border); color: var(--op-text); }
 .op-ask-box { display: flex; flex-direction: column; gap: 8px; }
 .op-ask-file-row {
   font-size: 14px; color: var(--op-text-muted);
@@ -622,23 +700,20 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
 .op-preview-deck {
   display: flex; flex-direction: column; gap: 14px; padding: 18px;
 }
-.op-preview-slide-card {
-  border: 1px solid; border-radius: 10px; padding: 16px 18px;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-  position: relative;
+/* ADR-061 — the deck no longer renders a hand-built HTML mockup card
+   per slide; each entry is the real server-rendered SVG (see
+   SvgPreviewAdapter). This wrapper just gives each one a consistent
+   frame — rounded corners, a subtle border/shadow, clipped overflow —
+   the actual slide design (colors, decoration, layout) lives entirely
+   inside the SVG itself now, not in this CSS. */
+.op-preview-slide-svg {
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  border: 1px solid var(--op-border);
+  line-height: 0; /* prevents a stray few px of whitespace under the inline svg */
 }
-.op-preview-slide-num {
-  position: absolute; top: 12px; right: 14px; font-size: 11px; font-weight: 700; opacity: 0.7;
-}
-.op-preview-slide-title {
-  font-weight: 700; font-size: 14px; margin-bottom: 8px; padding-right: 24px;
-}
-.op-preview-slide-bullet {
-  font-size: 12.5px; line-height: 1.5; margin-bottom: 3px; opacity: 0.9;
-}
-.op-preview-slide-more {
-  font-size: 11px; opacity: 0.55; margin-top: 4px; font-style: italic;
-}
+.op-preview-slide-svg svg { display: block; width: 100%; height: auto; }
 
 /* =========================================================================
    Mobile (ADR-058)

@@ -148,6 +148,57 @@ def test_engine_runs_full_five_stage_pipeline_when_ai_available(monkeypatch):
     assert fake.calls[:4] == ["strategy", "structure", "content", "layout"]
 
 
+def test_engine_passes_requested_language_to_the_closing_slide_fix(monkeypatch):
+    """ADR-060 — validate_and_fix() needs the request's language to
+    localize the closing slide it may add; this confirms the engine
+    actually passes it through end-to-end, not just that the function
+    itself works in isolation (covered separately in
+    test_quality_validator.py). Uses a dedicated fake (not
+    FakeFullPipelineAdapter, whose last slide is deliberately titled
+    "Thank You" already — an English closing-slide hint that would
+    skip the auto-add path entirely and make this test pass for the
+    wrong reason)."""
+    class FakeNoClosingSlide:
+        def is_available(self):
+            return True
+
+        def generate_strategy(self, request, research=None):
+            from backend.ports.ai_pipeline import PresentationStrategy
+            return PresentationStrategy(narrative_style="Classic Narrative", title_angle="Angle",
+                                         key_themes=["t1"], tone_notes="")
+
+        def generate_outline_structure(self, request, strategy):
+            from backend.ports.ai_pipeline import SlideOutlineItem
+            return [SlideOutlineItem(title=f"Slide {i+1}", purpose="purpose")
+                    for i in range(request.slide_count)]
+
+        def generate_slide_content(self, request, strategy, structure):
+            from backend.models.recipe import Outline, Slide, ContentBlock, BlockType, StructureSource
+            slides = [
+                Slide(order=i + 1, title=item.title, content_blocks=[
+                    ContentBlock(type=BlockType.BULLET, text="a point"),
+                ])
+                for i, item in enumerate(structure)
+            ]
+            return Outline(structure_source=StructureSource.AI_GENERATED, slides=slides)
+
+        def plan_layout(self, outline, request):
+            for slide in outline.slides:
+                slide.layout_type = "bullet_list"
+            return outline
+
+        def review_and_revise(self, outline, quality_report, request):
+            return outline  # not expected to be called on a clean fixture
+
+    monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: FakeNoClosingSlide())
+    monkeypatch.setattr(registry, "get_research_adapter", lambda: registry.NullResearchAdapter())
+
+    recipe, _, _ = generate_presentation_from_topic(
+        topic="Le Growth Marketing", slide_count=3, export_format="pptx", language="fr",
+    )
+    assert recipe.outline.slides[-1].title == "Merci"
+
+
 def test_engine_falls_back_to_deterministic_when_ai_pipeline_raises(monkeypatch):
     class AlwaysFails:
         def is_available(self):

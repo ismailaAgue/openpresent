@@ -2552,3 +2552,241 @@ presence/absence, and both chip-pattern regressions as explicit
 regression tests. 3 new tests for the content-prompt data instructions.
 Full backend suite green across 3 consecutive runs (446/446 — 430 +
 13 + 3).
+
+*Next entry: ADR-060.*
+
+---
+
+## ADR-060 — Closing-Slide Language Bug, a Real Language Selector, and the "Yellowish Former Page" Root Cause
+
+**Status:** Accepted.
+
+**Decision:** Four real, reported gaps, two of which turned out to be
+one bug and three of which turned out to be a single root cause.
+
+**1. Every deck's closing slide was hardcoded English, regardless of
+language.** Two compounding causes in `quality_validator.py`:
+`_ensure_closing_slide` runs on every generation (deterministic, $0,
+always-on — see this module's own docstring) and unconditionally
+appended English "Thank You"/"Questions?"; separately, its own
+duplicate-detection (`CLOSING_TITLE_HINTS`) only recognized English
+keywords, so even a closing slide the AI had already generated
+correctly in another language wasn't recognized as one and got a
+redundant English slide appended on top of it anyway. Fixed with a
+`CLOSING_SLIDE_TEXT` table (9 languages, case-insensitive, accepts
+both codes and full names) and `language` threaded through
+`validate_and_fix()` from both call sites in `ai_generate.py`.
+`CLOSING_TITLE_HINTS` also gained non-English equivalents for the
+languages the table covers. **Stated limitation:** an unsupported
+language falls back to English, honestly — this function is
+deterministic and free by design; calling the AI just to translate two
+words here would break that invariant for a minor gain, so the
+fallback is explicit rather than silently pretended away.
+
+**2. The fix above would have done nothing observable**, because the
+frontend never actually let anyone choose a language — every
+generation request hardcoded `"en"`, even though `language` was
+already a real, fully-wired parameter all the way through
+`generateFromTopicAsync`/`generateAsync` and into the AI prompts
+themselves (confirmed by reading `api-client.ts` before touching
+anything — the plumbing existed, only the UI control didn't). Added a
+language `<select>` to the composer's mode row (9 options, matching
+`CLOSING_SLIDE_TEXT`'s coverage exactly, with a comment linking the
+two so they don't drift apart).
+
+**3. "Login/edit/settings send you to the former page" and "yellowish
+color" were the same bug reported three ways, not three bugs.**
+`/dashboard`, `/settings`, and `/projects/[id]` are already inside the
+modern sidebar shell (`AppShell.tsx`'s `isStudioShell`, since
+ADR-057) — confirmed by inspection, this was never a routing
+regression. What was actually happening: their page content still
+uses the ORIGINAL pre-redesign component classes and CSS variables
+(`--paper`, `--pencil`, and a literal bright-yellow `--highlighter:
+#F2B705`) from the product's pre-ADR-053 identity, unchanged since
+ADR-057 wrapped these routes in the modern shell without ever
+restyling what's inside it. Fixed with a single scoped override block
+under `.op-shell-content` that re-points every one of those old
+variables (plus `--font-display`, which was still loading the serif
+Fraunces font unrelated to the sidebar's Inter) at its modern `op-*`
+equivalent — zero changes needed to `dashboard/page.tsx`,
+`settings/page.tsx`, or `projects/[id]/page.tsx` themselves, since they
+already only ever read these variables by name, never a hardcoded
+color. `/login` and `/register` explicitly don't render inside
+`.op-shell-content` (see `AppShell.tsx`'s own routing), so their
+original identity is untouched, exactly as ADR-057 intended it to
+stay. Two follow-on fixes needed once the override was in: `.btn-
+primary`'s original color pairing (bright yellow background + near-
+black text) loses its contrast once `--highlighter` becomes violet, so
+`.op-shell-content .btn-primary` gets explicit white text; and
+`.card`/`.index-card`'s box-shadow (tuned for a dark navy page
+background) is heavy against the modern shell's white background, so
+it's lightened in this scope too. Login/register's post-auth redirect
+also moved from `/dashboard` to `/`, matching how sign-out already
+returns to `/` (ADR-057) — landing on a project list read as a
+detour rather than a continuation of the sign-in flow.
+
+**4. "Upload should be a button like AI chatboxes."** The composer's
+"Upload a source document" mode-pill (a separate mode the person had
+to switch into before seeing a file picker) is replaced with a
+paperclip attach button inline in the composer — clicking it opens the
+file picker directly; once a file is attached it renders as a
+removable chip in place of the text input, and attaching a file IS the
+mode switch now (no separate pill to click first). Matches the
+attach-button pattern in ChatGPT/Claude-style chat composers.
+
+**Verification:** 5 new tests — 4 for the closing-slide language logic
+in `test_quality_validator.py` (localization, case/full-name lookup,
+unsupported-language fallback, non-English hint detection) plus 1
+engine-level test in `test_ai_generate_engine.py` confirming
+`request.language` is actually threaded through end-to-end, not just
+that the function works correctly in isolation. Full backend suite
+green across 3 consecutive runs (451/451 — 446 from ADR-059 + 5 new).
+Frontend: `tsc --noEmit` clean, `next build` succeeds (still 9 routes).
+The CSS override was independently verified in the actual COMPILED,
+served output (not just the source): fetched `/settings`'s real HTML,
+confirmed it renders inside `.op-shell-content`, then fetched the
+actual built CSS and confirmed the override rule compiled with the
+exact re-pointed variable values, `.btn-primary`'s color fix present,
+and the original `#F2B705` yellow still intact at `:root` (proving
+`/login`/`/register` keep their original look, not broken by this
+change) — a full round-trip check, not just trusting the source edit
+looked right.
+
+**Stated gaps, not attempted in this entry — deferred, not forgotten:**
+- "PPTs still look handmade" — the four ADR-059 themes are a real step,
+  but python-pptx has a real ceiling on matching Canva-style templates
+  (no custom icon sets, no layered photographic compositions). Further
+  passes possible, not attempted here.
+- "Preview doesn't show the real design" — an honest fix means
+  rendering actual slide thumbnails server-side, which needs
+  LibreOffice available in the **production** Render environment
+  (currently dev/test-only, per ADR-055's own note on this). A real
+  infrastructure decision, not made silently in this entry.
+
+*Next entry: ADR-062.*
+
+---
+
+## ADR-061 — PPTX Design Pass Across Every Slide; Real Themed Preview Without Needing LibreOffice in Production
+
+**Status:** Accepted.
+
+**Decision:** The two remaining, explicitly deferred items from
+ADR-060 — "PPTs still look handmade" and "preview doesn't show the
+real design" — are both addressed here.
+
+**1. Design pass: every slide now carries the deck's visual identity,
+not just the cover.** Before this, only the title slide got any
+decoration at all — bullet, statistics, comparison, and process slides
+were visually flat by comparison, which is a real, legitimate
+contributor to "looks handmade": the reference decks all carry a
+consistent visual identity (a repeated accent mark, colored bullet
+markers, card/badge treatments) across every single slide.
+
+- `_add_corner_decoration` gained a `small=True` variant: every
+  non-title slide now gets a small version of the theme's corner
+  decoration (blob/circle/none, matching `corner_style` exactly as
+  before), tucked into the bottom-right corner rather than skipped
+  entirely. Title slides keep the original large top-left version,
+  unchanged. **A real bug caught before shipping**: the first version
+  hardcoded 16:9 (13.333in) slide width for the small variant's
+  positioning; python-pptx's actual default `Presentation()` is
+  10x7.5in (4:3) — confirmed by checking, not assumed — which would
+  have rendered the decoration miles off-canvas, invisible, on every
+  real generated deck. Fixed by passing `prs` explicitly into
+  `_add_corner_decoration` instead of assuming a slide size.
+- `_add_colored_bullets` (new): every bullet list — plain, with-image,
+  and inside comparison columns — now uses an accent-colored square
+  marker instead of the default black round dot, matching every
+  reference deck (none of them use a plain dot). **A second real bug
+  caught before shipping**: the first version tried
+  `paragraph.bullet.none()` to suppress the native bullet before
+  adding the colored marker; this project's actual installed
+  python-pptx version (1.0.2, confirmed by checking, not assumed) has
+  no such API at all, so the try/except around it was silently
+  swallowing the call and would have left BOTH a native dot and the
+  new colored marker showing — worse than the original. Fixed with
+  direct XML manipulation (`_disable_native_bullet`, inserting
+  `<a:buNone/>` into the paragraph's `<a:pPr>`).
+- Comparison slides: each column now sits inside a light, accent-
+  tinted rounded-rectangle card (reusing `_tint`, the same helper the
+  statistics chips use) instead of floating as bare unbounded text —
+  two paragraphs with no visual boundary between them doesn't read as
+  "a comparison," a card does.
+- Process slides: step numbers now sit inside solid accent-colored
+  circle badges with white text, instead of plain colored digits —
+  every reference deck presents a numbered process this way.
+- Statistics slides gained the small corner decoration too (previously
+  had none at all, even though they already had the chip treatment
+  from ADR-059).
+
+**2. Real themed preview, without needing LibreOffice in production.**
+The honest fix for "doesn't show the real design" is rendering actual
+slide thumbnails — but that means screenshotting the real exported
+file, which needs LibreOffice available at runtime. **Checked, not
+assumed**: this project's Render backend is a plain pip-installed
+Python web service (confirmed by reading `DEPLOYMENT.md`) with no
+system-package mechanism — getting LibreOffice into production would
+mean migrating to a Docker-based Render deployment, a real
+infrastructure change this entry deliberately does not make
+unilaterally.
+
+Instead: `backend/adapters/preview/svg_preview.py`'s `SvgPreviewAdapter`
+renders one SVG per slide **directly from the same theme/layout logic
+PptxExportAdapter uses** — same `_COLOR_SETS` colors, same
+`corner_style`/`stat_chip`/`gradient_stops` per theme, same
+`CHIP_NUMBER_PATTERN` number/label splitting, same colored bullet
+markers. New `GET /projects/{id}/preview` route (owner-scoped, same
+pattern as every other project route) serves it. **Stated, explicit
+scope limit**: this is not pixel-accurate to the downloaded file — no
+real font rendering (browsers substitute their own), and comparison/
+process layouts fall back to a themed bullet-list rendering rather
+than their pptx-specific card/badge treatment (a real gap, not a
+silent one — noted in the module's own docstring). What it DOES match
+faithfully: every actual design decision — which colors, which
+decoration, which stat treatment — which is what "doesn't show the
+real design" was actually asking for, confirmed by rendering real
+samples from both `PptxExportAdapter` and `SvgPreviewAdapter` side by
+side and comparing them directly, not just by re-reading the code.
+
+Frontend: `JobBubblePreviewMirror` now fetches
+`getProjectPreview()` and renders the returned SVG markup directly
+(`dangerouslySetInnerHTML`, from a trusted authenticated backend
+response built from the person's own project data — the same trust
+boundary as any other API response rendered in the UI, not arbitrary
+third-party content) instead of the HTML mockup cards from ADR-057.
+The old `THEME_COLORS` duplication in `page.tsx` (a second, hand-
+maintained copy of `_COLOR_SETS` for the mockup cards) is gone
+entirely — one less place for the two to drift out of sync.
+
+**Verification:** every layout type (title, bullet, bullet-with-image,
+statistics chip, comparison, process) rendered to a real `.pptx`,
+converted via `soffice`, and visually inspected — both new bugs above
+were caught this way, not by code review. The SVG preview was
+end-to-end tested against a REAL, LIVE running backend: registered a
+user, generated a real project via the actual HTTP API, fetched
+`/projects/{id}/preview` for real, rendered the returned SVGs to PNG,
+and visually confirmed they match the real pptx export's design
+(including confirming a `corner_style: "none"` theme correctly shows
+no decoration — not a bug, the design working as intended). 18 new
+tests (7 for the pptx design pass, 11 for `SvgPreviewAdapter`) plus 4
+new integration tests for the `/preview` route (auth, 404, per-slide
+structure, ownership isolation). Full backend suite green across 3
+consecutive runs (473/473 — 451 from ADR-060 + 22 new: 7 for the pptx
+design pass, 11 for `SvgPreviewAdapter`, 4 for the `/preview` route).
+Frontend: `tsc --noEmit` clean, `next build` succeeds (still 9 routes
+— no new route, `/preview` is a backend-only API endpoint).
+
+**Stated gaps, honest about what's still not done:**
+- Comparison/process layouts in the SVG preview don't yet get their
+  own card/badge treatment — themed bullets only. A real, scoped
+  follow-up if it matters enough to prioritize.
+- No manual theme picker exists anywhere in the product — every theme
+  demonstrated in this entry and ADR-059 is reachable only through the
+  existing random rotation (`pick_theme_variant()`). Confirming a
+  specific theme currently means generating repeatedly or inspecting a
+  saved project's `theme.color_set_id`.
+- SVG preview text-wrapping (`_wrap_text`) is a rough character-count
+  estimate, not proportional-font-aware — long words or very narrow
+  themes could wrap slightly differently than the real pptx export's
+  own (also-approximate, but different) wrapping logic.

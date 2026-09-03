@@ -43,11 +43,57 @@ from backend.ports.ai_pipeline import QualityReport
 
 MAX_BULLETS_PER_SLIDE = 6
 CLOSING_TITLE_HINTS = (
-    "thank", "question", "conclusion", "summary", "next steps", "wrap up", "contact"
+    "thank", "question", "conclusion", "summary", "next steps", "wrap up", "contact",
+    # ADR-060 — a few common non-English equivalents, so an AI-generated
+    # closing slide that's ALREADY in the requested language is
+    # recognized as one and not duplicated. Not exhaustive (language is
+    # a free-form string here, not a fixed set — see CLOSING_SLIDE_TEXT
+    # below for the same limitation), but covers the languages that
+    # table itself covers, which is the realistic case this matters for.
+    "merci", "gracias", "danke", "grazie", "obrigado", "dank je", "tack", "dziękuję",
+    "questions", "conclusión", "fragen", "domande", "perguntas", "vragen",
 )
 
+# ADR-060 — CLOSING_TITLE_HINTS only recognizing English meant a
+# perfectly good AI-generated closing slide in, say, French was never
+# recognized as one, so an English "Thank You" got appended on top of
+# it regardless — the literal bug reported ("thank you slide is always
+# English no matter what language the deck is in"). This table covers
+# common language names/codes a person might type into a free-text
+# language field (there's no fixed language allow-list anywhere in
+# this codebase — see json_pipeline_base.py's prompts, which just
+# interpolate request.language directly). Anything not in this table
+# falls back to English, honestly — this is a deterministic, $0
+# function (see this module's own docstring); calling the AI just to
+# translate two words here would break that invariant for a minor
+# polish gain, so the fallback is a stated, real limitation, not
+# silently pretended away.
+CLOSING_SLIDE_TEXT = {
+    "en": ("Thank You", "Questions?"),
+    "fr": ("Merci", "Des questions ?"),
+    "french": ("Merci", "Des questions ?"),
+    "es": ("Gracias", "¿Preguntas?"),
+    "spanish": ("Gracias", "¿Preguntas?"),
+    "de": ("Danke", "Fragen?"),
+    "german": ("Danke", "Fragen?"),
+    "it": ("Grazie", "Domande?"),
+    "italian": ("Grazie", "Domande?"),
+    "pt": ("Obrigado", "Perguntas?"),
+    "portuguese": ("Obrigado", "Perguntas?"),
+    "nl": ("Dank je", "Vragen?"),
+    "dutch": ("Dank je", "Vragen?"),
+    "sv": ("Tack", "Frågor?"),
+    "swedish": ("Tack", "Frågor?"),
+    "pl": ("Dziękuję", "Pytania?"),
+    "polish": ("Dziękuję", "Pytania?"),
+}
 
-def validate_and_fix(outline: Outline, export_format: str = "pptx") -> tuple[Outline, QualityReport]:
+
+def _closing_slide_text(language: str) -> tuple[str, str]:
+    return CLOSING_SLIDE_TEXT.get((language or "en").strip().lower(), CLOSING_SLIDE_TEXT["en"])
+
+
+def validate_and_fix(outline: Outline, export_format: str = "pptx", language: str = "en") -> tuple[Outline, QualityReport]:
     issues: list[str] = []
     auto_fixed: list[str] = []
 
@@ -68,7 +114,7 @@ def validate_and_fix(outline: Outline, export_format: str = "pptx") -> tuple[Out
     if deduped:
         auto_fixed.append(f"Removed {deduped} bullet(s) repeated verbatim elsewhere in the deck")
 
-    added_closing = _ensure_closing_slide(outline)
+    added_closing = _ensure_closing_slide(outline, language=language)
     if added_closing:
         auto_fixed.append("Added a closing slide (deck ended without a summary/conclusion)")
 
@@ -174,16 +220,17 @@ def _dedupe_repeated_bullets(outline: Outline) -> int:
     return removed
 
 
-def _ensure_closing_slide(outline: Outline) -> bool:
+def _ensure_closing_slide(outline: Outline, language: str = "en") -> bool:
     if not outline.slides:
         return False
     last = outline.slides[-1]
     if any(hint in last.title.lower() for hint in CLOSING_TITLE_HINTS):
         return False
+    title_text, questions_text = _closing_slide_text(language)
     closing = Slide(
         order=last.order + 1,
-        title="Thank You",
-        content_blocks=[ContentBlock(type=BlockType.BULLET, text="Questions?")],
+        title=title_text,
+        content_blocks=[ContentBlock(type=BlockType.BULLET, text=questions_text)],
     )
     outline.slides.append(closing)
     return True

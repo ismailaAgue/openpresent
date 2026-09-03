@@ -77,6 +77,46 @@ def test_does_not_duplicate_closing_slide_when_already_present():
     assert not any("closing slide" in f for f in report.auto_fixed)
 
 
+def test_closing_slide_is_localized_when_language_is_set():
+    """ADR-060 — a deck generated in French previously still got an
+    English 'Thank You' slide appended regardless, since this function
+    had no language awareness at all."""
+    outline = make_outline([
+        Slide(order=1, title="Intro", content_blocks=[bullet("a")]),
+        Slide(order=2, title="Details", content_blocks=[bullet("b")]),
+    ])
+    fixed, report = validate_and_fix(outline, language="fr")
+    assert fixed.slides[-1].title == "Merci"
+    assert fixed.slides[-1].content_blocks[0].text == "Des questions ?"
+
+
+def test_closing_slide_language_lookup_is_case_insensitive_and_accepts_full_names():
+    outline = make_outline([Slide(order=1, title="Intro", content_blocks=[bullet("a")])])
+    fixed, _ = validate_and_fix(outline, language="Spanish")
+    assert fixed.slides[-1].title == "Gracias"
+
+
+def test_closing_slide_falls_back_to_english_for_an_unsupported_language():
+    """A real, stated limitation (see CLOSING_SLIDE_TEXT's own comment)
+    — not every language is covered, and falling back to English
+    honestly is better than silently mistranslating."""
+    outline = make_outline([Slide(order=1, title="Intro", content_blocks=[bullet("a")])])
+    fixed, _ = validate_and_fix(outline, language="Klingon")
+    assert fixed.slides[-1].title == "Thank You"
+
+
+def test_closing_slide_detection_recognizes_non_english_hints_too():
+    """A French AI-generated closing slide must not get a second,
+    redundant English one appended on top of it."""
+    outline = make_outline([
+        Slide(order=1, title="Intro", content_blocks=[bullet("a")]),
+        Slide(order=2, title="Merci", content_blocks=[bullet("Des questions ?")]),
+    ])
+    fixed, report = validate_and_fix(outline, language="fr")
+    assert len(fixed.slides) == 2
+    assert not any("closing slide" in f for f in report.auto_fixed)
+
+
 def test_clean_outline_has_no_issues_and_high_score():
     outline = make_outline([
         Slide(order=1, title="Intro", content_blocks=[bullet("a"), note("n")]),
