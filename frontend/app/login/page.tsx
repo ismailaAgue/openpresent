@@ -17,7 +17,12 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await login(email, password);
-      router.push("/dashboard");
+      // ADR-060 — was "/dashboard". Landing straight on a project list
+      // read as a jarring old-page detour rather than a continuation
+      // of signing in; "/" drops the person back into the actual
+      // studio (now signed in) instead, matching how sign-out from
+      // Settings already returns to "/" (ADR-057).
+      router.push("/");
     } catch (e: any) {
       setError(e.message || "Could not log in");
     } finally {

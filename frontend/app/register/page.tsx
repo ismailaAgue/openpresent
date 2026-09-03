@@ -18,7 +18,7 @@ export default function RegisterPage() {
     try {
       await register(email, password);
       await login(email, password);
-      router.push("/dashboard");
+      router.push("/");  // ADR-060 — see login/page.tsx's comment on this same change
     } catch (e: any) {
       setError(e.message || "Could not create your account");
     } finally {

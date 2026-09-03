@@ -1109,6 +1109,39 @@ def test_get_project_bullets_exclude_speaker_notes(client):
     assert "speaker note" not in all_bullets.lower()  # NullAdapter's own note text, if any slipped through
 
 
+# -- GET /projects/{id}/preview (ADR-061) ------------------------------------
+
+def test_get_project_preview_requires_auth(client):
+    resp = client.get("/projects/some-id/preview")
+    assert resp.status_code == 401
+
+
+def test_get_project_preview_unknown_project_returns_404(client):
+    token = _register_and_login(client, email="preview404@example.com")
+    resp = client.get("/projects/does-not-exist/preview", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 404
+
+
+def test_get_project_preview_returns_one_svg_per_slide(client):
+    headers, project_id = _register_login_and_generate_project(client)
+    resp = client.get(f"/projects/{project_id}/preview", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    project = client.get(f"/projects/{project_id}", headers=headers).json()
+    assert len(body["slides"]) == len(project["slides"])
+    for slide in body["slides"]:
+        assert "order" in slide
+        assert slide["svg"].startswith("<svg ")
+        assert slide["svg"].rstrip().endswith("</svg>")
+
+
+def test_get_project_preview_cannot_be_read_by_another_user(client):
+    headers_a, project_id = _register_login_and_generate_project(client)
+    token_b = _register_and_login(client, email="previewother@example.com", password="hunter22")
+    resp = client.get(f"/projects/{project_id}/preview", headers={"Authorization": f"Bearer {token_b}"})
+    assert resp.status_code == 404
+
+
 def test_get_slide_requires_auth(client):
     headers, project_id = _register_login_and_generate_project(client)
     resp = client.get(f"/projects/{project_id}/slides/1")

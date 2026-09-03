@@ -312,6 +312,21 @@ export async function getProject(projectId: string) {
   }>;
 }
 
+// ADR-061 — a real, themed preview (matching colors, corner
+// decoration, stat chips — the actual PptxExportAdapter design
+// decisions) rendered as SVG server-side, without needing a
+// screenshot of the real exported file (which would need LibreOffice
+// in production — see backend/adapters/preview/svg_preview.py's
+// module docstring for why that's a real infra decision, not made
+// here). Not pixel-accurate to the download; see that same docstring
+// for exactly what it does and doesn't match.
+export async function getProjectPreview(projectId: string) {
+  const res = await fetch(`${API_BASE}/projects/${projectId}/preview`, { headers: authHeaders() });
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (!res.ok) throw new Error("Preview not available");
+  return res.json() as Promise<{ slides: { order: number; svg: string }[] }>;
+}
+
 export async function deleteProject(projectId: string): Promise<void> {
   const res = await fetch(`${API_BASE}/projects/${projectId}`, {
     method: "DELETE",
