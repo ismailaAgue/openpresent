@@ -288,7 +288,20 @@ export default function StudioPage() {
       <div className="op-chat-col">
         <div className="op-chat-header">New chat</div>
         <div className="op-chat-thread" ref={threadRef}>
-          {messages.map((m) => {
+          {messages.length === 1 && messages[0].kind === "assistant-text" && messages[0].id === "welcome" ? (
+            // ADR-063 — a centered empty-state hero instead of a small
+            // chat bubble pinned to the top of an otherwise-empty
+            // column, inspired directly by how Claude/other chat apps
+            // treat a brand-new conversation: the greeting is the
+            // page's main content on first load, not a message that
+            // happens to be first in a list. Once a real message
+            // exists, this reverts to the normal top-aligned thread.
+            <div className="op-empty-state">
+              <div className="op-empty-state-icon">◇</div>
+              <div className="op-empty-state-title">What would you like to create?</div>
+              <div className="op-empty-state-subtitle">{messages[0].text}</div>
+            </div>
+          ) : messages.map((m) => {
             if (m.kind === "assistant-text") {
               return (
                 <div key={m.id} className="op-bubble op-bubble-assistant op-bubble-row">

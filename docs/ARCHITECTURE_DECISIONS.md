@@ -2902,3 +2902,88 @@ bullet distinction. Full backend suite green across 3 consecutive runs
   orange). The underlying renderers are theme-parameterized (colors,
   not hardcoded), so a second editorial palette is a color-set
   addition, not new rendering code — but none exists yet.
+
+*Next entry: ADR-063.*
+
+---
+
+## ADR-063 — Mobile: The Real Cause of "Blank Page," Floating Button Collision, and a Centered Empty State
+
+**Status:** Accepted.
+
+**Decision:** Real screenshots from an actual phone (shared directly,
+alongside two reference chat apps for comparison) showed the studio
+shell rendering as an almost entirely blank page on mobile — only a
+sidebar-toggle icon, a stray floating circle, and the composer crammed
+at the very bottom were visible; the welcome message that should
+anchor the top of the chat thread was nowhere to be seen. ADR-058's
+mobile pass fixed the sidebar/preview overlay behavior and the missing
+viewport meta tag, but three further, more specific bugs remained,
+found by reasoning through the actual CSS rather than guessing:
+
+1. **The actual root cause of the blank page**: ADR-058 switched
+   `.op-studio` to `flex-direction: column` on mobile so the chat and
+   preview columns could stack instead of sitting side by side. But
+   `.op-chat-col`'s desktop rule — `height: 100%` — was never
+   overridden for that new column context. `height: 100%` on a flex
+   item is fine when the parent is a ROW container (it just resolves
+   against the shared cross-axis height); the same rule on a flex item
+   inside a COLUMN container is a main-axis size claim, a well-known
+   flexbox conflict that can starve the item's own `overflow-y: auto`
+   child (`.op-chat-thread`, which is where the welcome message
+   actually lives) of any real computed height. Fixed with the
+   standard pattern for this exact situation: `flex: 1 1 auto;
+   min-height: 0;` instead of a hardcoded height.
+2. **`.op-shell` itself — the root of the entire layout — still used
+   `100vh`**, not `100dvh`, even though its own children
+   (`.op-sidebar`, `.op-preview-col`) already used the corrected unit
+   since ADR-058. `100vh` on iOS Safari is calculated against the
+   largest possible viewport, as if the address bar were permanently
+   collapsed — not what's actually visible when it's showing. Getting
+   this wrong at the root of the tree is exactly the kind of thing
+   that produces diffuse "blank space" symptoms that are hard to
+   attribute to any one specific child, because every descendant's
+   percentage-based sizing inherits the error. Fixed at the mobile
+   breakpoint: `.op-shell { height: 100dvh; }`.
+3. **The collapsed-preview floating button sat at `bottom: 20px`** —
+   directly underneath the composer (mode-row + input + hint text
+   stack to roughly 140-160px on a phone, before even accounting for
+   the home-indicator safe area on notched iPhones), which is exactly
+   the "purple circle overlapping the input box" visible in the
+   screenshot. Moved to `bottom: 200px`, with an `env(safe-area-
+   inset-bottom, 0px)` addition so it also respects the home indicator
+   specifically, not just a fixed guess.
+
+**A fourth, more subjective change**, made after directly comparing
+against the two reference chat apps supplied for inspiration: a
+brand-new conversation (only the welcome message present) now renders
+as a centered empty-state hero — icon, heading, subtitle — filling the
+thread area, instead of a small chat bubble pinned to the top of an
+otherwise-empty column. This is the same landing-screen treatment
+every reference app uses for a fresh chat. Once a real message exists,
+the thread reverts to normal top-aligned scrolling behavior
+unchanged.
+
+**Verification:** `tsc --noEmit` clean, `next build` succeeds (still 9
+routes). Every fix was independently confirmed in the actual COMPILED,
+built CSS output — not just the source — including catching that the
+minifier had merged `.op-shell` and `.op-sidebar`'s identical `height:
+100dvh` declaration into one combined selector (`.op-shell,.op-sidebar
+{height:100dvh}`), which an exact-string search initially missed until
+broadened. Backend suite re-run for regression safety (481/481, 3
+consecutive runs) even though this delivery touches no backend code.
+
+**Stated limitation, unchanged from ADR-058**: this was still not
+visually rendered and looked at on an actual phone or in a real mobile
+Safari/Chrome instance — no headless browser is available in this
+environment, and the flexbox/viewport-unit reasoning above, while
+solid and independently checked against the compiled output, is not a
+substitute for someone opening the deployed site on a real device.
+**This is the second time this exact limitation has been noted** (see
+ADR-058) — the person reporting a still-broken mobile page after that
+entry shipped is itself evidence that reasoning-plus-compiled-output
+verification, without ever actually loading the page on the target
+device, has a real gap. Once deployed: open the site on an actual
+phone and confirm the welcome message is visible without scrolling,
+the floating preview button no longer sits on top of the composer, and
+a fresh chat shows the centered empty state.
