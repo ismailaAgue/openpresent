@@ -513,6 +513,27 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   flex-direction: column;
   gap: 16px;
 }
+/* ADR-063 — the empty-state hero shown before any real message
+   exists. Fills the thread area and centers its own content
+   regardless of .op-chat-thread's own flex-start default, so a fresh
+   conversation reads as an intentional landing screen (matching how
+   Claude and similar chat apps treat a brand-new chat) instead of a
+   small bubble at the top of a mostly-empty column. */
+.op-empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 10px;
+  padding: 24px;
+  max-width: 420px;
+  margin: 0 auto;
+}
+.op-empty-state-icon { font-size: 32px; color: var(--op-violet); opacity: 0.8; }
+.op-empty-state-title { font-size: 20px; font-weight: 700; color: var(--op-text); }
+.op-empty-state-subtitle { font-size: 13.5px; color: var(--op-text-muted); line-height: 1.5; }
 .op-bubble { max-width: 640px; font-size: 14.5px; line-height: 1.55; }
 .op-bubble-assistant { align-self: flex-start; color: var(--op-text); }
 .op-bubble-user {
@@ -726,6 +747,16 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
    everything below fixes the first.
    ========================================================================= */
 @media (max-width: 860px) {
+  /* ADR-063 — 100vh on iOS Safari is calculated against the LARGEST
+     possible viewport (as if the address bar were fully collapsed),
+     not what's actually visible when it's showing — a well-documented
+     mobile-Safari-specific gap between 100vh and the real usable
+     height. .op-sidebar and .op-preview-col already used 100dvh
+     (ADR-058); .op-shell itself, the root of the whole layout, did
+     not, and is exactly the kind of thing that produces "blank space"
+     symptoms that are hard to attribute to a specific child. */
+  .op-shell { height: 100dvh; }
+
   /* Sidebar becomes a drawer over the content instead of a column
      that steals width from everything else. */
   .op-sidebar {
@@ -780,7 +811,16 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   .op-preview-col.closed {
     position: fixed;
     inset: auto;
-    bottom: 20px;
+    /* ADR-063 — was bottom:20px, which sat directly under/behind the
+       composer (mode-row + input + hint text stack to roughly
+       140-160px tall on a phone, plus the iOS home-indicator safe
+       area) — exactly the floating-purple-circle-overlapping-the-
+       input-box seen in a real screenshot. Cleared well above that,
+       using env(safe-area-inset-bottom) so it also respects the home
+       indicator on notched iPhones specifically, with a plain-pixel
+       fallback for browsers that don't support env(). */
+    bottom: 200px;
+    bottom: calc(200px + env(safe-area-inset-bottom, 0px));
     right: 18px;
     z-index: 40;
     width: 52px;
@@ -799,12 +839,25 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
   /* Studio: give the chat column the full width it now actually has,
      and shrink paddings/font sizes so nothing has to be squeezed to
      fit — the actual visible cause of "overlapping text." */
-  .op-studio { flex-direction: column; }
-  .op-chat-col { padding: 0; }
+  .op-studio { flex-direction: column; min-height: 0; }
+  /* ADR-063 — .op-chat-col's desktop rule is `height: 100%`, correct
+     when .op-studio is a ROW flex container (height:100% resolves
+     against the shared cross-axis height fine). Once ADR-058 switched
+     .op-studio to flex-direction:column for mobile, that same
+     height:100% became a main-axis size claim on a flex item inside a
+     column container — a well-known flexbox conflict that can starve
+     the actual content (the chat thread, containing the welcome
+     message) of any real rendered height, leaving what looks like a
+     blank page above the composer. `flex: 1 1 auto` + `min-height: 0`
+     is the standard fix: let the flex algorithm size this column
+     properly and allow its own overflow-y:auto child
+     (.op-chat-thread) to actually constrain and scroll within it,
+     instead of both fighting over an explicit 100%. */
+  .op-chat-col { padding: 0; height: auto; flex: 1 1 auto; min-height: 0; }
   .op-chat-header { padding: 14px 16px; font-size: 14px; }
-  .op-chat-thread { padding: 16px; gap: 14px; }
+  .op-chat-thread { padding: 16px; gap: 14px; min-height: 0; }
   .op-bubble { max-width: 100%; font-size: 14px; }
-  .op-composer { padding: 12px 14px 16px; }
+  .op-composer { padding: 12px 14px 16px; flex-shrink: 0; }
   .op-mode-row {
     flex-wrap: nowrap;
     overflow-x: auto;
