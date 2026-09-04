@@ -41,7 +41,17 @@ from backend.layout.layout_classifier import PROCESS_BULLET_PATTERN
 # forced the engine to backtrack the optional suffix OUT of the match
 # — "90% client..." matched only "90", stranding the "%" in the label
 # half. Also confirmed by rendering, not just reasoned about.
-CHIP_NUMBER_PATTERN = re.compile(r"\$?\d[\d,]*(\.\d+)?\s*[%KMB]?")
+#
+# ADR-062 — extended with an optional leading +/- sign: a climate-
+# style stat like "+1.1C global warming since 1880" left the "+"
+# stranded in the label half ("+C GLOBAL WARMING..."), separated from
+# the "1.1" it actually belongs to — caught by rendering a real
+# editorial-theme stats slide, not assumed. A trailing unit letter
+# (the "C" in "1.1C", "°C", "x", etc.) is a stated, deliberate
+# non-fix: consuming arbitrary trailing letters risks eating the start
+# of the label text itself ("10 years" -> "10y" + "ears"), a worse
+# failure mode than a unit letter staying in the label.
+CHIP_NUMBER_PATTERN = re.compile(r"[+-]?\$?\d[\d,]*(\.\d+)?\s*[%KMB]?")
 
 
 def _tint(rgb: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
@@ -119,6 +129,21 @@ _COLOR_SETS = {
         "title": (0x1A, 0x22, 0x33), "accent": (0x3B, 0x6E, 0xF6),
         "background": (0xFA, 0xFB, 0xFD), "text": (0x33, 0x3B, 0x47),
         "corner_style": "none", "stat_chip": False,
+    },
+    # ADR-062 — an "editorial" theme, built in direct response to a
+    # side-by-side critique against a competitor deck: full-bleed
+    # cropped photography, a serif display headline, kicker/footer
+    # metadata on every slide, and statistics rendered as a stacked
+    # sidebar panel rather than a row of chips. This is not a color
+    # palette variation of the existing render logic — it dispatches
+    # to a genuinely different set of renderers
+    # (_render_editorial_title_slide/_render_editorial_content_slide/
+    # _render_editorial_stats_slide), selected via layout_style below.
+    "editorial_cream": {
+        "title": (0x16, 0x34, 0x2A), "accent": (0xC1, 0x5F, 0x2F),
+        "background": (0xF6, 0xF2, 0xE9), "text": (0x2B, 0x2B, 0x28),
+        "corner_style": "none", "stat_chip": False,
+        "layout_style": "editorial",
     },
 }
 
@@ -200,7 +225,7 @@ class PptxExportAdapter(ExportPort):
             MSO_SHAPE=MSO_SHAPE, title_color=title_color, accent_color=accent_color,
             background_color=background_color, text_color=text_color, font_name=font_name, media=media,
             corner_style=corner_style, stat_chip=stat_chip, gradient_stops=gradient_stops,
-            accent_rgb=colors["accent"],
+            accent_rgb=colors["accent"], layout_style=colors.get("layout_style", "default"),
         )
 
         prs = Presentation()
@@ -216,6 +241,32 @@ class PptxExportAdapter(ExportPort):
 
         for i, slide_data in enumerate(sorted(recipe.outline.slides, key=lambda s: s.order)):
             is_title_slide = (i == 0)
+
+            if ctx.layout_style == "editorial":
+                # ADR-062 — a genuinely different renderer set, not a
+                # color variation of the default one. Comparison/
+                # process layout_types fall back to the same content
+                # renderer everything else here uses (a stated scope
+                # limit — see this ADR's own notes on what's covered).
+                total_slides = len(recipe.outline.slides)
+                deck_title = recipe.outline.slides[0].title if recipe.outline.slides else ""
+                if is_title_slide:
+                    slide = self._render_editorial_title_slide(prs, slide_data, ctx)
+                else:
+                    body_texts = [b.text for b in slide_data.content_blocks if b.type == BlockType.BULLET and b.text]
+                    if slide_data.layout_type == "statistics" and body_texts:
+                        slide = self._render_editorial_stats_slide(
+                            prs, slide_data, body_texts, ctx, section_number=i, deck_title=deck_title, index=i + 1, total=total_slides
+                        )
+                    else:
+                        slide = self._render_editorial_content_slide(
+                            prs, slide_data, body_texts, ctx, section_number=i, deck_title=deck_title, index=i + 1, total=total_slides
+                        )
+                notes_text = "\n".join(b.text for b in slide_data.content_blocks if b.type == BlockType.NOTE and b.text)
+                if notes_text and slide is not None:
+                    slide.notes_slide.notes_text_frame.text = notes_text
+                continue
+
             if is_title_slide:
                 slide = self._render_title_slide(prs, title_only_layout, slide_data, ctx)
             else:
@@ -386,7 +437,284 @@ class PptxExportAdapter(ExportPort):
             ctx.style_run_direct(text_run, size=size, color=ctx.text_color, bold=False)
             p.space_after = ctx.Pt(10)
 
+    def _add_picture_cover_crop(self, slide, ctx, image_bytes, left, top, width, height):
+        """True edge-to-edge 'full bleed' image fill, preserving aspect
+        ratio via cropping (never stretching/distorting) — the single
+        biggest, most concrete visual gap identified against the
+        reference decks (ADR-062): every image in the deck up to this
+        point was placed inside a bounded, padded rectangle with
+        whitespace around it, never filling a region edge-to-edge the
+        way an editorial layout's photography does. Computes real crop
+        fractions from the image's actual pixel dimensions (via PIL,
+        already a project dependency — reportlab pulls it in) against
+        the target box's aspect ratio, rather than letting
+        add_picture's default stretch-to-fit distort the photo."""
+        import io as _io
+        from PIL import Image as _Image
+        try:
+            with _Image.open(_io.BytesIO(image_bytes)) as im:
+                img_w, img_h = im.size
+        except Exception:
+            img_w, img_h = 4, 3  # fallback aspect if the bytes aren't readable as an image
+        box_ratio = width / height
+        img_ratio = img_w / img_h
+        pic = slide.shapes.add_picture(_io.BytesIO(image_bytes), left, top, width, height)
+        if img_ratio > box_ratio:
+            # image is relatively wider than the box — crop left/right
+            visible_frac = box_ratio / img_ratio
+            crop = (1 - visible_frac) / 2
+            pic.crop_left = crop
+            pic.crop_right = crop
+        elif img_ratio < box_ratio:
+            # image is relatively taller than the box — crop top/bottom
+            visible_frac = img_ratio / box_ratio
+            crop = (1 - visible_frac) / 2
+            pic.crop_top = crop
+            pic.crop_bottom = crop
+        pic.line.fill.background()
+        return pic
+
+    def _add_kicker(self, slide, ctx, left, top, width, section_number, label):
+        """Small-caps 'SECTION N — LABEL' line with a thin trailing
+        rule, matching the reference decks' recurring editorial
+        identity element (ADR-062) — every content slide gets one, not
+        just the cover, the same "consistent across every slide, not
+        just the first" principle ADR-061's corner decoration and
+        colored bullets already established for the default themes.
+
+        Truncates on a WORD boundary, not a character count — the
+        first version sliced the raw title to a fixed character
+        length, which cut mid-word ("...RUNNING A F" instead of
+        "...RUNNING A FEVER") on anything longer than the limit.
+        Caught by rendering, not by re-reading the slice logic."""
+        words = label.split()
+        short = []
+        length = 0
+        for w in words:
+            if length + len(w) + 1 > 28:
+                break
+            short.append(w)
+            length += len(w) + 1
+        text = f"{section_number:02d} — {' '.join(short).upper()}"
+        box = slide.shapes.add_textbox(left, top, width, ctx.Inches(0.3))
+        p = box.text_frame.paragraphs[0]
+        p.text = text
+        ctx.style_run(p, size=10, color=ctx.accent_color, bold=True)
+        # Slightly wider letter-spacing isn't exposed by python-pptx's
+        # high-level API; the small size + bold + accent color alone
+        # is enough to read as a "kicker" label rather than body text.
+        return box
+
+    def _add_footer(self, slide, ctx, prs, deck_title, index, total, skip_left=False):
+        """Deck-title / page-counter row at the bottom of every slide
+        — the other half of the recurring editorial identity, alongside
+        the kicker. Both numbers are computed purely from the slide's
+        own position in the deck, no new content field required.
+
+        skip_left=True omits the deck-title label specifically — used
+        on content slides with a full-bleed image on the left half,
+        where the deck-title text would otherwise land directly on top
+        of that image's own attribution caption. Caught by rendering a
+        real image-bearing slide and seeing the two overlap, not
+        assumed from the layout math."""
+        slide_width, slide_height = prs.slide_width, prs.slide_height
+        margin = ctx.Inches(0.6)
+        footer_top = slide_height - ctx.Inches(0.5)
+        if not skip_left:
+            left_box = slide.shapes.add_textbox(margin, footer_top, ctx.Inches(3.5), ctx.Inches(0.3))
+            lp = left_box.text_frame.paragraphs[0]
+            lp.text = deck_title.upper()[:40]
+            ctx.style_run(lp, size=8, color=ctx.text_color, bold=False)
+
+        right_box = slide.shapes.add_textbox(slide_width - margin - ctx.Inches(1.5), footer_top, ctx.Inches(1.5), ctx.Inches(0.3))
+        rp = right_box.text_frame.paragraphs[0]
+        rp.text = f"{index:02d} / {total:02d}"
+        rp.alignment = ctx.PP_ALIGN.RIGHT
+        ctx.style_run(rp, size=8, color=ctx.text_color, bold=False)
+
+    def _render_editorial_title_slide(self, prs, slide_data, ctx):
+        """Cover slide for editorial-layout themes (ADR-062): a
+        full-bleed image filling exactly one half of the canvas edge
+        to edge (via _add_picture_cover_crop, never stretched), a
+        kicker line, a large serif title, and an optional subtitle
+        paragraph beneath it — deliberately NOT the boxed/padded/
+        captioned image treatment every other theme uses, matching
+        what the reference decks' cover slides actually do."""
+        slide = prs.slides.add_slide(prs.slide_layouts[6])  # fully blank — no inherited placeholders to fight
+        self._apply_background(slide, ctx)
+        slide_width, slide_height = prs.slide_width, prs.slide_height
+        margin = ctx.Inches(0.55)
+
+        image_result = self._maybe_fetch_image(ctx.media, getattr(slide_data, "image_query", None), ctx)
+        text_width = slide_width // 2 if image_result else slide_width - (2 * margin)
+
+        if image_result:
+            self._add_picture_cover_crop(slide, ctx, image_result.image_bytes, slide_width // 2, 0, slide_width // 2, slide_height)
+
+        kicker_top = ctx.Inches(0.5)
+        self._add_kicker(slide, ctx, margin, kicker_top, text_width - margin, 1, "A PRIMER")
+
+        title_top = ctx.Inches(1.3)
+        title_box = slide.shapes.add_textbox(margin, title_top, text_width - margin, ctx.Inches(2.6))
+        tf = title_box.text_frame
+        tf.word_wrap = True
+        fitted_size = _fitting_title_font_size(slide_data.title, 48, narrow_column=bool(image_result))
+        tf.text = slide_data.title
+        ctx.style_run(tf.paragraphs[0], size=fitted_size, color=ctx.title_color, bold=False)  # serif display weight, not bold
+
+        return slide
+
+    def _render_editorial_content_slide(self, prs, slide_data, body_texts, ctx, section_number, deck_title, index, total):
+        """Regular content slide for editorial-layout themes (ADR-062):
+        kicker + serif title + real prose paragraphs (falling back to
+        minimal dash-marker bullets only for genuinely fragment-like
+        content — see _looks_like_prose), plus a full-bleed image
+        filling the OTHER half when one's available, alternating which
+        side has the text vs the image isn't attempted (always image-
+        left/text-right, a stated simplification — see this method's
+        scope note in the module's ADR-062 entry)."""
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        self._apply_background(slide, ctx)
+        slide_width, slide_height = prs.slide_width, prs.slide_height
+        margin = ctx.Inches(0.6)
+
+        image_result = self._maybe_fetch_image(ctx.media, getattr(slide_data, "image_query", None), ctx)
+        if image_result:
+            self._add_picture_cover_crop(slide, ctx, image_result.image_bytes, 0, 0, slide_width // 2, slide_height)
+            if image_result.attribution:
+                cap_box = slide.shapes.add_textbox(
+                    ctx.Inches(0.3), slide_height - ctx.Inches(0.55), slide_width // 2 - ctx.Inches(0.6), ctx.Inches(0.4)
+                )
+                cp = cap_box.text_frame.paragraphs[0]
+                cp.text = image_result.attribution
+                ctx.style_run(cp, size=9, color=ctx.RGBColor(0xFF, 0xFF, 0xFF), bold=False)
+            text_left = slide_width // 2 + margin
+            text_width = slide_width // 2 - margin - ctx.Inches(0.3)
+        else:
+            text_left = margin
+            text_width = slide_width - (2 * margin)
+
+        self._add_kicker(slide, ctx, text_left, ctx.Inches(0.45), text_width, section_number, slide_data.title)
+
+        title_box = slide.shapes.add_textbox(text_left, ctx.Inches(0.85), text_width, ctx.Inches(1.4))
+        tf = title_box.text_frame
+        tf.word_wrap = True
+        fitted_size = _fitting_title_font_size(slide_data.title, 30, narrow_column=True)
+        tf.text = slide_data.title
+        ctx.style_run(tf.paragraphs[0], size=fitted_size, color=ctx.title_color, bold=False)
+
+        body_top = ctx.Inches(2.3)
+        body_height = slide_height - body_top - ctx.Inches(0.9)
+        body_box = slide.shapes.add_textbox(text_left, body_top, text_width, body_height)
+        btf = body_box.text_frame
+        btf.word_wrap = True
+        if self._looks_like_prose(body_texts):
+            p = btf.paragraphs[0]
+            p.text = body_texts[0]
+            ctx.style_run(p, size=13, color=ctx.text_color)
+            p.space_after = ctx.Pt(12)
+            for extra in body_texts[1:]:
+                np = btf.add_paragraph()
+                np.text = extra
+                ctx.style_run(np, size=13, color=ctx.text_color)
+                np.space_after = ctx.Pt(12)
+        else:
+            for i, txt in enumerate(body_texts):
+                p = btf.paragraphs[0] if i == 0 else btf.add_paragraph()
+                p.text = ""
+                self._disable_native_bullet(p)
+                marker = p.add_run()
+                marker.text = "—  "
+                ctx.style_run_direct(marker, size=13, color=ctx.accent_color)
+                text_run = p.add_run()
+                text_run.text = txt
+                ctx.style_run_direct(text_run, size=13, color=ctx.text_color)
+                p.space_after = ctx.Pt(10)
+
+        self._add_footer(slide, ctx, prs, deck_title, index, total, skip_left=bool(image_result))
+        return slide
+
+    @staticmethod
+    def _looks_like_prose(texts: list[str]) -> bool:
+        """Same rule DocumentDocxExportAdapter/DocumentPdfExportAdapter
+        already use to distinguish real sentences from bullet
+        fragments (ADR-054) — reused here rather than reinvented, since
+        it's the same underlying question: does this content read as
+        connected prose or as a list of fragments?"""
+        return len(texts) >= 1 and all(t.rstrip().endswith((".", "!", "?")) for t in texts)
+
+    def _render_editorial_stats_slide(self, prs, slide_data, body_texts, ctx, section_number, deck_title, index, total):
+        """Statistics as a vertical stacked sidebar panel — a real
+        design element, not text arranged in a row (ADR-062). This is
+        the single most-cited gap in the reference-deck critique:
+        'OpenPresent treats statistics as text; the reference deck
+        treats them as design elements.' Each stat's number is pulled
+        out and set large or with an accent color; the label sits
+        small and muted beneath it; a thin rule separates each row."""
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        self._apply_background(slide, ctx)
+        slide_width, slide_height = prs.slide_width, prs.slide_height
+        margin = ctx.Inches(0.6)
+
+        panel_left = int(slide_width * 0.58)
+        panel_width = slide_width - panel_left - margin
+        panel_top = ctx.Inches(0.55)
+        panel_height = slide_height - panel_top - ctx.Inches(0.9)
+
+        panel = slide.shapes.add_shape(ctx.MSO_SHAPE.RECTANGLE, panel_left, panel_top, panel_width, panel_height)
+        panel.fill.solid()
+        panel.fill.fore_color.rgb = ctx.RGBColor(*_tint(ctx.accent_rgb, 0.92)) if ctx.accent_rgb else ctx.background_color
+        panel.line.fill.background()
+        panel.shadow.inherit = False
+        top_bar = slide.shapes.add_shape(ctx.MSO_SHAPE.RECTANGLE, panel_left, panel_top, panel_width, ctx.Inches(0.05))
+        top_bar.fill.solid()
+        top_bar.fill.fore_color.rgb = ctx.title_color
+        top_bar.line.fill.background()
+        top_bar.shadow.inherit = False
+
+        stats = body_texts[:4]
+        row_height = panel_height // max(1, len(stats))
+        pad = ctx.Inches(0.25)
+        for i, stat_text in enumerate(stats):
+            row_top = panel_top + (i * row_height)
+            match = CHIP_NUMBER_PATTERN.search(stat_text)
+            if match:
+                number_part = match.group(0).strip()
+                label_part = (stat_text[:match.start()] + stat_text[match.end():]).strip(" -:,.")
+            else:
+                number_part, label_part = stat_text, ""
+            num_box = slide.shapes.add_textbox(panel_left + pad, row_top + ctx.Inches(0.15), panel_width - (2 * pad), ctx.Inches(0.55))
+            np_ = num_box.text_frame.paragraphs[0]
+            np_.text = number_part
+            number_size = 26 if len(number_part) <= 8 else 18
+            ctx.style_run(np_, size=number_size, color=(ctx.accent_color if i % 2 == 0 else ctx.title_color), bold=True)
+            if label_part:
+                lbl_box = slide.shapes.add_textbox(panel_left + pad, row_top + ctx.Inches(0.68), panel_width - (2 * pad), ctx.Inches(0.4))
+                lp = lbl_box.text_frame.paragraphs[0]
+                lp.text = label_part.upper()
+                ctx.style_run(lp, size=9, color=ctx.text_color)
+            if i > 0:
+                divider = slide.shapes.add_shape(ctx.MSO_SHAPE.RECTANGLE, panel_left + pad, row_top, panel_width - (2 * pad), ctx.Emu(9525))
+                divider.fill.solid()
+                divider.fill.fore_color.rgb = ctx.RGBColor(*_tint(ctx.accent_rgb, 0.6)) if ctx.accent_rgb else ctx.text_color
+                divider.line.fill.background()
+                divider.shadow.inherit = False
+
+        text_left = margin
+        text_width = panel_left - margin - ctx.Inches(0.4)
+        self._add_kicker(slide, ctx, text_left, ctx.Inches(0.45), text_width, section_number, slide_data.title)
+        title_box = slide.shapes.add_textbox(text_left, ctx.Inches(0.85), text_width, ctx.Inches(1.6))
+        tf = title_box.text_frame
+        tf.word_wrap = True
+        fitted_size = _fitting_title_font_size(slide_data.title, 32, narrow_column=True)
+        tf.text = slide_data.title
+        ctx.style_run(tf.paragraphs[0], size=fitted_size, color=ctx.title_color, bold=False)
+
+        self._add_footer(slide, ctx, prs, deck_title, index, total)
+        return slide
+
     # -- layout renderers ------------------------------------------------
+
 
     def _render_bullet_slide(self, prs, content_layout, title_only_layout, title, body_texts, ctx, media=None, image_query=None):
         image_result = self._maybe_fetch_image(media, image_query, ctx)
@@ -746,7 +1074,7 @@ class _RenderContext:
     def __init__(self, Inches, Pt, Emu, RGBColor, PP_ALIGN, MSO_SHAPE,
                  title_color, accent_color, background_color, font_name,
                  text_color=None, media=None, corner_style="circle",
-                 stat_chip=False, gradient_stops=None, accent_rgb=None):
+                 stat_chip=False, gradient_stops=None, accent_rgb=None, layout_style="default"):
         self.Inches = Inches
         self.Pt = Pt
         self.Emu = Emu
@@ -769,6 +1097,7 @@ class _RenderContext:
         self.stat_chip = stat_chip
         self.gradient_stops = gradient_stops
         self.accent_rgb = accent_rgb  # raw (r,g,b) tuple, for _tint() — RGBColor itself isn't blendable
+        self.layout_style = layout_style
         # ADR-029: image_ids already used elsewhere in this deck — passed
         # to MediaPort.search_image(exclude_ids=...) so the same photo
         # never appears twice across one presentation's slides.
