@@ -72,6 +72,8 @@ THEME_VARIANT_IDS = [
     "default", "academic", "warm", "modern_dark",
     # ADR-059
     "gradient_violet", "minimal_mono", "bold_violet_stats", "clean_saas_blue",
+    # ADR-062
+    "editorial_cream",
 ]
 
 

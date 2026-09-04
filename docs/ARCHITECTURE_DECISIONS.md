@@ -2790,3 +2790,115 @@ Frontend: `tsc --noEmit` clean, `next build` succeeds (still 9 routes
   estimate, not proportional-font-aware — long words or very narrow
   themes could wrap slightly differently than the real pptx export's
   own (also-approximate, but different) wrapping logic.
+
+*Next entry: ADR-062.*
+
+---
+
+## ADR-062 — Editorial Layout System, Built From a Direct Design Critique
+
+**Status:** Accepted.
+
+**Decision:** A new theme, `editorial_cream`, built specifically in
+response to a side-by-side critique of a real OpenPresent-generated
+deck against a competitor deck (both supplied directly, along with a
+detailed written critique identifying exactly where the gap was). This
+is not a color palette variation of the existing render logic — it
+dispatches to three genuinely new renderers
+(`_render_editorial_title_slide`, `_render_editorial_content_slide`,
+`_render_editorial_stats_slide`), selected via a new `layout_style`
+theme key, because the critique's core finding was structural, not
+cosmetic: *"OpenPresent looks like software-generated PowerPoint;
+[the competitor] looks like designed visual communication."* Four
+concrete gaps were named and addressed directly:
+
+1. **"Everything is inside boxes" / images "dropped into a predefined
+   rectangle."** New `_add_picture_cover_crop`: images now fill exactly
+   half the canvas edge-to-edge with no padding or border, preserving
+   aspect ratio via real crop-fraction math (computed from the image's
+   actual pixel dimensions via PIL) rather than the default stretch-
+   to-fit, which would have distorted the photo. This is the single
+   most visually significant change — every other fix compounds on top
+   of it.
+2. **"Statistics are treated as text, not design elements."** New
+   `_render_editorial_stats_slide`: a vertical stacked sidebar panel
+   (tinted background, top accent bar, thin dividers between rows,
+   alternating number colors) replacing the horizontal chip row every
+   other theme uses. Directly implements what the critique called out
+   by name as "Principle 2 — make numbers visual."
+3. **"No consistent art direction across slides."** New
+   `_add_kicker`/`_add_footer`: every content slide (not just the
+   cover) gets a small-caps "N — SECTION LABEL" line and a bottom
+   deck-title/page-counter row — the same "consistent identity across
+   every slide" principle ADR-061 already established for the default
+   themes' corner decoration, applied here via a different visual
+   vocabulary matching this theme's editorial register.
+4. **Typography.** `editorial_cream` uses `font_set_id: "serif"`
+   (Cambria — already an existing, safe cross-platform choice in this
+   codebase's font system, not a new dependency) for a genuine display-
+   serif headline treatment instead of the sans-serif bold weight
+   every other theme uses.
+
+**Three real bugs found and fixed by actually rendering real decks**,
+not by code review — the same discipline this project has followed
+since ADR-046:
+- The kicker was cutting mid-word ("...RUNNING A F" instead of
+  "...RUNNING A FEVER"). Root cause was two-layered: `_add_kicker`
+  itself correctly did word-boundary truncation, but every call site
+  was passing an already character-sliced `slide_data.title[:24]` into
+  it — the word-boundary logic was operating on an already-broken
+  fragment. Fixed by passing the full, untruncated title through and
+  letting `_add_kicker` do the only truncation.
+- `CHIP_NUMBER_PATTERN` didn't account for a leading `+`/`-` sign — a
+  climate-style stat like `"+1.1C global warming since 1880"` matched
+  only `"1.1"`, stranding the `"+"` in the label half
+  (`"+C GLOBAL WARMING..."`). Fixed with an optional leading sign in
+  the pattern. **Stated, deliberate non-fix**: a trailing unit letter
+  (the `"C"` in `"1.1C"`) is left in the label — consuming arbitrary
+  trailing letters risks eating the start of the label text itself
+  (`"10 years"` → `"10y"` + `"ears"`), a worse failure mode than a unit
+  letter staying put.
+- On image-bearing content slides, the footer's deck-title label and
+  the image's own attribution caption both rendered in the same
+  bottom-left region, overlapping. Fixed with a new `skip_left`
+  parameter on `_add_footer`, used whenever an image occupies that
+  area.
+
+**Wired into rotation**: `editorial_cream` added to `variety.py`'s
+`THEME_VARIANT_IDS` and `rule_based.py`'s `_KNOWN_THEMES`, same as
+every theme in ADR-059.
+
+**Verification:** built a real sample deck (title + statistics +
+image-bearing content slide) matching the structure of the reference
+deck from the critique, using placeholder colored-rectangle images
+standing in for real photography, and rendered it via `soffice` at
+every stage of fixing the three bugs above — each fix was confirmed by
+re-rendering and looking, not by re-reading the code. 8 new tests
+(`test_pptx_editorial_layout.py`) covering theme registration, no
+stray corner decoration, both regex/truncation regressions as explicit
+regression tests, the footer-collision fix, and the prose-vs-fragment
+bullet distinction. Full backend suite green across 3 consecutive runs
+(481/481 — 473 + 8 new).
+
+**Stated gaps, honest about what's not done:**
+- `SvgPreviewAdapter` (ADR-061) does not yet know about `layout_style`
+  — confirmed by testing, not assumed: it renders `editorial_cream`
+  decks using the correct COLORS but the WRONG LAYOUT (no full-bleed
+  image, plain chip row instead of the sidebar panel). It does not
+  crash or error — the preview is just visually inconsistent with the
+  real export for this one theme, until the preview adapter gets its
+  own editorial-aware renderers as a follow-up.
+- Comparison and process `layout_type` values fall back to
+  `_render_editorial_content_slide`'s bullet treatment in editorial
+  decks — they don't get their own editorial-specific composition
+  (no dedicated comparison/process visual language was designed for
+  this theme in this entry).
+- The image side is always image-left/text-right for content slides
+  (matching the reference deck's actual pattern) — no alternating
+  left/right composition across slides, which the reference deck also
+  didn't consistently do, so not clearly a gap, but worth noting as a
+  simplification.
+- Only one editorial theme exists (`editorial_cream`, cream/green/
+  orange). The underlying renderers are theme-parameterized (colors,
+  not hardcoded), so a second editorial palette is a color-set
+  addition, not new rendering code — but none exists yet.

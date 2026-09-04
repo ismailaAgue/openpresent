@@ -49,6 +49,10 @@ _KNOWN_THEMES = {
     "minimal_mono": Theme(layout_template_id="standard", color_set_id="minimal_mono", font_set_id="sans"),
     "bold_violet_stats": Theme(layout_template_id="standard", color_set_id="bold_violet_stats", font_set_id="sans"),
     "clean_saas_blue": Theme(layout_template_id="standard", color_set_id="clean_saas_blue", font_set_id="sans"),
+    # ADR-062 — font_set_id="serif" (Cambria) matches the reference
+    # decks' editorial display typography far better than the sans
+    # faces every other theme uses.
+    "editorial_cream": Theme(layout_template_id="standard", color_set_id="editorial_cream", font_set_id="serif"),
 }
 
 _SERIF_DOCUMENT_TYPES = {"academic", "lecture"}
