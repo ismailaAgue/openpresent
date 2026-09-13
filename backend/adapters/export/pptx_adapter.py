@@ -53,6 +53,79 @@ from backend.layout.layout_classifier import PROCESS_BULLET_PATTERN
 # failure mode than a unit letter staying in the label.
 CHIP_NUMBER_PATTERN = re.compile(r"[+-]?\$?\d[\d,]*(\.\d+)?\s*[%KMB]?")
 
+_STAT_SUFFIX_MULTIPLIER = {"K": 1e3, "M": 1e6, "B": 1e9}
+
+
+def _parse_stat_magnitude(number_part: str) -> tuple[str, float] | None:
+    """Turns a CHIP_NUMBER_PATTERN match (e.g. "97%", "$320,820M",
+    "-12", "50") into (unit_kind, numeric_value) for real-chart
+    eligibility — see ADR-064's chart entry. unit_kind is one of
+    "percent"/"currency"/"plain"; K/M/B suffixes are folded into the
+    numeric value itself (so "$1.2B" and "$320M" land on the same
+    scale) rather than treated as their own unit, since they're a
+    magnitude, not a different kind of quantity. Returns None if the
+    digits can't be parsed at all — deliberately permissive input
+    (this only ever receives text this same regex already matched
+    elsewhere), strict output (a caller should treat None as "don't
+    chart this")."""
+    s = number_part.strip()
+    if not s:
+        return None
+    sign = -1.0 if s.startswith("-") else 1.0
+    s = s.lstrip("+-").strip()
+    has_dollar = s.startswith("$")
+    s = s.lstrip("$").strip()
+    suffix = ""
+    if s and s[-1] in "%KMB":
+        suffix = s[-1]
+        s = s[:-1].strip()
+    s = s.replace(",", "")
+    if not s:
+        return None
+    try:
+        base = float(s)
+    except ValueError:
+        return None
+    value = sign * base * _STAT_SUFFIX_MULTIPLIER.get(suffix, 1.0)
+    if suffix == "%":
+        unit_kind = "percent"
+    elif has_dollar:
+        unit_kind = "currency"
+    else:
+        unit_kind = "plain"
+    return unit_kind, value
+
+
+def _extract_chartable_stats(stats: list[str]) -> list[tuple[str, str, float]] | None:
+    """Returns [(label, display_text, numeric_value), ...] when every
+    stat parses to a number AND they all share the same unit_kind (all
+    percentages, all currency, or all plain counts) — a real bar chart
+    comparing a percentage against a dollar figure would be
+    meaningless, so mixed units deliberately opt OUT of charting
+    rather than plot something misleading. Returns None otherwise,
+    which callers treat as "fall back to the existing text/chip
+    rendering, unchanged" — a stated limitation (see ADR-064), not a
+    silently-swallowed failure."""
+    if len(stats) < 2:
+        return None
+    parsed = []
+    unit_kinds = set()
+    for stat_text in stats:
+        match = CHIP_NUMBER_PATTERN.search(stat_text)
+        if not match:
+            return None
+        number_part = match.group(0).strip()
+        label_part = (stat_text[:match.start()] + stat_text[match.end():]).strip(" -:,.")
+        result = _parse_stat_magnitude(number_part)
+        if result is None:
+            return None
+        unit_kind, value = result
+        unit_kinds.add(unit_kind)
+        parsed.append((label_part or stat_text, number_part, value))
+    if len(unit_kinds) != 1:
+        return None
+    return parsed
+
 
 def _tint(rgb: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
     """Lightens a color by blending it toward white. amount=0 returns
@@ -895,9 +968,23 @@ class PptxExportAdapter(ExportPort):
         STATISTIC_PATTERN the layout classifier itself uses to decide
         a slide even qualifies as a statistics slide) and rendered
         large inside a tinted rounded-rectangle card, with whatever
-        text remains as a smaller label beneath it. Themes with
-        stat_chip=False keep the original plain-text behavior,
-        unchanged."""
+        text remains as a smaller label beneath it.
+
+        ADR-064 — themes with stat_chip=False no longer just get plain
+        centered text: when the stats are actually chartable (2+ of
+        them, every one parses to a number, and they all share the
+        same unit — see _extract_chartable_stats), they're rendered as
+        a real, native, editable PowerPoint chart (an actual
+        GraphicFrame chart object, not a picture or a styled textbox)
+        instead. Mixed-unit or unparseable stats fall back to the
+        original plain-text row unchanged — charting a percentage
+        against a dollar figure on one axis would be misleading, not
+        an enhancement, so this is a deliberate, stated opt-out rather
+        than a forced chart. stat_chip=True (colored card) and the
+        editorial theme's stacked sidebar panel are untouched — both
+        are deliberate, reference-matched visual identities (ADR-059,
+        ADR-062), not the "plain, undesigned" case this entry
+        upgrades."""
         slide = prs.slides.add_slide(title_only_layout)
         self._apply_background(slide, ctx)
         self._add_corner_decoration(slide, ctx, prs, small=True)
@@ -911,6 +998,10 @@ class PptxExportAdapter(ExportPort):
         box_height = ctx.Inches(2.4)
 
         if not ctx.stat_chip:
+            chartable = _extract_chartable_stats(stats)
+            if chartable is not None:
+                self._add_native_stats_chart(slide, prs, ctx, chartable)
+                return slide
             for idx, stat_text in enumerate(stats):
                 left = margin + (idx * box_width)
                 box = slide.shapes.add_textbox(left, box_top, box_width, box_height)
@@ -966,6 +1057,83 @@ class PptxExportAdapter(ExportPort):
                 lp.alignment = ctx.PP_ALIGN.CENTER
                 ctx.style_run(lp, size=12, color=ctx.text_color)
         return slide
+
+    def _add_native_stats_chart(self, slide, prs, ctx, chartable_stats):
+        """ADR-064 — a real, native PowerPoint chart (an actual chart
+        part PowerPoint recognizes and lets you edit/reformat/re-point
+        at different numbers), not a picture of one and not a styled
+        textbox pretending to be one. One column per stat, values on
+        the scale _extract_chartable_stats already normalized (so a
+        mix of "$320M" and "$1.2B" compares correctly); each column's
+        data label shows the ORIGINAL display text (e.g. "97%",
+        "$320,820M") rather than the raw normalized number, since the
+        normalization exists only to make bar heights comparable, not
+        to replace the number a person actually wrote or expects to
+        see. Value axis is hidden entirely — the data labels already
+        state the exact figure per bar, so a numeric axis alongside
+        them would be redundant clutter, not added clarity."""
+        from pptx.chart.data import CategoryChartData
+        from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION, XL_TICK_MARK
+
+        labels = [label for label, _display, _value in chartable_stats]
+        values = [value for _label, _display, value in chartable_stats]
+        displays = [display for _label, display, _value in chartable_stats]
+
+        slide_width, slide_height = prs.slide_width, prs.slide_height
+        margin = ctx.Inches(0.6)
+        chart_top = int(slide_height * 0.32)
+        chart_height = int(slide_height * 0.58)
+
+        chart_data = CategoryChartData()
+        chart_data.categories = labels
+        chart_data.add_series("Value", values)
+
+        graphic_frame = slide.shapes.add_chart(
+            XL_CHART_TYPE.COLUMN_CLUSTERED, margin, chart_top,
+            slide_width - (2 * margin), chart_height, chart_data,
+        )
+        chart = graphic_frame.chart
+        chart.has_legend = False
+        chart.has_title = False
+
+        plot = chart.plots[0]
+        plot.gap_width = 60
+        series = plot.series[0]
+        series.format.fill.solid()
+        series.format.fill.fore_color.rgb = ctx.accent_color
+        series.format.line.fill.background()
+
+        plot.has_data_labels = True
+        data_labels = plot.data_labels
+        data_labels.position = XL_LABEL_POSITION.OUTSIDE_END
+        data_labels.font.size = ctx.Pt(20)
+        data_labels.font.bold = True
+        data_labels.font.name = ctx.font_name
+        data_labels.font.color.rgb = ctx.title_color
+
+        # Per-point override with the ORIGINAL display text — without
+        # this every column would show its normalized numeric value
+        # (e.g. 320000000 instead of "$320M"), which is correct for
+        # bar height but meaningless as a label a person would want to
+        # read on a slide.
+        for point, display_text in zip(series.points, displays):
+            point.data_label.has_text_frame = True
+            label_paragraph = point.data_label.text_frame.paragraphs[0]
+            label_paragraph.text = display_text
+            ctx.style_run(label_paragraph, size=20, color=ctx.title_color, bold=True)
+
+        value_axis = chart.value_axis
+        value_axis.visible = False
+        value_axis.has_major_gridlines = False
+        value_axis.has_minor_gridlines = False
+
+        category_axis = chart.category_axis
+        category_axis.format.line.color.rgb = ctx.text_color
+        category_axis.has_major_gridlines = False
+        category_axis.major_tick_mark = XL_TICK_MARK.NONE
+        category_axis.tick_labels.font.size = ctx.Pt(16)
+        category_axis.tick_labels.font.name = ctx.font_name
+        category_axis.tick_labels.font.color.rgb = ctx.text_color
 
     def _render_comparison_slide(self, prs, title_only_layout, title, body_texts, ctx):
         """Two side-by-side text columns instead of one bulleted list —

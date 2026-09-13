@@ -96,6 +96,23 @@ def test_closing_slide_language_lookup_is_case_insensitive_and_accepts_full_name
     assert fixed.slides[-1].title == "Gracias"
 
 
+def test_closing_slide_is_localized_for_russian():
+    """ADR-064 — Russian added as a supported language."""
+    outline = make_outline([
+        Slide(order=1, title="Intro", content_blocks=[bullet("a")]),
+        Slide(order=2, title="Details", content_blocks=[bullet("b")]),
+    ])
+    fixed, report = validate_and_fix(outline, language="ru")
+    assert fixed.slides[-1].title == "Спасибо"
+    assert fixed.slides[-1].content_blocks[0].text == "Вопросы?"
+
+
+def test_closing_slide_russian_lookup_is_case_insensitive_and_accepts_full_name():
+    outline = make_outline([Slide(order=1, title="Intro", content_blocks=[bullet("a")])])
+    fixed, _ = validate_and_fix(outline, language="Russian")
+    assert fixed.slides[-1].title == "Спасибо"
+
+
 def test_closing_slide_falls_back_to_english_for_an_unsupported_language():
     """A real, stated limitation (see CLOSING_SLIDE_TEXT's own comment)
     — not every language is covered, and falling back to English
@@ -113,6 +130,18 @@ def test_closing_slide_detection_recognizes_non_english_hints_too():
         Slide(order=2, title="Merci", content_blocks=[bullet("Des questions ?")]),
     ])
     fixed, report = validate_and_fix(outline, language="fr")
+    assert len(fixed.slides) == 2
+    assert not any("closing slide" in f for f in report.auto_fixed)
+
+
+def test_closing_slide_detection_recognizes_russian_hints_too():
+    """A Russian AI-generated closing slide must not get a second,
+    redundant English one appended on top of it."""
+    outline = make_outline([
+        Slide(order=1, title="Intro", content_blocks=[bullet("a")]),
+        Slide(order=2, title="Спасибо", content_blocks=[bullet("Вопросы?")]),
+    ])
+    fixed, report = validate_and_fix(outline, language="ru")
     assert len(fixed.slides) == 2
     assert not any("closing slide" in f for f in report.auto_fixed)
 

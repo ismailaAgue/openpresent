@@ -52,6 +52,11 @@ CLOSING_TITLE_HINTS = (
     # table itself covers, which is the realistic case this matters for.
     "merci", "gracias", "danke", "grazie", "obrigado", "dank je", "tack", "dziękuję",
     "questions", "conclusión", "fragen", "domande", "perguntas", "vragen",
+    # ADR-064 — Russian added to CLOSING_SLIDE_TEXT below; its hints
+    # need to be in this tuple too, same reasoning as every other
+    # language here (recognize an AI-generated Russian closing slide
+    # as one, don't append a redundant English one on top of it).
+    "спасибо", "вопросы",
 )
 
 # ADR-060 — CLOSING_TITLE_HINTS only recognizing English meant a
@@ -86,6 +91,9 @@ CLOSING_SLIDE_TEXT = {
     "swedish": ("Tack", "Frågor?"),
     "pl": ("Dziękuję", "Pytania?"),
     "polish": ("Dziękuję", "Pytania?"),
+    # ADR-064 — Russian, requested as a new supported language.
+    "ru": ("Спасибо", "Вопросы?"),
+    "russian": ("Спасибо", "Вопросы?"),
 }
 
 

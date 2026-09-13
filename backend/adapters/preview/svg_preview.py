@@ -24,15 +24,26 @@ parity, but no longer a generic title+bullets text mockup that ignores
 the theme entirely.
 
 Layout coverage: title, bullet_list (plain and colored-bullet), and
-statistics (chip and plain) are fully covered. comparison and process
-fall back to a themed bullet-list rendering — a stated, deliberate
-scope limit (see this class's render() docstring), not a silent gap.
+statistics (chip, plain, and now native-chart) are fully covered.
+comparison and process fall back to a themed bullet-list rendering —
+a stated, deliberate scope limit (see this class's render() docstring),
+not a silent gap.
+
+ADR-064 — the real PptxExportAdapter now renders chartable statistics
+(stat_chip=False themes, 2+ same-unit stats) as an actual native
+PowerPoint chart instead of plain centered text. This preview reuses
+the exact same _extract_chartable_stats() chartability decision from
+pptx_adapter (one source of truth, not a second copy that could drift)
+and draws a simple SVG bar chart for the same case — otherwise the
+preview would keep showing plain text for a slide that actually
+exports as a chart, exactly the "preview doesn't show the real design"
+problem ADR-061 already fixed once for colors/corner-decoration/chips.
 """
 
 from xml.sax.saxutils import escape as _xml_escape
 from backend.models.recipe import Recipe, BlockType
 from backend.adapters.export.pptx_adapter import (
-    _COLOR_SETS, _tint, CHIP_NUMBER_PATTERN,
+    _COLOR_SETS, _tint, CHIP_NUMBER_PATTERN, _extract_chartable_stats,
 )
 
 # 4:3, matching PptxExportAdapter's actual (unconfigured, default
@@ -173,6 +184,49 @@ class SvgPreviewAdapter:
             y += 8
         return self._svg_wrapper("".join(parts), colors)
 
+    def _statistics_bar_chart(self, chartable_stats, colors: dict, margin: int, gap: int,
+                               card_width: int, card_top: int, card_height: int) -> str:
+        """ADR-064 — mirrors the real PptxExportAdapter's native chart
+        for the exact same chartable case (same _extract_chartable_stats
+        decision, imported from pptx_adapter rather than reimplemented,
+        so the two can't silently drift apart). Not pixel-accurate
+        (this whole module isn't, per its own docstring) but the same
+        DESIGN: bars scaled to the largest value, the ORIGINAL display
+        text ("97%", not a raw normalized number) above each bar, and
+        the parsed label beneath — a bar chart preview for a slide that
+        actually exports as a bar chart, instead of the plain-text
+        preview this used to fall back to unconditionally."""
+        parts = []
+        max_value = max(abs(value) for _label, _display, value in chartable_stats) or 1
+        baseline = card_top + card_height
+        bar_width = max(24, card_width - 40)
+        for idx, (label, display, value) in enumerate(chartable_stats):
+            cx = margin + idx * (card_width + gap) + card_width // 2
+            bar_height = max(4, int(card_height * (abs(value) / max_value)))
+            bar_left = cx - bar_width // 2
+            bar_top = baseline - bar_height
+            parts.append(
+                f'<rect x="{bar_left}" y="{bar_top}" width="{bar_width}" height="{bar_height}" '
+                f'fill="{_hex(colors["accent"])}"/>'
+            )
+            parts.append(
+                f'<text x="{cx}" y="{bar_top - 8}" font-size="15" font-weight="700" '
+                f'text-anchor="middle" fill="{_hex(colors["title"])}" '
+                f'font-family="Inter, sans-serif">{_xml_escape(display)}</text>'
+            )
+            label_line = _wrap_text(label, max_chars=16)[0] if label else ""
+            if label_line:
+                parts.append(
+                    f'<text x="{cx}" y="{baseline + 18}" font-size="11" '
+                    f'text-anchor="middle" fill="{_hex(colors["text"])}" '
+                    f'font-family="Inter, sans-serif">{_xml_escape(label_line)}</text>'
+                )
+        parts.append(
+            f'<line x1="{margin}" y1="{baseline}" x2="{VIEWBOX_WIDTH - margin}" y2="{baseline}" '
+            f'stroke="{_hex(colors["text"])}" stroke-width="1"/>'
+        )
+        return "".join(parts)
+
     def _render_statistics(self, title: str, bullets: list[str], colors: dict) -> str:
         title_svg, content_top = self._title_with_accent(title, colors)
         parts = [self._corner_decoration(colors, small=True), title_svg]
@@ -183,6 +237,13 @@ class SvgPreviewAdapter:
         card_height = 160
 
         if not colors.get("stat_chip"):
+            chartable = _extract_chartable_stats(stats)
+            if chartable is not None:
+                return self._svg_wrapper(
+                    "".join(parts) + self._statistics_bar_chart(chartable, colors, margin, gap,
+                                                                 card_width, card_top, card_height),
+                    colors,
+                )
             for idx, stat_text in enumerate(stats):
                 cx = margin + idx * (card_width + gap) + card_width // 2
                 parts.append(

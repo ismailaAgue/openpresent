@@ -2987,3 +2987,154 @@ device, has a real gap. Once deployed: open the site on an actual
 phone and confirm the welcome message is visible without scrolling,
 the floating preview button no longer sits on top of the composer, and
 a fresh chat shows the centered empty state.
+
+*Next entry: ADR-064.*
+
+---
+
+## ADR-064 — Russian Added as a Supported Generation Language
+
+**Status:** Accepted.
+
+**Decision:** Russian added to the two places that actually needed
+new, language-specific work — everything else in the generation path
+(`request.language` interpolated straight into the AI prompts in
+`json_pipeline_base.py`, and the theme fonts, Calibri/Cambria, both of
+which already carry full Cyrillic coverage in any real Office install)
+was already language-agnostic and needed nothing.
+
+**1. `CLOSING_SLIDE_TEXT`, `quality_validator.py`.** Added `"ru"` and
+`"russian"` → `("Спасибо", "Вопросы?")`, matching the existing
+case-insensitive, code-or-full-name lookup every other language in
+this table already gets. `CLOSING_TITLE_HINTS` gained `"спасибо"` and
+`"вопросы"` so an AI-generated closing slide already in Russian is
+recognized as one and doesn't get a redundant English slide appended
+on top of it — the exact bug ADR-060 fixed for the other 8 languages,
+avoided here by adding Russian to the same table instead of
+special-casing it.
+
+**2. `LANGUAGE_OPTIONS`, `frontend/app/page.tsx`.** Added `{ code:
+"ru", label: "Русский" }` to the composer's language `<select>`, per
+the comment already sitting on that array linking it to
+`CLOSING_SLIDE_TEXT`'s coverage.
+
+**Verification:** Rendered an actual Cyrillic deck through
+`PptxExportAdapter` end to end (non-Latin title, body bullet, and a
+Russian closing slide) and converted it to PDF/JPEG via
+`soffice --headless` + `pdftoppm` to look at it directly, per this
+doc's own "render and look" convention (Section 5, point 2) — not just
+trusted green tests for something visual. Both the body Cyrillic and
+the closing slide's "Спасибо" / "Вопросы?" render cleanly with no
+tofu/missing-glyph boxes. 3 new tests in `test_quality_validator.py`
+(localization, case/full-name lookup, non-English — here
+non-Cyrillic — hint detection), mirroring ADR-060's test shape exactly
+for the new language. Full backend suite: 484/484 (481 from ADR-063 +
+3 new). Frontend: `tsc --noEmit` clean, `next build` succeeds (still 9
+routes, no new route added).
+
+**Stated limitation, carried over from ADR-060, unchanged:** any
+language typed into the (free-form, not-enum) `language` field that
+isn't in `CLOSING_SLIDE_TEXT` still falls back to an English closing
+slide, honestly, rather than a silent mistranslation — this remains a
+real, stated gap for languages beyond the 10 now covered, not
+something this entry attempts to solve generally.
+
+*Next entry: ADR-065.*
+
+---
+
+## ADR-065 — Real Native PowerPoint Charts for Statistics
+
+**Status:** Accepted.
+
+**Decision:** Statistics slides on `stat_chip=False`, non-editorial
+themes (6 of the 9 themes — `neutral`, `blue_academic`,
+`warm_editorial`, `modern_dark`, `bold_violet_stats`,
+`clean_saas_blue`) now render as a real, native PowerPoint chart — an
+actual `GraphicFrame` chart part PowerPoint recognizes, lets you
+reformat, re-color, or re-point at different numbers — instead of a
+row of plain centered text, whenever the underlying stats are
+genuinely chartable. Before this, no statistics layout on any theme
+produced an actual chart object at all; the "chip" and editorial
+sidebar treatments (ADR-059, ADR-062) are real visual designs but
+neither is a chart.
+
+**What "chartable" means, and why it's not automatic.** A bar chart
+comparing a dollar figure against a percentage on one axis would be
+actively misleading, not an enhancement — so charting only happens
+when: (1) there are 2+ stats, (2) every one parses to an actual
+number via the number portion `CHIP_NUMBER_PATTERN` already extracts
+elsewhere in this file, and (3) they all share the same unit kind
+(percent / currency / plain count). `_parse_stat_magnitude()` folds
+K/M/B suffixes straight into the numeric value (so `$1.2B` and
+`$320M` land on one comparable scale, rather than being treated as
+different units) and `_extract_chartable_stats()` makes the go/no-go
+call. Anything that fails any of those three conditions — mixed
+units, an unparseable stat, or fewer than 2 stats — falls back to the
+exact original plain-text rendering, unchanged. This is a stated,
+deliberate opt-out, not a silently swallowed failure: a slide with
+"$50B market size" next to "97% satisfaction" will never become a
+chart, by design.
+
+**What the chart actually looks like:** one column per stat, bars
+filled with the theme's accent color, the value axis hidden entirely
+(gridlines and axis labels would be redundant next to a data label
+already showing the exact figure), and — the detail that matters
+most — each column's data label shows the ORIGINAL text a person
+wrote or the AI generated ("97%", "$320,820M"), not the raw numeric
+value used internally to size the bars. Legend and chart title are
+both off; the slide's own title (rendered the normal themed way,
+above the chart) already says what the chart is about.
+
+**Scope, stated explicitly:** `stat_chip=True` (the colored-card
+treatment, ADR-059) and the editorial theme's stacked sidebar panel
+(ADR-062) are untouched — both are deliberate, reference-matched
+visual identities, not the "plain, undesigned" case this entry
+upgrades. Converting them to bar charts would have overwritten real,
+prior design work rather than fixed a gap. If real charts are wanted
+for those themes too, that's a distinct, future decision, not an
+oversight here.
+
+**The preview had to move too, or it would have started lying.**
+`backend/adapters/preview/svg_preview.py` (ADR-061's themed,
+LibreOffice-free preview) had its own, separate implementation of the
+plain-text statistics case. Left alone, it would have kept showing
+plain text in the preview panel for a slide that now actually exports
+as a chart — exactly the "preview doesn't match the real design"
+problem ADR-061 already fixed once for colors, corner decoration, and
+chips. Fixed by importing `_extract_chartable_stats()` directly from
+`pptx_adapter.py` (one chartability decision, not two copies that
+could quietly drift apart over time) and adding a matching SVG bar
+chart — same scaling, same original-text data labels, same
+theme-accent fill.
+
+**Verification:** Rendered real decks through `PptxExportAdapter`,
+converted to PDF via `soffice --headless` then to JPEG via
+`pdftoppm`, and looked at them directly, per this doc's own "render
+and look" convention (Section 5, point 2) — a same-unit stats slide
+on `neutral` renders a clean native column chart with correct bar
+heights and original-text data labels; a mixed-unit slide on the same
+theme falls back to the unchanged plain-text row; `gradient_violet`
+(chip) is completely unaffected. Also rendered the SVG preview for
+the same cases and visually confirmed the bar chart mirrors the real
+export's design. 14 new tests in `tests/contract/test_pptx_native_charts.py`
+(unit-parsing, chartability decision, end-to-end chart shape/data/
+labels, mixed-unit and chip/editorial non-regression) plus 2 new
+tests in `test_svg_preview.py` covering the preview's matching branch
+and its own mixed-unit fallback. Full backend suite, 3 consecutive
+runs per Section 5 point 3 (this touches shared rendering code):
+500/500 every time (498 prior + 2 new — the 484 baseline plus the
+Russian-language ADR-064 tests plus these).
+
+**Stated limitation:** `_extract_chartable_stats()`'s same-unit rule
+is a real, deliberate simplification, not a full unit-aware
+comparison engine — it distinguishes exactly three coarse kinds
+(percent / currency / plain), not, say, currencies in different
+denominations, or a percent correctly recognized as comparable to a
+0–1 ratio phrased without a `%` sign. Stats that don't fit this
+coarse model simply don't chart, which is the safe failure mode, not
+a silent miscomparison — but it does mean some genuinely comparable
+stats will still fall back to plain text if they're phrased in a way
+this simple parser doesn't recognize.
+
+*Next entry: ADR-066.*
