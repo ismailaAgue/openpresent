@@ -3138,3 +3138,76 @@ stats will still fall back to plain text if they're phrased in a way
 this simple parser doesn't recognize.
 
 *Next entry: ADR-066.*
+
+---
+
+## ADR-066 — An Adsterra Ad Banner After Every Chat Response
+
+**Status:** Accepted.
+
+**Decision:** A banner ad now renders after every assistant response
+in the chat thread — a plain text message, and a completed generation
+job in either its "done" or "failed" state (a failure is still a
+response the person is waiting on, not a silent gap). Never after a
+user message, and never before the very first welcome message (that
+one renders through the separate empty-state branch, ADR-063, not
+this list — showing an ad before the person has said anything would
+be backwards).
+
+**The real engineering problem here wasn't placement, it was
+`document.write()`.** The ad unit Adsterra provides is a single
+`<script src="...">` tag. Classic ad-network tags like this
+frequently call `document.write()` internally — harmless during a
+page's initial HTML parse, but actively dangerous once called *after*
+load in a single-page app: `document.write()` implicitly calls
+`document.open()` first, which can wipe the live DOM out from under
+React — every chat bubble, the composer, all of it — the moment a new
+ad slot mounts after a response, since that's exactly a
+post-load, dynamically-inserted script in this app's case. The fix:
+`AdBanner` loads the ad script inside its own sandboxed iframe
+(`srcDoc`, a tiny standalone HTML document), so any `document.write()`
+calls only ever touch that iframe's own document, never the real
+page. This is the standard, known-safe way to drop a classic
+document.write-based ad tag into a React app — worth stating
+explicitly since it's the one piece of this that isn't obvious from
+just reading Adsterra's own snippet.
+
+**Stated tradeoff on the sandbox flags.** The iframe uses
+`sandbox="allow-scripts allow-same-origin allow-popups"`.
+`allow-same-origin` is there because most ad networks' own
+cookies/local-storage (used for frequency capping, tracking) need it
+to work at all; combined with `allow-scripts` on a `srcDoc` iframe
+this is weaker isolation than using only one of the two flags — a
+widely accepted, standard tradeoff for third-party ad embeds, not a
+hidden one. `allow-popups` is there because the ad network's domain
+(`profitableratecpmnetwork.com`) is a popunder-style CPM network by
+naming convention — without this flag, a click that's meant to open a
+new tab/window would likely just silently fail instead, which is
+worse for a real ad placement than allowing the popup.
+
+**Stated UX note, not silently decided away:** because this is
+(apparently) a popunder-style network, clicking the banner may open a
+new browser tab/window rather than just linking through inline — this
+is normal for this category of ad network, but worth knowing before
+shipping it, since it's a more intrusive interaction than a typical
+static banner ad.
+
+**Verification:** `tsc --noEmit` clean, `next build` succeeds (still
+9 routes — this is a rendering change to the existing `/studio` page,
+not a new route). The full backend suite doesn't apply here (backend
+untouched); no frontend test framework exists in this project to run
+against (`package.json` has no test script) — `tsc` + `next build` is
+this project's existing, full bar for a frontend-only change, same as
+was used for ADR-064's language selector.
+
+**Stated limitation:** the actual ad network domain
+(`profitableratecpmnetwork.com`) isn't in this sandbox's outbound
+network allowlist, so the *live* ad content itself couldn't be
+rendered and looked at directly the way this doc's "render and look"
+convention (Section 5, point 2) asks for on anything visual — what
+was verified is that the integration compiles, builds, and places the
+banner correctly relative to each response type; the ad network's own
+creative/behavior needs a real look on a deployed environment, not
+this sandbox, before calling it fully confirmed.
+
+*Next entry: ADR-067.*
