@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import AppShell from "@/components/AppShell";
+import { Analytics } from "@vercel/analytics/next";
 
 export const metadata: Metadata = {
   title: "OpenPresent — Presentations, without the paywall",
@@ -30,6 +31,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       </head>
       <body>
         <AppShell>{children}</AppShell>
+        {/* Vercel Web Analytics — a no-op unless this build is actually
+            served from a Vercel deployment with Web Analytics turned on
+            for the project (Vercel dashboard -> project -> Analytics ->
+            Enable); safe to leave in for local dev and any other host. */}
+        <Analytics />
       </body>
     </html>
   );
