@@ -3211,3 +3211,38 @@ creative/behavior needs a real look on a deployed environment, not
 this sandbox, before calling it fully confirmed.
 
 *Next entry: ADR-067.*
+
+---
+
+## ADR-067 — Vercel Web Analytics
+
+**Status:** Accepted.
+
+**Decision:** Added the official `@vercel/analytics` package and its
+`<Analytics />` component to the root layout
+(`frontend/app/layout.tsx`), via the Next.js-specific entrypoint
+(`@vercel/analytics/next`, not the generic `/react` one — it's
+App-Router-aware, tracking route changes through `next/navigation`
+automatically instead of needing manual page-view calls). This is the
+whole integration: no API key, no env var, no backend change. The
+component is a genuine no-op unless the deployed build is actually
+served from Vercel with **Web Analytics enabled** for the project
+(Vercel dashboard → project → Analytics tab → Enable) — safe to leave
+in for local dev, and for any other host, without configuring
+anything or guarding it behind a flag.
+
+**Verification:** `tsc --noEmit` clean, `next build` succeeds, still 9
+routes, First Load JS shared bundle size unchanged (the component
+injects a small `<script defer src="/_vercel/insights/script.js">` at
+runtime rather than bundling the analytics library itself, so there's
+no real bundle-size cost to weigh here). No backend suite run — this
+doesn't touch `backend/` at all.
+
+**Stated limitation:** actual analytics events can't be verified from
+this sandbox — there's no live Vercel deployment to check the
+dashboard against. Confirm after deploying: Vercel dashboard →
+project → Analytics tab, Web Analytics toggled on, and real pageviews
+showing up after visiting the live site a few times (events can take
+a few minutes to appear, this is normal).
+
+*Next entry: ADR-068.*
