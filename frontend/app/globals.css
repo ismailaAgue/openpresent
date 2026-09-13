@@ -551,6 +551,34 @@ input:focus, textarea:focus, select:focus, .btn:focus, a:focus {
 }
 .op-bubble-row { display: flex; align-items: flex-start; }
 
+/* Ad banner shown after every assistant response (plain text or a
+   finished/failed generation job) — never after a user message, and
+   never before the very first welcome message (that one renders via
+   the empty-state branch, not this list, on purpose). The iframe
+   itself is sized by whatever Adsterra's ad unit renders at; this
+   just gives it a sane minimum footprint before that content loads so
+   the chat thread doesn't jump/reflow once the ad appears. */
+.op-ad-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+}
+.op-ad-label {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--op-text-muted);
+  opacity: 0.7;
+}
+.op-ad-iframe {
+  width: 100%;
+  max-width: 728px;
+  min-height: 90px;
+  border: none;
+}
+
 .op-steps { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 2px 32px; }
 .op-step {
   display: flex; align-items: center; gap: 6px;

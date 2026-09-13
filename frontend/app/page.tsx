@@ -64,6 +64,48 @@ function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
+// The ad unit Adsterra gives you is a single <script src="..."> tag.
+// Classic ad-network tags like this frequently call document.write()
+// internally, which is fine during a normal page's initial HTML parse
+// but actively dangerous once called *after* load in a single-page
+// app: document.write() implicitly calls document.open() first, which
+// can wipe out the live DOM — every chat bubble, the composer, all of
+// it — the moment a new banner mounts after a chat response. Loading
+// the script inside its own sandboxed iframe (srcDoc, a tiny standalone
+// HTML document) means any document.write() calls only affect that
+// iframe's own document, never the real page — this is the standard,
+// safe way to drop a classic ad tag into a React app.
+//
+// Stated tradeoff: `allow-same-origin` is included alongside
+// `allow-scripts` because most ad networks (Adsterra included) need it
+// for their own cookies/storage to work at all; combined with
+// `allow-scripts` on a srcDoc iframe this is weaker isolation than a
+// sandbox with only one of the two — a widely accepted, standard
+// tradeoff for third-party ad embeds, not a hidden one.
+const ADSTERRA_SCRIPT_SRC =
+  "https://pl31270673.profitableratecpmnetwork.com/1d/65/68/1d6568a914e643944ec9d8cd58ce2dd1.js";
+
+function AdBanner() {
+  const srcDoc = `<!DOCTYPE html><html><head><style>
+    html,body{margin:0;padding:0;display:flex;align-items:center;justify-content:center;background:transparent;overflow:hidden;}
+  </style></head><body>
+    <script src="${ADSTERRA_SCRIPT_SRC}"></script>
+  </body></html>`;
+
+  return (
+    <div className="op-ad-slot">
+      <span className="op-ad-label">Advertisement</span>
+      <iframe
+        title="Advertisement"
+        className="op-ad-iframe"
+        srcDoc={srcDoc}
+        sandbox="allow-scripts allow-same-origin allow-popups"
+        scrolling="no"
+      />
+    </div>
+  );
+}
+
 function JobBubble({ jobId, outputFormat }: { jobId: string; outputFormat: ExportFormat }) {
   const [status, setStatus] = useState<"pending" | "running" | "done" | "failed">("pending");
   const [stageIdx, setStageIdx] = useState(0);
@@ -144,7 +186,12 @@ function JobBubble({ jobId, outputFormat }: { jobId: string; outputFormat: Expor
   }, [jobId]);
 
   if (status === "failed") {
-    return <div className="op-error-bubble">Something went wrong: {error}</div>;
+    return (
+      <>
+        <div className="op-error-bubble">Something went wrong: {error}</div>
+        <AdBanner />
+      </>
+    );
   }
 
   if (status !== "done") {
@@ -202,6 +249,7 @@ function JobBubble({ jobId, outputFormat }: { jobId: string; outputFormat: Expor
           </span>
         )}
       </div>
+      <AdBanner />
     </>
   );
 }
@@ -305,9 +353,12 @@ export default function StudioPage() {
           ) : messages.map((m) => {
             if (m.kind === "assistant-text") {
               return (
-                <div key={m.id} className="op-bubble op-bubble-assistant op-bubble-row">
-                  <span className="op-bubble-avatar" />
-                  <span>{m.text}</span>
+                <div key={m.id}>
+                  <div className="op-bubble op-bubble-assistant op-bubble-row">
+                    <span className="op-bubble-avatar" />
+                    <span>{m.text}</span>
+                  </div>
+                  <AdBanner />
                 </div>
               );
             }
