@@ -32,6 +32,7 @@ const LANGUAGE_OPTIONS = [
   { code: "nl", label: "Nederlands" },
   { code: "sv", label: "Svenska" },
   { code: "pl", label: "Polski" },
+  { code: "ru", label: "Русский" },
 ];
 
 type Msg =

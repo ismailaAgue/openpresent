@@ -112,6 +112,55 @@ def test_statistics_slide_without_chip_theme_renders_plain_text():
     assert 'rx="14"' not in result[1]["svg"]
 
 
+def test_statistics_slide_without_chip_theme_renders_a_bar_chart_when_chartable():
+    """ADR-064 — the preview must match the real export: 2+ same-unit
+    stats on a stat_chip=False theme now render as an actual bar chart
+    (rects scaled to value, original display text per bar) instead of
+    plain centered text, mirroring PptxExportAdapter's own native
+    chart for the identical case."""
+    slides = [
+        Slide(order=1, title="Cover", content_blocks=[]),
+        Slide(order=2, title="Key Metrics", content_blocks=[
+            ContentBlock(type=BlockType.BULLET, text="42% renewable adoption"),
+            ContentBlock(type=BlockType.BULLET, text="31% wind share"),
+            ContentBlock(type=BlockType.BULLET, text="18% hydro share"),
+        ], layout_type="statistics"),
+    ]
+    result = SvgPreviewAdapter().render(make_recipe("minimal_mono", slides=slides))  # stat_chip=False
+    stats_svg = result[1]["svg"]
+    # 2 baseline rects (background + title accent bar) + 1 bar per stat
+    assert stats_svg.count("<rect") == 5
+    assert "42%" in stats_svg
+    assert "31%" in stats_svg
+    assert "18%" in stats_svg
+    assert "renewable" in stats_svg
+    # the tallest bar (42%, the largest value) must actually be taller
+    # than the shortest (18%) — a chart that doesn't scale by value
+    # isn't a chart, it's three identical rectangles with numbers on them.
+    import re
+    heights = [int(h) for h in re.findall(r'<rect[^>]*height="(\d+)"', stats_svg)]
+    assert max(heights) > min(heights)
+
+
+def test_statistics_slide_without_chip_theme_falls_back_for_mixed_units():
+    """Same non-chartability rule as the real export (imported from
+    pptx_adapter, not reimplemented) — a dollar figure next to a
+    percentage stays plain text, doesn't become a misleading chart."""
+    slides = [
+        Slide(order=1, title="Cover", content_blocks=[]),
+        Slide(order=2, title="Key Metrics", content_blocks=[
+            ContentBlock(type=BlockType.BULLET, text="$50B market size"),
+            ContentBlock(type=BlockType.BULLET, text="97% satisfaction"),
+        ], layout_type="statistics"),
+    ]
+    result = SvgPreviewAdapter().render(make_recipe("minimal_mono", slides=slides))
+    stats_svg = result[1]["svg"]
+    # 2 baseline rects (background + title accent bar), no bars added
+    assert stats_svg.count("<rect") == 2
+    assert "$50B market size" in stats_svg
+    assert "97% satisfaction" in stats_svg
+
+
 def test_bullet_slide_has_one_colored_marker_per_bullet():
     result = SvgPreviewAdapter().render(make_recipe())
     bullet_svg = result[1]["svg"]
