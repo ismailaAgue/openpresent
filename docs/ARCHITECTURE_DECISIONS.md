@@ -3320,3 +3320,77 @@ regardless (500/500) even though this is a frontend-only change — no
 backend file was touched.
 
 *Next entry: ADR-069.*
+
+---
+
+## ADR-069 — Preview Panel No Longer Opens Fullscreen-First on Mobile
+
+**Status:** Accepted.
+
+**Decision:** `previewOpen` defaulted to `true` unconditionally, with
+no mobile awareness at all — on mobile, an open preview panel is a
+*fullscreen overlay* (ADR-063's own mobile rule for `.op-preview-col`),
+not a side pane, so this made an empty "Your slides will appear here
+once generation starts" screen the literal first thing a phone visitor
+saw, before they'd typed anything or the welcome message was even
+visible. Now defaults closed on mobile, exactly the way the sidebar
+already defaults closed on mobile (AppShell, ADR-058) — reopening it
+is still one tap away via the existing floating reopen button, nothing
+about that interaction changed.
+
+**A new shared hook, used in exactly one new place.**
+`frontend/lib/use-is-mobile.ts` extracts the `(max-width: 860px)`
+breakpoint into `useIsMobile()`, used here for the preview panel's
+default. **Deliberately not** used to refactor `AppShell.tsx`'s
+existing sidebar-default logic, even though that logic checks the same
+breakpoint: AppShell's mobile-detection effect applies the sidebar's
+default synchronously, inside the same effect call that reads
+`matchMedia` — reading the *local* `mobile` parameter directly, never
+its own `isMobile` state. Wiring AppShell through this hook instead
+would mean a *second* effect keyed on the hook's returned value,
+which only fires a render after the state updates — a one-render-late
+gap that doesn't exist today. That's a real, if small, timing change
+to code that's already been through two rounds of genuine mobile bugs
+(ADR-058, ADR-063) for a refactor with no user-visible benefit. Stated
+duplication of one breakpoint constant, not an oversight: worth
+reconciling if AppShell's sidebar logic is ever rewritten anyway, not
+worth the risk of forcing it now for an unrelated fix.
+
+**Why default `true` and correct via an effect, rather than default
+`false` directly:** `isMobile` is always `false` on the very first
+render (matching what the server rendered, since `window` doesn't
+exist there) — defaulting the state to match desktop and then
+correcting it the instant the real viewport is known avoids a
+server/client hydration mismatch, the same pattern AppShell already
+uses for the sidebar. There's a technically-possible one-frame flash
+of the fullscreen overlay before the correction effect fires; this is
+the same class of flash the sidebar's own default already accepts
+(and hasn't been reported as visible in practice).
+
+**Deliberately not persisted**, unlike the sidebar's open/closed state
+— this is a one-time "don't show an empty panel first" default, not a
+standing preference someone would expect remembered across visits.
+Once a person deliberately opens or closes it during a session, that
+in-session choice is respected as normal (nothing about the existing
+open/close buttons changed); it just isn't written to `localStorage`.
+
+**Verification:** Rendered a completely fresh mobile load (390×844,
+zero interaction) via Playwright + Chromium and confirmed the welcome
+screen and composer are what's visible, not the preview overlay — the
+same "render and look" convention as every other visual fix in this
+doc. Also confirmed: the floating reopen button still opens the
+preview correctly on mobile, and a fresh desktop load is completely
+unaffected (side-by-side preview still shows by default there, as
+it always has). `tsc --noEmit` clean, `next build` succeeds, same 9
+routes. Full backend suite run regardless (500/500) — no backend file
+touched.
+
+**Stated limitation:** the preview doesn't auto-open on mobile once a
+generation actually finishes — it stays closed until the person
+deliberately taps to reopen it, even though at that point there's
+finally something real to show. That's arguably a nice follow-up (open
+automatically the first time real slides exist), but it's a distinct
+UX decision from "don't show an empty panel before there's anything to
+show," which is what was actually reported — not bundled in here.
+
+*Next entry: ADR-070.*

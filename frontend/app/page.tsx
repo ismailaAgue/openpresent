@@ -14,6 +14,7 @@ import {
   WorkspaceSummary,
 } from "@/lib/api-client";
 import { ExportFormat } from "@/lib/export-formats";
+import { useIsMobile } from "@/lib/use-is-mobile";
 
 type Mode = "topic" | "document";
 
@@ -292,6 +293,23 @@ export default function StudioPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const threadRef = useRef<HTMLDivElement>(null);
   const signedIn = typeof window !== "undefined" && !!getSessionToken();
+  const isMobile = useIsMobile();
+
+  // ADR-069 — on mobile, an open preview panel is a fullscreen overlay
+  // (see .op-preview-col's mobile rule in globals.css), not a side
+  // pane — so defaulting `previewOpen` to true made an empty "Your
+  // slides will appear here" screen the very first thing a phone
+  // visitor saw, before they'd typed anything. Starting `true` (not
+  // `false`) avoids a server/client render mismatch — `isMobile` is
+  // always `false` on the very first render, matching the server,
+  // then corrects itself the instant the real viewport is known; the
+  // same pattern AppShell already uses for the sidebar's own mobile
+  // default. Deliberately not persisted (unlike the sidebar) — this
+  // is a one-time "don't show an empty panel first" default, not a
+  // standing preference someone would expect remembered across visits.
+  useEffect(() => {
+    if (isMobile) setPreviewOpen(false);
+  }, [isMobile]);
 
   useEffect(() => {
     threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight, behavior: "smooth" });
