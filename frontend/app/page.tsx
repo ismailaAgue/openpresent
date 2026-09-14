@@ -64,6 +64,18 @@ function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
+// Collapses the first user message down to a short chat-header title —
+// strip newlines (a pasted multi-line topic shouldn't wrap the header),
+// then cut at the last whole word inside the limit rather than
+// mid-word, the same way title bars in other chat apps do it.
+function truncateChatTitle(text: string, maxLength = 48): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= maxLength) return collapsed || "New chat";
+  const cut = collapsed.slice(0, maxLength);
+  const lastSpace = cut.lastIndexOf(" ");
+  return (lastSpace > 20 ? cut.slice(0, lastSpace) : cut).trimEnd() + "…";
+}
+
 // The ad unit Adsterra gives you is a single <script src="..."> tag.
 // Classic ad-network tags like this frequently call document.write()
 // internally, which is fine during a normal page's initial HTML parse
@@ -332,10 +344,22 @@ export default function StudioPage() {
 
   const latestJob = [...messages].reverse().find((m): m is Extract<Msg, { kind: "job" }> => m.kind === "job");
 
+  // Like any real chat app (Claude/ChatGPT included), the header should
+  // reflect what this conversation is actually about, not sit stuck on
+  // "New chat" forever. Deterministic, not an extra AI call: the title
+  // is just the first user message, truncated — instant, and (per this
+  // whole project's zero-AI-configured philosophy) works identically
+  // whether or not any AI provider is even set up. Falls back to "New
+  // chat" only before the person has actually sent anything.
+  const firstUserMessage = messages.find(
+    (m): m is Extract<Msg, { kind: "user-text" }> => m.kind === "user-text",
+  );
+  const chatTitle = firstUserMessage ? truncateChatTitle(firstUserMessage.text) : "New chat";
+
   return (
     <div className="op-studio">
       <div className="op-chat-col">
-        <div className="op-chat-header">New chat</div>
+        <div className="op-chat-header">{chatTitle}</div>
         <div className="op-chat-thread" ref={threadRef}>
           {messages.length === 1 && messages[0].kind === "assistant-text" && messages[0].id === "welcome" ? (
             // ADR-063 — a centered empty-state hero instead of a small
@@ -397,14 +421,14 @@ export default function StudioPage() {
               onClick={() => setExportFormat("pptx")}
               title="Generate a slide deck (.pptx)"
             >
-              → Slides
+              → PPT
             </button>
                 <button
                   className={`op-mode-pill ${outputFormat === "document_docx" ? "active" : ""}`}
                   onClick={() => setExportFormat("document_docx")}
                   title="Generate a Word document (.docx) instead of a deck"
                 >
-                  → Document
+                  → DOCX
                 </button>
                 <button
                   className={`op-mode-pill ${outputFormat === "document_pdf" ? "active" : ""}`}
