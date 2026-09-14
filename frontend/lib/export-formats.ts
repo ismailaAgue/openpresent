@@ -9,15 +9,15 @@ export type ExportFormat = "pptx" | "document_docx" | "document_pdf";
 export interface ExportFormatMeta {
   format: ExportFormat;
   label: string;       // "presentation", "document", ...
-  shortLabel: string;  // "Slides", "Document", ... — for compact UI like a <select>
+  shortLabel: string;  // "PPT", "DOCX", ... — for compact UI like a <select>
   extension: string;   // "pptx", "docx", "pdf"
   isSvg: boolean;
 }
 
 export const EXPORT_FORMATS: ExportFormatMeta[] = [
-  { format: "pptx", label: "presentation", shortLabel: "Slides (.pptx)", extension: "pptx", isSvg: false },
-  { format: "document_docx", label: "document", shortLabel: "Document (.docx)", extension: "docx", isSvg: false },
-  { format: "document_pdf", label: "PDF", shortLabel: "Document (.pdf)", extension: "pdf", isSvg: false },
+  { format: "pptx", label: "presentation", shortLabel: "PPT (.pptx)", extension: "pptx", isSvg: false },
+  { format: "document_docx", label: "document", shortLabel: "DOCX (.docx)", extension: "docx", isSvg: false },
+  { format: "document_pdf", label: "PDF", shortLabel: "PDF (.pdf)", extension: "pdf", isSvg: false },
 ];
 
 export function exportFormatMeta(format: string): ExportFormatMeta {

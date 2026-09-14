@@ -3246,3 +3246,77 @@ showing up after visiting the live site a few times (events can take
 a few minutes to appear, this is normal).
 
 *Next entry: ADR-068.*
+
+---
+
+## ADR-068 — Mobile Header/Sidebar-Toggle Collision, a Real Chat Title, and PPT/DOCX Labels
+
+**Status:** Accepted.
+
+**Decision:** Three separate, unrelated things, reported together from
+a real phone screenshot: a genuine visual bug, a hardcoded string that
+should have been dynamic, and a naming preference. Handled separately
+below, in the order they matter.
+
+**1. The header/sidebar-toggle collision — a real bug, distinct from
+ADR-063's.** The screenshot showed "New chat" rendering as "v chat" —
+the sidebar's reopen button sitting on top of the header's own title
+text. Root cause: on mobile, a closed sidebar becomes a
+`position: fixed; top: 10px; left: 10px` 32px button (so it floats
+over content rather than taking its own space in the layout — a
+deliberate choice, see ADR-063), while the SAME mobile breakpoint was
+separately shrinking `.op-chat-header`'s left padding from 24px down
+to 16px — landing the header's title text directly under the button's
+~10-42px horizontal span. This is a genuinely different collision than
+the one ADR-063 already fixed (that one was the collapsed-*preview*
+button sitting on the composer, at the bottom of the screen) — a
+sibling bug in the same family, not a regression of the earlier fix.
+Fixed by reserving 54px of left padding on the header at that
+breakpoint specifically, the same way any title bar with a leading
+menu icon reserves a lane for it rather than expecting the icon to
+avoid content that doesn't know it's there.
+
+**2. "New chat" was completely hardcoded — now a real, if
+deterministic, chat title.** `chatTitle` is derived from the first
+user message via `truncateChatTitle()`: collapse whitespace, cut at
+the last whole word inside a 48-character limit (not mid-word), append
+an ellipsis if trimmed. Falls back to "New chat" only before a message
+has actually been sent. This is a deliberate choice to stay
+deterministic rather than call an AI provider to summarize a title —
+consistent with this whole project's founding philosophy (every
+feature works identically with zero AI configured, `NullAdapter`
+fallback everywhere else) — not an oversight or a placeholder for a
+"real" AI version later. If genuinely AI-summarized titles (e.g. "Q3
+Investor Pitch" instead of the literal truncated first message) are
+wanted, that's a distinct, future decision requiring a new backend
+call, not something this entry silently deferred.
+
+**3. Composer format labels: "Slides"/"Document" → "PPT"/"DOCX".**
+Changed in both places that needed it — the composer's own pills in
+`page.tsx`, AND `frontend/lib/export-formats.ts`'s `shortLabel` field
+(ADR-049's single source of truth for format labels, already shared by
+the project editor and the settings page's default-format picker) — so
+this is consistent everywhere in the app, not just the composer. The
+PDF option's `shortLabel` was also tidied from "Document (.pdf)" to
+"PDF (.pdf)" alongside this — it was already a little inconsistent to
+call the PDF option "Document" once DOCX became its own distinct
+label.
+
+**Verification:** Rendered the actual app in a real browser (Playwright
++ Chromium, no system-package install needed since only the browser
+binary itself was required, not `--with-deps`) at a 390×844 mobile
+viewport matching the reported screenshot, and looked at it directly,
+per this doc's own "render and look" convention (Section 5, point 2) —
+confirmed "New chat" now sits fully clear of the reopen button, and
+that sending a message updates the header live to a truncated version
+of it. Also rendered the desktop viewport to confirm the mobile-only
+CSS change doesn't affect it. Could not visually verify the
+authenticated `/settings` page specifically (no live backend + account
+in this sandbox to sign in with) — confirmed at the code level instead,
+since both `/settings` and the project editor read `shortLabel` from
+the one shared file that was edited, not a separate copy. `tsc --noEmit`
+clean, `next build` succeeds, same 9 routes. Full backend suite run
+regardless (500/500) even though this is a frontend-only change — no
+backend file was touched.
+
+*Next entry: ADR-069.*
