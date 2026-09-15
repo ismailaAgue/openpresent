@@ -905,6 +905,28 @@ class PptxExportAdapter(ExportPort):
         except Exception:
             return None
 
+    def _remove_empty_title_placeholder(self, slide):
+        """_render_title_slide builds its own custom, font-fitted title
+        textbox instead of using the layout's inherited title
+        placeholder — needed because _fitting_title_font_size's
+        narrow-column logic has nowhere to hook into a plain
+        placeholder's fixed autosize behavior. But every OTHER layout
+        in this file fills that same inherited placeholder via
+        _add_title_with_accent(); this is the only one that
+        intentionally doesn't. Left alone, an unfilled placeholder
+        isn't just invisibly absent — PowerPoint and LibreOffice both
+        render an empty, textless placeholder as a visible dashed
+        outline box, sitting at the layout's own default title
+        position (a wide strip near the top), regardless of where this
+        function puts its actual title text. That's the empty dashed
+        rectangle every title slide was rendering — confirmed from a
+        real generated deck's screenshots, not a hypothetical. Removing
+        the unused shape outright (there's no "leave it but hide it"
+        option in the OOXML placeholder model) is the fix."""
+        title_shape = slide.shapes.title
+        if title_shape is not None:
+            title_shape._element.getparent().remove(title_shape._element)
+
     def _render_title_slide(self, prs, title_only_layout, slide_data, ctx):
         """Title text and (optional) image are both positioned
         explicitly, in the same left-column/right-column scheme as
@@ -920,6 +942,7 @@ class PptxExportAdapter(ExportPort):
         slide = prs.slides.add_slide(title_only_layout)
         self._apply_background(slide, ctx)
         self._add_corner_decoration(slide, ctx, prs)
+        self._remove_empty_title_placeholder(slide)
 
         image_result = self._maybe_fetch_image(ctx.media, getattr(slide_data, "image_query", None), ctx)
         image_bytes = image_result.image_bytes if image_result else None

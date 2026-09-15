@@ -46,7 +46,15 @@ def build_deterministic_outline(request: GenerationRequest) -> Outline:
 
     slides.append(Slide(
         order=len(slides) + 1, title="Thank You",
-        content_blocks=[ContentBlock(type=BlockType.BULLET, text="Questions?")],
+        # Topic-aware, unlike the plain "Questions?" this used to be —
+        # every OTHER slide in this fallback already references the
+        # topic; the closing slide silently didn't, which made it read
+        # as the most obviously-generic slide in an otherwise
+        # topic-aware (if still generic) deck. Title stays "Thank
+        # You" — quality_validator's CLOSING_TITLE_HINTS already
+        # recognizes it as a real closing slide via that title alone,
+        # so this doesn't change whether a redundant one gets added.
+        content_blocks=[ContentBlock(type=BlockType.BULLET, text=f"Questions about {topic}?")],
     ))
 
     return Outline(structure_source=StructureSource.DETERMINISTIC_TOPIC, slides=slides,

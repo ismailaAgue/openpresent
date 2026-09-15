@@ -200,6 +200,14 @@ def test_engine_passes_requested_language_to_the_closing_slide_fix(monkeypatch):
 
 
 def test_engine_falls_back_to_deterministic_when_ai_pipeline_raises(monkeypatch):
+    import backend.engines.ai_generate as engine_module
+    monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)  # ADR-070 — don't
+    # actually wait through 3 real retry attempts just to prove the
+    # eventual fallback still works; that behavior is what
+    # test_engine_still_falls_back_when_a_stage_fails_every_attempt
+    # and test_call_stage_with_retry_gives_up_after_exhausting_attempts
+    # cover directly — this test's job is only the fallback outcome.
+
     class AlwaysFails:
         def is_available(self):
             return True
@@ -305,3 +313,134 @@ def test_engine_theme_variety_actually_takes_effect(monkeypatch):
     )
     expected = design_module.get_theme_variant("modern_dark")
     assert recipe.theme.color_set_id == expected.color_set_id == "modern_dark"
+
+
+# -- ADR-070: bounded retry around each AI stage call --------------------
+
+def test_deterministic_closing_slide_bullet_references_the_topic():
+    """The closing slide's TITLE stays "Thank You" (so
+    CLOSING_TITLE_HINTS still recognizes it and doesn't append a
+    redundant second one) but the bullet beneath it used to be the
+    completely topic-blind literal string "Questions?" — the one slide
+    in this whole fallback template that didn't reference the topic at
+    all, which read as the most obviously-generic slide in an
+    otherwise at-least-topic-aware deck."""
+    req = GenerationRequest(topic="Renewable Energy", slide_count=5)
+    outline = build_deterministic_outline(req)
+    assert outline.slides[-1].title == "Thank You"
+    assert "Renewable Energy" in outline.slides[-1].content_blocks[0].text
+
+
+def test_call_stage_with_retry_succeeds_immediately_without_retrying(monkeypatch):
+    import backend.engines.ai_generate as engine_module
+    sleeps = []
+    monkeypatch.setattr(engine_module.time, "sleep", lambda s: sleeps.append(s))
+
+    calls = []
+    def fn(x):
+        calls.append(x)
+        return x * 2
+
+    result = engine_module._call_stage_with_retry(fn, 5, stage_name="test_stage")
+    assert result == 10
+    assert calls == [5]  # called exactly once — no retry needed
+    assert sleeps == []  # never slept — nothing failed
+
+
+def test_call_stage_with_retry_recovers_from_one_transient_failure(monkeypatch):
+    """A stage that fails once (a momentary rate limit, say) then
+    succeeds on retry must return the SUCCESSFUL result, not give up
+    after the first failure the way every AI call did before ADR-070."""
+    import backend.engines.ai_generate as engine_module
+    monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)  # don't actually wait in tests
+
+    attempts = []
+    def flaky():
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise ConnectionError("transient network blip")
+        return "success"
+
+    result = engine_module._call_stage_with_retry(flaky, stage_name="test_stage")
+    assert result == "success"
+    assert len(attempts) == 2  # failed once, succeeded on the retry
+
+
+def test_call_stage_with_retry_gives_up_after_exhausting_attempts(monkeypatch):
+    import backend.engines.ai_generate as engine_module
+    monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)
+
+    attempts = []
+    def always_fails():
+        attempts.append(1)
+        raise RuntimeError("provider is fully down")
+
+    with pytest.raises(RuntimeError, match="provider is fully down"):
+        engine_module._call_stage_with_retry(always_fails, stage_name="test_stage")
+    assert len(attempts) == engine_module.STAGE_RETRY_ATTEMPTS  # exhausted, not more, not fewer
+
+
+def test_engine_recovers_when_one_stage_fails_once_then_succeeds(monkeypatch):
+    """End-to-end version of the retry fix: before ADR-070, ANY single
+    failure at ANY of the 4 sequential AI calls discarded the whole
+    AI-generated deck and fell back to build_deterministic_outline's
+    fully generic template — even if 3 of the 4 calls had already
+    succeeded. This is the actual reported symptom (a real deck's
+    closing slide kept coming back as the generic "Thank You" /
+    "Questions?" fallback) traced to its root cause: zero retries
+    anywhere in the AI adapter layer. This fixture's generate_strategy
+    fails exactly once, then succeeds — the engine must still produce
+    the real AI-generated deck, not the deterministic fallback."""
+    import backend.engines.ai_generate as engine_module
+    monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)
+
+    class FlakyThenFineAdapter(FakeFullPipelineAdapter):
+        def __init__(self):
+            super().__init__()
+            self._strategy_attempts = 0
+
+        def generate_strategy(self, request, research=None):
+            self._strategy_attempts += 1
+            if self._strategy_attempts == 1:
+                raise TimeoutError("provider timed out")
+            return super().generate_strategy(request, research)
+
+    fake = FlakyThenFineAdapter()
+    monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: fake)
+    monkeypatch.setattr(registry, "get_research_adapter", lambda: registry.NullResearchAdapter())
+
+    recipe, output_bytes, quality = generate_presentation_from_topic(
+        topic="Ebola", slide_count=4, export_format="pptx",
+    )
+    # The REAL AI-generated deck was used, not the generic fallback —
+    # this is the whole point of the fix.
+    assert recipe.outline.structure_source == StructureSource.AI_GENERATED
+    assert fake._strategy_attempts == 2  # failed once, succeeded on retry
+    assert len(output_bytes) > 0
+
+
+def test_engine_still_falls_back_when_a_stage_fails_every_attempt(monkeypatch):
+    """The all-or-nothing fallback boundary itself is unchanged — a
+    GENUINELY down provider (fails all STAGE_RETRY_ATTEMPTS attempts,
+    not just a transient blip) must still land on the deterministic
+    template, exactly as before ADR-070. Retries make transient
+    failures resilient; they don't (and shouldn't) mask a hard,
+    persistent failure."""
+    import backend.engines.ai_generate as engine_module
+    monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)
+
+    class AlwaysFailsAdapter:
+        def is_available(self):
+            return True
+
+        def generate_strategy(self, request, research=None):
+            raise RuntimeError("provider is fully down")
+
+    monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: AlwaysFailsAdapter())
+    monkeypatch.setattr(registry, "get_research_adapter", lambda: registry.NullResearchAdapter())
+
+    recipe, output_bytes, quality = generate_presentation_from_topic(
+        topic="Ebola", slide_count=4, export_format="pptx",
+    )
+    assert recipe.outline.structure_source == StructureSource.DETERMINISTIC_TOPIC
+    assert len(output_bytes) > 0
