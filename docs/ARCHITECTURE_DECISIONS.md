@@ -3394,3 +3394,113 @@ UX decision from "don't show an empty panel before there's anything to
 show," which is what was actually reported — not bundled in here.
 
 *Next entry: ADR-070.*
+
+---
+
+## ADR-070 — Empty Placeholder Box on Every Title Slide; Zero Retries Behind the Recurring Generic Closing Slide
+
+**Status:** Accepted.
+
+**Decision:** Two unrelated bugs, both reported from real generated
+decks' screenshots (COVID-19 and Ebola topics), both traced to actual
+root causes rather than patched at the symptom.
+
+**1. The empty dashed box.** `_render_title_slide()` builds its own
+custom, font-fitted title textbox instead of using the slide layout's
+inherited title placeholder — needed because
+`_fitting_title_font_size()`'s narrow-column sizing logic has nowhere
+to hook into a plain placeholder's fixed autosize behavior. Every
+OTHER layout in this file fills that same inherited placeholder via
+`_add_title_with_accent()`; this was the one layout that intentionally
+didn't, and it never removed the now-unused placeholder either. Left
+on the slide with no text set, PowerPoint and LibreOffice both render
+an empty placeholder as a visible dashed-outline box — sitting at the
+layout's own default title position (a wide strip near the top),
+completely independent of where this function actually put the real
+title text or image. That's the box in both screenshots. Fixed with a
+new `_remove_empty_title_placeholder()` helper, called right after the
+slide is created — there's no "leave it but hide it" option in the
+OOXML placeholder model, only remove-or-keep.
+
+**Worth stating plainly: an existing test had a loophole that let this
+exact bug hide.** `test_no_shape_extends_past_slide_boundaries`
+explicitly skips any shape with no text and no picture, treating it as
+"decorative by design" — which is precisely what an accidental
+leftover placeholder also looks like to that check. Two new, more
+specific tests check directly for a leftover placeholder shape instead
+of relying on that looser net — one for the title slide's with-image
+branch, one for its no-image branch (`_render_title_slide` has two
+separate code paths, both needed the fix, both needed a test).
+
+**2. The recurring generic "Thank You" / "Questions?" closing slide —
+confirmed the user's own hypothesis.** The topic-first pipeline
+(`_run_ai_pipeline`) makes 4 sequential AI calls — strategy, outline
+structure, slide content, layout — and, by original design (a
+deliberate all-or-nothing boundary, not itself wrong), ANY single
+failure at ANY of those 4 stages discarded the entire AI-generated
+outline and fell back to `build_deterministic_outline()`, whose
+closing slide was a hardcoded, completely topic-blind
+`title="Thank You"` / `text="Questions?"`. The actual bug: **zero
+retries existed anywhere in the AI adapter layer** — a single
+transient failure (a rate limit, a momentary network blip, one
+malformed-JSON response) on just ONE of the 4 calls was silently
+throwing away THREE other calls that had already succeeded, on every
+occurrence. This matches "AI call shortage" exactly.
+
+Fixed with `_call_stage_with_retry()` — a bounded retry (3 attempts,
+1s/2s exponential backoff) wrapped around each of the 4 stage calls,
+before the existing all-or-nothing boundary gives up. A genuinely,
+persistently broken provider still correctly falls back after
+exhausting all 3 attempts — retries make transient failures resilient,
+they don't (and shouldn't) mask a hard, persistent one. Can't
+distinguish a retryable error from a non-retryable one generically
+(the AI Port abstracts over several providers with different exception
+shapes) — a stated simplification: a hard failure just takes a few
+extra seconds to reach the same, already-correct fallback it would
+have reached immediately before, never worse than before, strictly
+better for the transient case.
+
+**Complementary, lower-risk fix alongside it:** the deterministic
+fallback's closing slide bullet is now topic-aware — "Questions about
+{topic}?" instead of the bare, completely generic "Questions?" — so
+even a genuine, persistent full-fallback (all 3 retries exhausted)
+doesn't read as jarringly blank as before. The title stays "Thank
+You," unchanged — `CLOSING_TITLE_HINTS` already recognizes it via that
+title alone, so this doesn't affect whether `_ensure_closing_slide`
+adds a redundant one.
+
+**Scope, stated explicitly:** the document-upload pipeline
+(`backend/engines/generate.py`) was deliberately left untouched. It
+has a fundamentally different, lower-risk shape already — it starts
+from a rule-based, document-derived outline (`structure.build_outline`)
+and only uses a SINGLE AI call as an enhancement layer on top
+(`ai.propose_structure`), with its own try/except that keeps the
+already-substantive rule-based outline on failure. There's no
+all-or-nothing 4-call chain to protect there, and the user's report was
+specifically about topic generation — extending retry logic there
+would be a reasonable, distinct follow-up, not something silently
+bundled into this fix.
+
+**Verification:** Rendered actual decks through both the with-image
+and forced-fallback paths, converted via `soffice --headless` → PDF →
+`pdftoppm` → JPEG, and looked at them directly — an "Ebola:
+Confronting a Deadly Pathogen..." title slide with a real image and NO
+dashed box (same topic as the reported screenshot), and a
+force-failed-provider deck whose closing slide correctly reads
+"Questions about Ebola Outbreak Response?" after 2 logged retries and
+a clean fall to `DETERMINISTIC_TOPIC`. 8 new tests: the retry helper
+directly (succeeds without retrying, recovers from one failure,
+exhausts attempts and re-raises), an end-to-end "one stage fails once
+then succeeds -> real AI deck still produced, not the fallback" test,
+an end-to-end "a stage fails every attempt -> fallback still correctly
+triggered" test, the topic-aware closing-slide bullet, and the 2
+leftover-placeholder tests. Also fixed a real side effect found while
+testing: one pre-existing test didn't mock `time.sleep` and started
+silently taking 3 real wall-clock seconds per run once retries
+existed — fixed by mocking it there too, same as every new retry test
+does. Full backend suite, 3 consecutive runs (this touches shared
+generation/rendering code): 508/508 every time, ~21s each (unchanged
+from before this fix — confirming no test is silently sleeping for
+real).
+
+*Next entry: ADR-071.*

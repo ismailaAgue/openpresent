@@ -27,10 +27,18 @@ half-AI/half-broken deck. This is a deliberate all-or-nothing boundary
 around the AI portion of the pipeline: partially trusting an outline
 that failed partway through validation would be worse than a clean,
 fully-deterministic fallback.
+
+ADR-070 — each of the 4 sequential calls in that chain now gets a
+bounded retry (3 attempts, short exponential backoff) BEFORE this
+all-or-nothing boundary gives up — see _call_stage_with_retry. A
+single transient failure (a rate limit, a momentary network blip) no
+longer has to discard 3 other calls that already succeeded just
+because the 4th one hiccuped once.
 """
 
 import os
 import random
+import time
 import uuid
 from typing import Callable
 from backend.adapters import registry
@@ -67,6 +75,52 @@ def _report(on_stage: Callable[[str], None] | None, stage: str) -> None:
         # Progress reporting is best-effort only — must never break or
         # slow down an otherwise-successful generation.
         capture_exception(e, tags={"stage": "progress_report"})
+
+
+STAGE_RETRY_ATTEMPTS = 3  # the call itself, plus up to 2 retries
+STAGE_RETRY_BASE_DELAY = 1.0  # seconds; doubles each retry (1s, 2s)
+
+
+def _call_stage_with_retry(fn: Callable, *args, stage_name: str, **kwargs):
+    """A single transient failure — a provider rate limit, a momentary
+    network blip, one malformed-JSON response — at ANY ONE of this
+    pipeline's 4 sequential AI calls used to be enough to discard the
+    ENTIRE AI-generated deck: _run_ai_pipeline's outer try/except
+    catches everything and returns None, and the caller then falls all
+    the way back to build_deterministic_outline's fully generic,
+    topic-blind template — hardcoded "Thank You" / "Questions?"
+    closing slide chief among the obviously-generic tells, but really
+    every slide in that fallback is equally generic, not just the
+    last one. This was a real, reported pattern ("keeps returning
+    Thank You"), not a hypothetical: with zero retries anywhere in the
+    AI adapter layer, a rate-limited account or a flaky provider would
+    turn almost every generation into the bland fallback, even though
+    3 of the 4 calls in the chain may have already succeeded.
+
+    Retrying the ONE failing call, a bounded few times with a short
+    backoff, before giving up on the whole pipeline, means a single
+    transient hiccup no longer throws away calls that already
+    succeeded. This can't distinguish a genuinely transient error
+    (worth retrying) from a hard one — bad API key, provider fully
+    down, consistently malformed output (not worth retrying, will just
+    fail the same way 3 times) — since the AI Port abstracts over
+    several providers with different exception shapes; that's a stated
+    simplification, not a claim of correctness. A hard failure just
+    takes a few extra seconds to reach the same, already-correct
+    deterministic fallback it would have reached immediately before —
+    strictly better for the transient case, never worse for the
+    already-failing one."""
+    last_exc: Exception | None = None
+    for attempt in range(STAGE_RETRY_ATTEMPTS):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < STAGE_RETRY_ATTEMPTS - 1:
+                add_breadcrumb("ai_pipeline", f"{stage_name} failed, retrying",
+                                data={"attempt": attempt + 1, "error": str(e)[:200]})
+                time.sleep(STAGE_RETRY_BASE_DELAY * (2 ** attempt))
+    raise last_exc
 
 
 def generate_presentation_from_topic(
@@ -172,20 +226,24 @@ def _run_ai_pipeline(request: GenerationRequest, on_stage: Callable[[str], None]
             research_brief = None  # research is optional — proceed without it, not fatal
 
     try:
-        strategy = pipeline.generate_strategy(request, research_brief)
+        strategy = _call_stage_with_retry(pipeline.generate_strategy, request, research_brief,
+                                           stage_name="generate_strategy")
         add_breadcrumb("ai_pipeline", "strategy generated",
                         data={"narrative_style": strategy.narrative_style})
 
         _report(on_stage, STAGE_OUTLINE)
-        structure = pipeline.generate_outline_structure(request, strategy)
+        structure = _call_stage_with_retry(pipeline.generate_outline_structure, request, strategy,
+                                            stage_name="generate_outline_structure")
         add_breadcrumb("ai_pipeline", "outline structure generated", data={"slides": len(structure)})
 
         _report(on_stage, STAGE_CONTENT)
-        outline = pipeline.generate_slide_content(request, strategy, structure)
+        outline = _call_stage_with_retry(pipeline.generate_slide_content, request, strategy, structure,
+                                          stage_name="generate_slide_content")
         add_breadcrumb("ai_pipeline", "slide content generated")
 
         _report(on_stage, STAGE_LAYOUT)
-        outline = pipeline.plan_layout(outline, request)
+        outline = _call_stage_with_retry(pipeline.plan_layout, outline, request,
+                                          stage_name="plan_layout")
         add_breadcrumb("ai_pipeline", "layout planned")
 
         return outline

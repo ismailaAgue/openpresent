@@ -80,6 +80,54 @@ def test_title_slide_text_never_overlaps_image(monkeypatch):
             )
 
 
+def test_title_slide_has_no_leftover_empty_placeholder(monkeypatch):
+    """Regression test for a real bug found from actual generated
+    decks' screenshots: _render_title_slide builds its own custom,
+    font-fitted title textbox instead of using the layout's inherited
+    title placeholder, but never removed that now-unused placeholder —
+    left on the slide with no text set, PowerPoint/LibreOffice both
+    render it as a visible dashed-outline box, sitting at the layout's
+    own default title position regardless of where the real title text
+    actually is. Notably, test_no_shape_extends_past_slide_boundaries
+    (below) would NOT have caught this — it explicitly skips any shape
+    with no text and no picture as 'decorative by design', which is
+    exactly what an accidental leftover placeholder looks like too.
+    This test checks specifically for a placeholder shape instead of
+    relying on that boundary check's looser net."""
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    prs = _generate_with_fake_image(monkeypatch, "**Ebola: Confronting a Deadly Pathogen**\n\nSome content here.")
+    title_slide = prs.slides[0]
+    leftover_placeholders = [s for s in title_slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PLACEHOLDER]
+    assert not leftover_placeholders, (
+        f"title slide has {len(leftover_placeholders)} leftover placeholder shape(s) — "
+        f"these render as an empty dashed box in PowerPoint/LibreOffice"
+    )
+
+
+def test_title_slide_without_an_image_also_has_no_leftover_placeholder(monkeypatch):
+    """Same bug, the other branch: _render_title_slide's no-image path
+    is a separate code path (single full-width textbox, no image
+    column) that also never touched the inherited placeholder."""
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    from backend.adapters import registry as reg
+
+    class NoImageMediaAdapter:
+        def is_available(self):
+            return False
+
+    monkeypatch.setattr(reg, "get_media_adapter", lambda: NoImageMediaAdapter())
+    from backend.engines.generate import generate_presentation
+    recipe, pptx_bytes = generate_presentation(
+        file_bytes=b"**A Presentation With No Image At All**\n\nSome content here.",
+        filename="doc.txt",
+    )
+    prs = Presentation(io.BytesIO(pptx_bytes))
+    title_slide = prs.slides[0]
+    assert not _picture_shapes(title_slide), "expected no image for this test to exercise the right branch"
+    leftover_placeholders = [s for s in title_slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PLACEHOLDER]
+    assert not leftover_placeholders
+
+
 def test_content_slide_title_never_overlaps_image(monkeypatch):
     """Regression test: a content slide's title was measured with an
     image's bounding box completely containing the title's bounding
