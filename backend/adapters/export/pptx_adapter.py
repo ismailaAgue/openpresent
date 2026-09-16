@@ -127,6 +127,26 @@ def _extract_chartable_stats(stats: list[str]) -> list[tuple[str, str, float]] |
     return parsed
 
 
+def _truncate_stat_label(text: str, max_chars: int = 130) -> str:
+    """Defensive cap for _render_editorial_stats_slide's label text —
+    that layout budgets a fixed, equal row height across up to 4
+    stats, sized for a short caption, not a full sentence. Real
+    AI-generated content sometimes produces a paragraph-length "label"
+    instead (confirmed from an actual generated deck's screenshots) —
+    left alone, even WRAPPED text that long would overflow a fixed-
+    height row into the one below it. Cuts at the last whole word
+    inside the limit, matching the same pattern used for chat titles
+    (frontend/app/page.tsx's truncateChatTitle) and stat chips
+    elsewhere in this file — consistent behavior for "too long for a
+    caption-sized space" everywhere it comes up, not a one-off rule."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_chars:
+        return collapsed
+    cut = collapsed[:max_chars]
+    last_space = cut.rfind(" ")
+    return (cut[:last_space] if last_space > 20 else cut).rstrip() + "…"
+
+
 def _tint(rgb: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
     """Lightens a color by blending it toward white. amount=0 returns
     the original color, amount=1 returns white. Used for stat-chip
@@ -723,7 +743,26 @@ class PptxExportAdapter(ExportPort):
         'OpenPresent treats statistics as text; the reference deck
         treats them as design elements.' Each stat's number is pulled
         out and set large or with an accent color; the label sits
-        small and muted beneath it; a thin rule separates each row."""
+        small and muted beneath it; a thin rule separates each row.
+
+        ADR-071 — confirmed from a real generated deck's screenshots: 3
+        of 11 slides had label text spilling off BOTH slide edges,
+        overlapping the title. Root cause: python-pptx's add_textbox()
+        defaults to wrap="none" with shape auto-fit — the number/label
+        boxes below never set word_wrap, so any label longer than a
+        couple words rendered as one long unwrapped line, auto-growing
+        the shape (and overflowing the slide) instead of staying inside
+        its declared width. word_wrap=True on both fixes the rendering
+        bug outright. Separately, this layout budgets a fixed, equal
+        row height across up to 4 stats, sized for a short caption (a
+        few words) — real AI output sometimes hands this a
+        paragraph-length "label" instead (confirmed from the same real
+        deck), which would still overflow into the row below even once
+        wrapped. _truncate_stat_label() below is a defensive cap for
+        that — the right long-term fix is upstream content shaping
+        keeping these short in the first place (this rendering layer
+        has no way to ask for a rewrite), so this is a safety net, not
+        a substitute for that."""
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         self._apply_background(slide, ctx)
         slide_width, slide_height = prs.slide_width, prs.slide_height
@@ -757,12 +796,16 @@ class PptxExportAdapter(ExportPort):
             else:
                 number_part, label_part = stat_text, ""
             num_box = slide.shapes.add_textbox(panel_left + pad, row_top + ctx.Inches(0.15), panel_width - (2 * pad), ctx.Inches(0.55))
+            num_box.text_frame.word_wrap = True
             np_ = num_box.text_frame.paragraphs[0]
             np_.text = number_part
             number_size = 26 if len(number_part) <= 8 else 18
             ctx.style_run(np_, size=number_size, color=(ctx.accent_color if i % 2 == 0 else ctx.title_color), bold=True)
             if label_part:
-                lbl_box = slide.shapes.add_textbox(panel_left + pad, row_top + ctx.Inches(0.68), panel_width - (2 * pad), ctx.Inches(0.4))
+                label_part = _truncate_stat_label(label_part)
+                label_height = max(ctx.Inches(0.4), row_height - ctx.Inches(0.68) - ctx.Inches(0.15))
+                lbl_box = slide.shapes.add_textbox(panel_left + pad, row_top + ctx.Inches(0.68), panel_width - (2 * pad), label_height)
+                lbl_box.text_frame.word_wrap = True
                 lp = lbl_box.text_frame.paragraphs[0]
                 lp.text = label_part.upper()
                 ctx.style_run(lp, size=9, color=ctx.text_color)

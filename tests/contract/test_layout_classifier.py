@@ -90,10 +90,20 @@ def test_process_not_triggered_by_single_sequential_word():
     assert classify_layout(slide) == "bullet_list"
 
 
-def test_export_renders_process_slide_as_numbered_steps():
+def test_export_renders_process_slide_as_numbered_steps(monkeypatch):
+    """Tests the shared, non-editorial process renderer (numbered-step
+    badges) specifically. editorial_cream is now the default theme for
+    a document upload with none requested (ADR-071) and has no
+    process-specific renderer of its own (falls back to a themed
+    bullet list, same stated ADR-062 scope limitation as comparison
+    slides) — pin the non-editorial default explicitly rather than
+    relying on what "no theme requested" happens to resolve to."""
     from backend.engines.generate import generate_presentation
+    from backend.adapters.design import rule_based
     from pptx import Presentation
     import io
+
+    monkeypatch.setitem(rule_based._KNOWN_THEMES, "editorial_cream", rule_based._KNOWN_THEMES["default"])
 
     source = (
         "**Onboarding**\n\n"
@@ -119,13 +129,20 @@ def test_export_renders_process_slide_as_numbered_steps():
     assert "Finally," not in all_text
 
 
-def test_export_renders_statistics_slide_as_separate_textboxes():
+def test_export_renders_statistics_slide_as_separate_textboxes(monkeypatch):
     """End-to-end: confirms the export adapter actually draws distinct,
     non-overlapping shapes for a statistics slide, not just that the
-    layout_type field gets set."""
+    layout_type field gets set. Tests the shared, non-editorial stats
+    renderer specifically — editorial_cream (now the default for a
+    document upload with no theme requested, ADR-071) renders stats as
+    its own stacked sidebar panel (ADR-062), a deliberately different
+    shape count/layout — pin the non-editorial default explicitly."""
     from backend.engines.generate import generate_presentation
+    from backend.adapters.design import rule_based
     from pptx import Presentation
     import io
+
+    monkeypatch.setitem(rule_based._KNOWN_THEMES, "editorial_cream", rule_based._KNOWN_THEMES["default"])
 
     source = (
         "**Report**\n\n"
@@ -145,10 +162,21 @@ def test_export_renders_statistics_slide_as_separate_textboxes():
     assert left_positions[0] != left_positions[1] != left_positions[2]  # genuinely side by side
 
 
-def test_export_renders_comparison_slide_as_two_columns():
+def test_export_renders_comparison_slide_as_two_columns(monkeypatch):
+    """Tests the shared, non-editorial comparison renderer specifically
+    — editorial_cream has its own, deliberately different, stated
+    scope limitation here (ADR-062: comparison/process fall back to a
+    themed bullet-list, not two columns), and is now the DEFAULT theme
+    for a document upload with none requested (ADR-071), so this test
+    pins the non-editorial default explicitly rather than relying on
+    what "no theme requested" happens to resolve to — that's no longer
+    a safe assumption to leave implicit."""
     from backend.engines.generate import generate_presentation
+    from backend.adapters.design import rule_based
     from pptx import Presentation
     import io
+
+    monkeypatch.setitem(rule_based._KNOWN_THEMES, "editorial_cream", rule_based._KNOWN_THEMES["default"])
 
     source = (
         "**Renewable vs Fossil Fuels**\n\n"

@@ -16,6 +16,7 @@ import io
 from unittest.mock import MagicMock
 from PIL import Image
 from pptx import Presentation
+from pptx.util import Inches
 from backend.adapters.export.pptx_adapter import PptxExportAdapter, CHIP_NUMBER_PATTERN
 from backend.models.recipe import Recipe, Outline, Slide, ContentBlock, BlockType, StructureSource, Theme
 from backend.models.media import ImageResult
@@ -112,6 +113,73 @@ def test_editorial_stats_slide_renders_a_sidebar_panel_not_a_row():
              if s.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE and "RECTANGLE" in str(getattr(s, "auto_shape_type", ""))]
     # panel background + top bar + 1 divider (2 stats = 1 divider between them)
     assert len(rects) >= 3
+
+
+def test_truncate_stat_label_passes_short_text_through_unchanged():
+    from backend.adapters.export.pptx_adapter import _truncate_stat_label
+    assert _truncate_stat_label("global warming since 1880") == "global warming since 1880"
+
+
+def test_truncate_stat_label_cuts_long_text_on_a_word_boundary():
+    from backend.adapters.export.pptx_adapter import _truncate_stat_label
+    long_text = ("Historic precedent: AfD won percent of votes (39 of 83 seats) "
+                 "in the state parliament elections, marking the first time since 1945 "
+                 "that a far-right party has achieved this level of representation")
+    result = _truncate_stat_label(long_text, max_chars=110)
+    assert len(result) <= 111  # +1 for the ellipsis character
+    assert result.endswith("…")
+    # every word present (besides the trailing ellipsis) must be a
+    # COMPLETE word from the original — never a fragment of one
+    for w in result.rstrip("…").split():
+        assert w in long_text.split(), f"'{w}' looks like a mid-word cut"
+
+
+def test_editorial_stats_slide_label_boxes_wrap_instead_of_overflowing(monkeypatch):
+    """Regression test for a real, severe bug found from an actual
+    generated deck's screenshots: 3 of 11 slides had label text
+    spilling off BOTH slide edges and overlapping the title. Root
+    cause: add_textbox() defaults to wrap="none" — never explicitly
+    turned on here, so any label longer than a couple words rendered
+    unwrapped, auto-growing the shape past the slide boundary in both
+    directions instead of staying inside its declared width."""
+    long_label = ("Historic precedent: AfD won percent of votes thirty nine of "
+                   "eighty three seats in the state parliament elections marking "
+                   "the first time since nineteen forty five")
+    slides = [
+        Slide(order=1, title="Cover", content_blocks=[]),
+        Slide(order=2, title="Political Shift in Germany", content_blocks=[
+            ContentBlock(type=BlockType.BULLET, text=f"43.8% {long_label}"),
+            ContentBlock(type=BlockType.BULLET, text="17.2% Crisis of traditional parties under new leadership"),
+        ], layout_type="statistics"),
+    ]
+    prs = _render(make_recipe(slides=slides))
+    stats_slide = prs.slides[1]
+
+    # Scope to the panel's own number/label textboxes specifically —
+    # the kicker ("01 — ...") is a different shape on the LEFT side,
+    # and the footer page number ("02 / 02") sits BELOW the panel —
+    # both are deliberately short, fixed, single-line text by design
+    # and neither is something this fix touches.
+    panel_left = int(prs.slide_width * 0.58)
+    panel_top = Inches(0.55)
+    panel_bottom = prs.slide_height - Inches(0.9)
+    text_boxes = [
+        s for s in stats_slide.shapes
+        if s.has_text_frame and s.text_frame.text.strip()
+        and s.left >= panel_left and panel_top <= s.top <= panel_bottom
+    ]
+    assert text_boxes, "expected at least the number/label textboxes to be present"
+    for box in text_boxes:
+        assert box.text_frame.word_wrap is True, (
+            f"textbox {box.text_frame.text[:30]!r} doesn't wrap — "
+            f"this is exactly the bug that let text spill off both slide edges"
+        )
+        # No shape should extend past the slide's own boundaries — the
+        # literal, visible symptom from the real bug report.
+        assert box.left >= 0, f"shape starts left of the slide: {box.text_frame.text[:30]!r}"
+        assert box.left + box.width <= prs.slide_width, (
+            f"shape extends past the right edge of the slide: {box.text_frame.text[:30]!r}"
+        )
 
 
 def test_editorial_content_slide_with_image_has_no_footer_deck_title_collision():
