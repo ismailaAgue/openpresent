@@ -76,7 +76,21 @@ class RuleBasedDesignAdapter(DesignPort):
         if theme.layout_template_id != "default":
             resolved_theme = theme  # caller explicitly requested a theme — respect it
         else:
-            theme_key = "academic" if outline.document_type in _SERIF_DOCUMENT_TYPES else "default"
+            # ADR-071 — editorial_cream is now the default for the
+            # document-upload path too, not just topic-first generation
+            # (variety.pick_theme_variant). Before this, a document
+            # upload with no theme explicitly requested could ONLY ever
+            # land on "default" (plain neutral) or "academic" (blue) —
+            # none of the 7 other themes added since ADR-030/059/062,
+            # editorial_cream included, were ever reachable here at
+            # all. Confirmed safe: editorial's own renderers
+            # (_render_editorial_content_slide/_title_slide) already
+            # degrade gracefully with no image available (falls back to
+            # a full-width text layout, not a broken half-empty one) —
+            # a real property to check, not assumed, since a document
+            # upload with no media provider configured is a common,
+            # ordinary case, not an edge case.
+            theme_key = "academic" if outline.document_type in _SERIF_DOCUMENT_TYPES else "editorial_cream"
             resolved_theme = _KNOWN_THEMES[theme_key]
 
         if not ai_layout_planned:

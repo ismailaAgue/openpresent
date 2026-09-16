@@ -132,7 +132,17 @@ def test_content_slide_title_never_overlaps_image(monkeypatch):
     """Regression test: a content slide's title was measured with an
     image's bounding box completely containing the title's bounding
     box in real generated output (title top=274638 fully inside image
-    range [0, 1920240])."""
+    range [0, 1920240]). Tests the shared, non-editorial content-slide
+    renderer specifically, via its native title placeholder
+    (content_slide.shapes.title) — editorial_cream (now the default
+    for a document upload with no theme requested, ADR-071) has no
+    native title placeholder at all by design (a blank layout with its
+    own manual title textbox, same as the title-slide fix in ADR-070),
+    so pin the non-editorial default explicitly rather than relying on
+    what "no theme requested" happens to resolve to."""
+    from backend.adapters.design import rule_based
+    monkeypatch.setitem(rule_based._KNOWN_THEMES, "editorial_cream", rule_based._KNOWN_THEMES["default"])
+
     prs = _generate_with_fake_image(
         monkeypatch,
         "**Quantum Entanglement: The Nonlocal Structure of Reality**\n\n"

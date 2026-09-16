@@ -14,10 +14,12 @@ Two independent axes of variety:
    quality for the sake of variety, which the Quality Philosophy
    (spec Section 1) explicitly says should never happen.
 
-2. Visual theme — a color/font variant, picked independently and
-   genuinely randomly (see backend/adapters/design/rule_based.py's
-   _KNOWN_THEMES), since visual variety doesn't carry the same
-   topic-fit risk narrative structure does.
+2. Visual theme — a color/font variant, picked independently (see
+   backend/adapters/design/rule_based.py's _KNOWN_THEMES). ADR-071 —
+   no longer a flat uniform random pick across all 9 variants:
+   editorial_cream is now weighted heavily as the de facto default
+   (see pick_theme_variant), a deliberate product decision, while the
+   others remain reachable for genuine variety.
 
 For the deterministic (no-AI) fallback path
 (backend/pipeline/deterministic_topic_outline.py), narrative style
@@ -86,7 +88,20 @@ def suggest_style() -> dict:
 
 
 def pick_theme_variant() -> str:
-    """Genuinely random — visual variety carries no topic-fit risk,
-    unlike narrative structure. Callers that already have an explicit
-    theme requested should skip this entirely."""
-    return random.choice(THEME_VARIANT_IDS)
+    """ADR-071 — editorial_cream is now the dominant default for
+    topic-first generation: a direct, explicit product decision
+    (a real reference deck's design was preferred outright over the
+    prior spread of 9 equally-likely themes), not an incidental
+    side-effect of this function. Weighted heavily toward
+    editorial_cream rather than switched to it outright — the other 8
+    variants remain real, reachable options (a person can still land
+    on one, or explicitly request one), preserving SOME of what
+    ADR-030's original variety mechanism was for, while making the
+    editorial aesthetic what most generations actually look like,
+    matching the explicit "I want it to be like this from now on"
+    direction. 75% is a stated, roughly-chosen weight — there was no
+    request for an exact number, and 100% would have quietly deleted 8
+    themes' worth of working functionality no one asked to remove."""
+    if random.random() < 0.75:
+        return "editorial_cream"
+    return random.choice([v for v in THEME_VARIANT_IDS if v != "editorial_cream"])

@@ -3504,3 +3504,112 @@ from before this fix — confirming no test is silently sleeping for
 real).
 
 *Next entry: ADR-071.*
+
+---
+
+## ADR-071 — Editorial Stats Overflow Bug Fixed; editorial_cream Made the Default Theme
+
+**Status:** Accepted.
+
+**Decision:** A real deck (uploaded directly, confirmed as
+OpenPresent's own output — its Russian closing slide matches
+ADR-064's `CLOSING_SLIDE_TEXT["ru"]` exactly) showed 3 of 11 slides
+severely broken: label text spilling off BOTH slide edges, overlapping
+the title. The other 8 slides — title, bullet+image, closing — looked
+genuinely good, and the person asked for this look (or "a variation of
+it") to become the standard going forward, not just one of 9
+equally-likely options.
+
+**1. The overflow bug — root cause, not a workaround.**
+`_render_editorial_stats_slide()`'s per-stat number/label textboxes
+never set `word_wrap`. `add_textbox()` defaults to `wrap="none"` with
+shape auto-fit — so any label longer than a couple words rendered as
+ONE long unwrapped line, the shape auto-growing (in both directions
+from around its center, based on the actual overflow pattern) past the
+slide boundary instead of staying inside its declared width. Every
+label in the reported deck was a full sentence, not a short caption —
+this bug was effectively guaranteed to fire, not an edge case. Fixed
+with `word_wrap = True` on both boxes.
+
+**Second, related issue, same slides:** this layout budgets a fixed,
+equal row height across up to 4 stats, sized for a short caption. Even
+with wrapping turned on, a paragraph-length label would still overflow
+into the next row. Added `_truncate_stat_label()` — cuts at the last
+whole word inside a 130-char limit, the same "truncate on a word
+boundary" pattern already used for chat titles (frontend) and stat
+chips elsewhere in this same file. Stated explicitly: the durable fix
+is upstream content shaping keeping these labels short in the first
+place; this rendering layer has no way to ask for a rewrite, so this
+is a safety net, not a substitute for that.
+
+**2. editorial_cream made the default, not just an available option.**
+Two separate selection mechanisms existed, both changed:
+
+- **Topic-first generation** (`variety.pick_theme_variant()`): was a
+  flat uniform random choice across all 9 themes (~11% each).
+  Reweighted to 75% editorial_cream, 25% split across the other 8. A
+  deliberate, explicit product decision — not switched to 100%,
+  since that would have quietly deleted 8 themes' worth of working
+  functionality no one asked to remove; "or a variation of this" reads
+  as wanting continued variety, not a single static look.
+
+- **Document upload** (`RuleBasedDesignAdapter.apply_theme`): before
+  this, a document with no theme explicitly requested could ONLY ever
+  resolve to `"default"` (plain neutral) or `"academic"` (for
+  academic/lecture document types) — none of the 7 other themes added
+  since ADR-030/059/062, editorial_cream included, were EVER reachable
+  from this path. Now resolves to `editorial_cream` for anything that
+  isn't academic/lecture. Confirmed safe before making this the
+  default, not assumed: editorial's content/title renderers already
+  degrade gracefully with no image available (fall back to a
+  full-width text layout, not a broken half-empty one) — rendered and
+  looked at an actual no-image document-upload deck to confirm this
+  directly, since "no media provider configured" is an ordinary case
+  for this path, not a rare edge case.
+
+**A real, non-obvious side effect this surfaced, and how it was
+fixed — not silently worked around:** making editorial_cream the
+deterministic document-upload default broke 4 existing tests that
+called `generate_presentation()` without pinning a theme, then
+asserted on structure specific to the non-editorial renderers —
+comparison-as-two-columns, process-as-numbered-steps,
+statistics-as-separate-textboxes, and content-slide title/image
+collision via the native `.shapes.title` placeholder. None of these
+were wrong tests or flaky — they were testing real, still-correct
+behavior of the SHARED, non-editorial renderers, which is a stated,
+pre-existing ADR-062 scope limitation (editorial has no
+comparison/process-specific treatment, falls back to a themed bullet
+list; no native title placeholder, uses its own manual textbox like
+the ADR-070 title-slide fix). That behavior didn't change — what
+changed is that "no theme requested" no longer reaches it by default.
+Fixed by having each test explicitly pin the non-editorial default via
+`monkeypatch.setitem(rule_based._KNOWN_THEMES, "editorial_cream",
+rule_based._KNOWN_THEMES["default"])` — keeping the full, realistic
+`generate_presentation()` pipeline (classify_layout, image handling,
+etc.) exercised end-to-end, rather than rewriting them to construct a
+Recipe by hand and lose that coverage.
+
+**Verification:** Rendered the exact kind of verbose, sentence-length
+label text from the reported deck through the fixed stats renderer, at
+both 3-stat and 4-stat row budgets, converted via `soffice --headless`
+→ PDF → `pdftoppm` → JPEG, and looked at them directly — clean
+wrapping, correct truncation, no overflow, no overlap in either case.
+Also rendered an actual no-image document-upload deck end to end and
+confirmed the editorial default degrades cleanly. 3 new tests for the
+overflow fix (word-wrap-is-set, no-shape-past-slide-bounds, and the
+truncation helper's word-boundary behavior), a new test file for
+`RuleBasedDesignAdapter`'s default resolution (no prior direct
+coverage existed), and a new test file for `variety.py`'s weighted
+selection (statistical: 1000 draws, editorial_cream share must exceed
+60%, and at least one other theme must still appear — both properties
+of the real function, not a mocked stand-in). Full backend suite, 5
+consecutive runs (given the new randomness involved): 518/518 every
+time.
+
+**Stated scope, not built this round:** "or a variation of this" could
+reasonably mean multiple editorial-family color palettes (different
+accent colors on the same layout skeleton), not just one. Didn't
+invent new palettes without the person's input on what those should
+actually look like — a real, reasonable follow-up, not an oversight.
+
+*Next entry: ADR-072.*
