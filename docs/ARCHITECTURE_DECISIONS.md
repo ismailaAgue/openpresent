@@ -3613,3 +3613,170 @@ invent new palettes without the person's input on what those should
 actually look like — a real, reasonable follow-up, not an oversight.
 
 *Next entry: ADR-072.*
+
+---
+
+## ADR-072 — Cost Circuit Breaker Removed; Topic-First Generation No Longer Falls Back When AI Is Unavailable
+
+**Status:** Accepted.
+
+**Decision:** Two explicit, direct product/architecture decisions,
+both reversing previously-deliberate safety mechanisms — implemented,
+not just discussed, with the real tradeoff of each stated plainly
+rather than quietly accepted.
+
+**1. The cost circuit breaker (ADR-043) is gone.** Deleted
+`backend/ports/quota.py`, both implementations
+(`backend/adapters/quota/sqlite_adapter.py`,
+`.../postgres_quota.py`), `registry.get_quota_adapter()` and its
+lazy-singleton state, `_enforce_generation_quota()` and its helpers in
+`api/main.py`, and all 4 call sites (sync and async, topic and
+document generation) that gated work behind it. `tests/contract/test_quota_port.py`
+deleted outright; the 4 quota-specific tests inside
+`test_api_http.py` (daily-limit blocking, gate-runs-before-work,
+per-user keying) removed along with the mechanism they tested, not
+left disabled.
+
+**Stated plainly, not hidden in a diff:** this port existed
+specifically because, per the original handoff doc, "a single
+generation can trigger 6+ AI calls... nothing caps spend." That
+statement is true again now. There is no per-user, per-day, or
+per-IP limit on generation requests anymore. This is a real,
+reintroduced cost-exposure risk, accepted as an explicit decision, not
+an oversight.
+
+(`backend/adapters/media/quota.py`'s `QuotaTracker` is a completely
+separate, unrelated mechanism — a per-provider hourly image-API
+budget guard, ADR-029 — and was correctly left untouched; it has
+nothing to do with generation cost.)
+
+**2. Topic-first generation is now AI-first in the strict sense.**
+Before this, `_run_ai_pipeline` returning `None` (no AI provider
+configured, or every stage's retries exhausted) silently fell back to
+`build_deterministic_outline()` — a fully generic, topic-blind
+template. That fallback was this project's original "works with zero
+AI configured" founding principle, stated explicitly in its earliest
+handoff doc — and it was also the direct, confirmed root cause of a
+real reported bug earlier this session: decks whose closing slide (and
+often much more) kept coming back as bland filler whenever any single
+AI call in the 4-call chain hiccupped, even after ADR-070 added
+retries.
+
+Now: no AI provider configured, or the pipeline failing even after
+retries, raises `AIGenerationUnavailableError` — a new exception,
+propagated all the way to the HTTP layer as a clear `503` with an
+actionable message ("No AI provider is configured... it can no longer
+fall back to a generic template"), not a silently-degraded `200`.
+`backend/pipeline/deterministic_topic_outline.py` — the module that
+produced that fallback — is deleted entirely, not left as dead code.
+`StructureSource.DETERMINISTIC_TOPIC` (the enum value describing that
+outcome) is kept, unlike the module that produced it — a stated,
+deliberate exception: any project saved before this change may still
+have that literal string persisted in its database record, and
+removing the enum value would break deserializing that old data. It's
+legacy-only now, nothing produces it going forward.
+
+**Deliberately scoped to topic-first generation only.** The
+document-upload path (`backend/engines/generate.py`) keeps its
+existing, separate, single-AI-call graceful degradation — on AI
+failure, it keeps the real, document-derived rule-based outline
+(`structure.build_outline`), not a synthetic one. That's a
+meaningfully different situation from topic-first's fully-synthetic
+fallback: there's real, user-provided content to build from either
+way. Not touched in this pass; a distinct decision if wanted, not
+assumed.
+
+**A wider test-suite impact than the source change itself, found and
+fixed properly, not papered over.** `NullAdapter` served two very
+different purposes: the product fallback just removed, AND being the
+default AI adapter for nearly the entire test suite (`tests/conftest.py`),
+specifically so tests run hermetically — fast, free, no real API keys
+or network calls. Removing the product fallback broke:
+- 16 tests in `test_ai_generate_engine.py` that directly tested the
+  old fallback behavior — rewritten to assert the new raise-based
+  behavior instead (4 tests unit-testing `build_deterministic_outline`
+  itself deleted outright, since that function no longer exists).
+- **17 integration tests** in `test_api_http.py` that never intended
+  to test AI behavior at all — they used "AI disabled → deterministic
+  fallback" purely as a convenient way to get SOME real generated
+  output, to check completely unrelated things (zip bundling, job
+  polling, workspace assignment, project saving, docx/pdf export
+  headers). Fixed with a new, shared `FakeTopicPipelineAdapter` —
+  hermetic (no network, no API key, fixed output), wired in by default
+  for the whole file via the existing autouse registry-reset fixture,
+  so all 17 continue to exercise their actual concern without
+  depending on AI behavior. Their `structure_source` assertions
+  updated from `"deterministic-topic"` to `"ai-generated"` accordingly.
+  One dedicated test (`test_generate_topic_returns_503_when_no_ai_configured`)
+  explicitly opts out of the fake, to verify the real HTTP-level 503
+  behavior a genuine no-AI deployment would hit.
+
+**Verification:** Rendered/exercised all three surfaces directly, not
+just unit-level: a real document-upload generation (theme resolution
+unaffected by this ADR, confirmed separately by ADR-073 below); a
+forced-no-AI topic generation through the actual FastAPI `TestClient`
+confirming a real `503` with the exact intended message, not a mocked
+stand-in; and the full backend suite, 3 consecutive runs: 505/505
+every time (509 after circuit-breaker removal alone, settling to 505
+net of the test deletions/additions from the AI-fallback change and
+ADR-073 below).
+
+*Next entry: ADR-073.*
+
+---
+
+## ADR-073 — editorial_cream Only: Theme Selection Is No Longer Random
+
+**Status:** Accepted.
+
+**Decision:** Supersedes ADR-071's 75/25 weighting with an explicit,
+direct instruction: "editorial cream only... remove the other
+themes." `variety.pick_theme_variant()` now always returns
+`"editorial_cream"` — zero randomness left in it. `RuleBasedDesignAdapter`'s
+document-upload default resolution had one remaining exception
+(academic/lecture document types got `blue_academic`, kept in ADR-071
+specifically because editorial_cream wasn't yet established as THE
+theme) — that exception is gone too: `document_type` no longer
+affects theme resolution at all, editorial_cream unconditionally.
+`_SERIF_DOCUMENT_TYPES`, the constant that drove that exception,
+removed as dead code rather than left unused. Nothing is actually lost
+for academic content specifically: editorial_cream's own
+`font_set_id` is already `"serif"` — the exact property the academic
+exception existed to guarantee in the first place.
+
+**Explicit, stated scope — what this ADR does NOT do.** Theme
+*selection* now guarantees editorial_cream is the only thing anyone
+will ever see through normal generation. The other 8 color-set
+definitions, and their dedicated rendering branches throughout
+`pptx_adapter.py` (chip-style stats, corner-decoration variants,
+gradient fills, the plain/non-editorial title-slide and content-slide
+renderers, etc.) still physically exist in the codebase — reachable
+only if something explicitly constructs a `Theme` naming one of them
+directly (nothing in the product does this anymore), not through any
+normal generation path. This is a deliberate, stated deferral, not an
+oversight: physically deleting ~8 themes' worth of rendering code from
+a single, well-tested, ~1300-line file — and updating the roughly
+15-20 test files that specifically exercise those other themes'
+distinct behavior (`test_pptx_theme_styles.py`,
+`test_pptx_native_charts.py`'s chip-vs-plain coverage, several cases
+in `test_layout_classifier.py`/`test_layout_collision.py`, and
+`svg_preview.py`'s own theme-conditional mirror of the same logic) —
+is a substantially larger, higher-risk refactor than reweighting
+selection, and doing it carefully deserves its own focused pass rather
+than being compressed into the same turn as ADR-072's two other
+changes. Selection-level removal achieves the actual product-facing
+goal (nobody will ever see anything but editorial_cream) with a small,
+surgical, low-risk change; physical deletion of the dead code is real,
+legitimate follow-up work, not yet done.
+
+**Verification:** `pick_theme_variant()` tested directly (200 draws,
+all `"editorial_cream"`, zero variance — this is now a deterministic
+function, not a statistical one, and the test reflects that).
+`RuleBasedDesignAdapter`'s academic/lecture exception-removal tested
+directly across all three document types. Rendered actual
+document-upload decks for both a general topic and an explicitly
+academic-sounding one and confirmed both resolve to `editorial_cream`
+now, not just asserted at the unit level. Full backend suite, 3
+consecutive runs: 505/505 every time.
+
+*Next entry: ADR-074.*

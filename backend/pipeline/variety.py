@@ -15,17 +15,22 @@ Two independent axes of variety:
    (spec Section 1) explicitly says should never happen.
 
 2. Visual theme — a color/font variant, picked independently (see
-   backend/adapters/design/rule_based.py's _KNOWN_THEMES). ADR-071 —
-   no longer a flat uniform random pick across all 9 variants:
-   editorial_cream is now weighted heavily as the de facto default
-   (see pick_theme_variant), a deliberate product decision, while the
-   others remain reachable for genuine variety.
+   backend/adapters/design/rule_based.py's _KNOWN_THEMES). ADR-073
+   superseded ADR-071's 75/25 weighting: pick_theme_variant() now
+   always returns "editorial_cream" — an explicit "editorial_cream
+   only, remove the others" product decision, not a weighting anymore.
+   The other 8 color-set definitions and their dedicated renderers
+   still exist in pptx_adapter.py/rule_based.py (a separate, larger,
+   deliberately-deferred cleanup — see ADR-073), but nothing in the
+   product can reach them through normal generation anymore.
 
-For the deterministic (no-AI) fallback path
-(backend/pipeline/deterministic_topic_outline.py), narrative style
-selection doesn't apply — there's no AI making structural choices — but
-theme variety still does, so a deck generated with no AI configured
-still doesn't look identical to the last no-AI deck.
+ADR-072 removed the deterministic (no-AI) fallback path entirely
+(backend/pipeline/deterministic_topic_outline.py, deleted) — topic-
+first generation now requires a real AI provider and raises
+AIGenerationUnavailableError otherwise. pick_theme_variant() is
+unaffected either way: it's only ever called after the AI pipeline has
+already succeeded (backend/engines/ai_generate.py), never as part of
+a no-AI code path.
 """
 
 import random
@@ -88,20 +93,13 @@ def suggest_style() -> dict:
 
 
 def pick_theme_variant() -> str:
-    """ADR-071 — editorial_cream is now the dominant default for
-    topic-first generation: a direct, explicit product decision
-    (a real reference deck's design was preferred outright over the
-    prior spread of 9 equally-likely themes), not an incidental
-    side-effect of this function. Weighted heavily toward
-    editorial_cream rather than switched to it outright — the other 8
-    variants remain real, reachable options (a person can still land
-    on one, or explicitly request one), preserving SOME of what
-    ADR-030's original variety mechanism was for, while making the
-    editorial aesthetic what most generations actually look like,
-    matching the explicit "I want it to be like this from now on"
-    direction. 75% is a stated, roughly-chosen weight — there was no
-    request for an exact number, and 100% would have quietly deleted 8
-    themes' worth of working functionality no one asked to remove."""
-    if random.random() < 0.75:
-        return "editorial_cream"
-    return random.choice([v for v in THEME_VARIANT_IDS if v != "editorial_cream"])
+    """ADR-073 — editorial_cream is now the ONLY theme, superseding
+    ADR-071's 75/25 weighting: the person explicitly said "editorial
+    cream only... remove the other themes," a clearer, stronger
+    instruction than ADR-071's "or a variation of this." Always
+    returns "editorial_cream" — no randomness left in this function at
+    all. THEME_VARIANT_IDS (the other 8 ids) is kept as a list, not
+    deleted, only because a handful of other places still reference it
+    structurally (tests, the theme registry itself) — nothing in the
+    product calls random.choice over it anymore."""
+    return "editorial_cream"

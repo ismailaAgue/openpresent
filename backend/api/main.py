@@ -29,7 +29,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from backend.engines.generate import generate_presentation
-from backend.engines.ai_generate import generate_presentation_from_topic
+from backend.engines.ai_generate import generate_presentation_from_topic, AIGenerationUnavailableError
 from backend.engines.export_bundle import build_export_bundle
 from backend.engines.edit_slide import (
     edit_slide_manually, regenerate_slide_ai,
@@ -157,66 +157,12 @@ def _download_filename(export_format: str) -> str:
     return f"{base}.{ext}"
 
 
-# ADR-043 — cost circuit breaker. This was the #1 item in the original
-# handoff doc's "actually risky right now" list, written before any of
-# this existed: "A single generation can now trigger 6+ AI calls...
-# Nothing caps spend." Fixed-window (daily, UTC-bucketed) counter, not
-# a general rate limiter — see ports/quota.py's docstring for why that
-# scope line was drawn deliberately. Defaults chosen to be generous
-# enough not to bother a real user in normal use (30/day signed-in)
-# while still bounding worst-case daily spend from any single source,
-# with anonymous use capped much lower (5/day) since it can't be tied
-# to an account for follow-up if abused.
-DAILY_WINDOW_SECONDS = 86400
-
-
-def _generation_limit_user() -> int:
-    # Read at call time, not import time — a module-level constant
-    # baked in from os.environ at import would never see an env var
-    # changed later (including by tests via monkeypatch.setenv, which
-    # is exactly what caught this the first time it was written wrong).
-    return int(os.environ.get("OPENPRESENT_DAILY_GENERATION_LIMIT_USER", "30"))
-
-
-def _generation_limit_anon() -> int:
-    return int(os.environ.get("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "5"))
-
-
-def _enforce_generation_quota(user, request: Request) -> None:
-    """Raises HTTPException(429) if this caller is over their daily cap.
-    Must be called BEFORE any AI/export work starts — the whole point
-    is to gate spend, not just report it after the fact. Anonymous
-    callers are keyed by IP; request.client can be None under some ASGI
-    test/proxy setups, so that's treated as a single shared "unknown"
-    bucket rather than raising — a slightly-too-strict shared limit for
-    that edge case is a fine tradeoff against ever letting an unkeyable
-    caller bypass the cap entirely."""
-    _enforce_daily_quota(user, request, key_prefix="", noun="generations",
-                          limit_user=_generation_limit_user(), limit_anon=_generation_limit_anon())
-
-
-# ADR-057 removed the frontend feature (and the /documents/ask route
-# this quota gated) — see ADR-057. The generation quota above and its
-# helpers are untouched; only the Q&A-specific bucket is gone.
-
-
-def _enforce_daily_quota(user, request: Request, key_prefix: str, noun: str,
-                          limit_user: int, limit_anon: int) -> None:
-    quota = registry.get_quota_adapter()
-    if user:
-        key, limit = f"{key_prefix}user:{user.id}", limit_user
-    else:
-        client_ip = request.client.host if request.client else "unknown"
-        key, limit = f"{key_prefix}anon:{client_ip}", limit_anon
-    count = quota.record_attempt(key, DAILY_WINDOW_SECONDS)
-    if count > limit:
-        message = (
-            f"You've reached your daily limit of {limit} {noun}. Try again tomorrow."
-            if user else
-            f"You've reached the daily limit of {limit} {noun} for anonymous use. "
-            f"Log in for a higher daily limit, or try again tomorrow."
-        )
-        raise HTTPException(status_code=429, detail=message)
+# ADR-072 removed the cost circuit breaker (ADR-043) — see
+# ARCHITECTURE_DECISIONS.md for the reasoning and the real tradeoff
+# this reopens (an unbounded-spend risk this port existed specifically
+# to close). _enforce_generation_quota and its helpers, and their 4
+# call sites right before generation work starts, are gone along with
+# it, not left disabled/unused.
 
 
 def _resolve_workspace_id(workspace_id: str | None, user) -> str | None:
@@ -429,7 +375,6 @@ async def generate(request: Request, file: UploadFile = File(...), export_format
     # correctly at the API level. Fixed by giving sync generation the
     # same "save if logged in" behavior async already had.
     user = _current_user(authorization)
-    _enforce_generation_quota(user, request)  # ADR-043 — before any AI/export work starts
     resolved_workspace_id = _resolve_workspace_id(workspace_id, user)  # ADR-044 — validate before any work too
     brand = _fetch_brand_profile(resolved_workspace_id, user)  # ADR-045
     file_bytes = await file.read()
@@ -501,7 +446,6 @@ def generate_from_topic(req: TopicGenerateRequest, request: Request,
     # form (the primary "AI-first" flow) never produced anything
     # editable even for a logged-in user.
     user = _current_user(authorization)
-    _enforce_generation_quota(user, request)  # ADR-043 — before any AI/export work starts
     resolved_workspace_id = _resolve_workspace_id(req.workspace_id, user)  # ADR-044
     brand = _fetch_brand_profile(resolved_workspace_id, user)  # ADR-045
     try:
@@ -518,6 +462,10 @@ def generate_from_topic(req: TopicGenerateRequest, request: Request,
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except AIGenerationUnavailableError as e:
+        # ADR-072 — no more silent deterministic fallback; a real,
+        # actionable failure the caller must see, not a lesser deck.
+        raise HTTPException(status_code=503, detail=str(e))
 
     owner_id = user.id if user else None
     project_id = None
@@ -554,7 +502,6 @@ def generate_from_topic_async(req: TopicGenerateRequest, request: Request,
     if not req.topic or not req.topic.strip():
         raise HTTPException(status_code=400, detail="topic is required")
     user = _current_user(authorization)
-    _enforce_generation_quota(user, request)  # ADR-043 — gate the enqueue itself, not just the sync path
     resolved_workspace_id = _resolve_workspace_id(req.workspace_id, user)  # ADR-044
     brand = _fetch_brand_profile(resolved_workspace_id, user)  # ADR-045
     queue = registry.get_queue_adapter()
@@ -590,7 +537,6 @@ async def generate_async(request: Request, file: UploadFile = File(...), export_
                           authorization: str | None = Header(default=None)):
     file_bytes = await file.read()
     user = _current_user(authorization)
-    _enforce_generation_quota(user, request)  # ADR-043 — gate the enqueue itself, not just the sync path
     resolved_workspace_id = _resolve_workspace_id(workspace_id, user)  # ADR-044
     brand = _fetch_brand_profile(resolved_workspace_id, user)  # ADR-045
     queue = registry.get_queue_adapter()

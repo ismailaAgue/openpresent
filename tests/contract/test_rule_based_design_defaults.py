@@ -1,14 +1,13 @@
 """
-RuleBasedDesignAdapter's default-theme resolution — ADR-071.
+RuleBasedDesignAdapter's default-theme resolution — ADR-071, ADR-073.
 
 No prior test file covered apply_theme()'s own theme_key resolution
 directly (test_ai_generate_engine.py covers the topic-first pipeline's
 separate variety.pick_theme_variant() path, a different mechanism).
-This covers the specific change: a document upload (or any caller)
-with no theme explicitly requested used to land on "default" (plain
-neutral) unconditionally unless the document type called for serif —
-meaning 7 of the 9 themes added since ADR-030/059/062 were never
-reachable from this path at all. editorial_cream is now that default.
+ADR-071 made editorial_cream the default with one exception (academic/
+lecture document types kept blue_academic); ADR-073 removed that
+exception too — "editorial cream only" is now unconditional here,
+document_type no longer affects theme resolution at all.
 """
 
 from backend.adapters.design.rule_based import RuleBasedDesignAdapter, _KNOWN_THEMES
@@ -38,24 +37,33 @@ def test_no_explicit_theme_resolves_to_editorial_cream():
     assert recipe.theme.color_set_id == "editorial_cream"
 
 
-def test_serif_leaning_document_types_still_get_academic_not_editorial():
-    """A stated, deliberate exception, unchanged by ADR-071: academic/
-    lecture documents get the blue_academic serif theme specifically,
-    not editorial_cream — this distinction predates ADR-071 and isn't
-    what it was about."""
-    for doc_type in ("academic", "lecture"):
+def test_academic_and_lecture_document_types_also_get_editorial_cream_now():
+    """ADR-073 superseded ADR-071's one exception here: academic/
+    lecture document types used to get blue_academic specifically, on
+    the reasoning that editorial_cream wasn't yet established as THE
+    theme. Now that "editorial cream only" is an explicit, direct
+    instruction, that exception is gone — document_type no longer
+    changes which theme a document upload gets. Nothing is actually
+    lost for academic content: editorial_cream's own font_set_id is
+    already "serif", the property the old exception existed to
+    guarantee."""
+    for doc_type in ("academic", "lecture", "general"):
         outline = make_outline(document_type=doc_type)
         recipe = RuleBasedDesignAdapter().apply_theme(
             project_id="p1", source_text="doc text", outline=outline,
             theme=Theme(), audience_type="general", language="en",
         )
-        assert recipe.theme.color_set_id == "blue_academic", f"failed for document_type={doc_type!r}"
+        assert recipe.theme.color_set_id == "editorial_cream", f"failed for document_type={doc_type!r}"
 
 
 def test_explicitly_requested_theme_is_still_respected():
-    """ADR-071 only changes what happens with NO explicit theme — a
-    caller that names one (topic-first generation always does, via
-    variety.pick_theme_variant) must still get exactly that theme."""
+    """Neither ADR-071 nor ADR-073 touch what happens when a caller
+    explicitly names a theme — only what "no theme requested" resolves
+    to. Nothing currently in the product does this anymore (variety.
+    pick_theme_variant only ever returns "editorial_cream" now, ADR-073),
+    but the resolution logic itself still honors an explicit request if
+    one is ever made — e.g. directly through this port, or by future
+    code — rather than silently overriding it."""
     outline = make_outline()
     requested = _KNOWN_THEMES["gradient_violet"]
     recipe = RuleBasedDesignAdapter().apply_theme(

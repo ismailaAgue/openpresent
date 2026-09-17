@@ -1,33 +1,12 @@
 import os
 import pytest
-from backend.pipeline.deterministic_topic_outline import build_deterministic_outline
-from backend.ports.ai_pipeline import GenerationRequest
 from backend.models.recipe import StructureSource
-from backend.engines.ai_generate import generate_presentation_from_topic
+from backend.engines.ai_generate import generate_presentation_from_topic, AIGenerationUnavailableError
 from backend.adapters import registry
 
 
-def test_deterministic_outline_has_requested_slide_count():
-    req = GenerationRequest(topic="Volcanoes", slide_count=6)
-    outline = build_deterministic_outline(req)
-    assert len(outline.slides) == 6
-    assert outline.structure_source == StructureSource.DETERMINISTIC_TOPIC
-
-
-def test_deterministic_outline_title_and_closing_slide():
-    req = GenerationRequest(topic="Volcanoes", slide_count=5)
-    outline = build_deterministic_outline(req)
-    assert outline.slides[0].title == "Volcanoes"
-    assert "thank" in outline.slides[-1].title.lower()
-
-
-def test_deterministic_outline_never_below_three_slides():
-    req = GenerationRequest(topic="X", slide_count=1)
-    outline = build_deterministic_outline(req)
-    assert len(outline.slides) >= 3
-
-
-# -- Engine: with no AI adapter configured, falls back cleanly ---------
+# -- Engine: with no AI adapter configured, generation now fails clearly
+# (ADR-072 removed the deterministic-template fallback) ------------------
 
 @pytest.fixture(autouse=True)
 def reset_registry_singletons(monkeypatch):
@@ -49,16 +28,17 @@ def reset_registry_singletons(monkeypatch):
     registry._ai_adapter_instance = None
 
 
-def test_engine_falls_back_to_deterministic_when_no_ai_configured(monkeypatch):
+def test_engine_raises_when_no_ai_configured(monkeypatch):
+    """ADR-072 — this used to fall back to a fully generic,
+    topic-blind deterministic template (StructureSource.DETERMINISTIC_TOPIC)
+    and silently succeed. That template, and the fallback path that
+    produced it, are gone entirely: no AI provider configured now
+    raises a clear, specific exception instead of a lesser deck."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setenv("OPENPRESENT_AI_ADAPTER", "null")
 
-    recipe, output_bytes, quality = generate_presentation_from_topic(
-        topic="The Water Cycle", slide_count=5, export_format="pptx",
-    )
-    assert recipe.outline.structure_source == StructureSource.DETERMINISTIC_TOPIC
-    assert len(output_bytes) > 0  # a real pptx byte stream was produced
-    assert quality.score >= 0
+    with pytest.raises(AIGenerationUnavailableError, match="No AI provider is configured"):
+        generate_presentation_from_topic(topic="The Water Cycle", slide_count=5, export_format="pptx")
 
 
 def test_engine_rejects_empty_topic():
@@ -67,9 +47,14 @@ def test_engine_rejects_empty_topic():
 
 
 def test_engine_clamps_slide_count_is_caller_responsibility_but_survives_extremes(monkeypatch):
-    monkeypatch.setenv("OPENPRESENT_AI_ADAPTER", "null")
     # Engine itself doesn't clamp (the API layer does) — verify it still
     # produces a valid deck rather than crashing on an unusual count.
+    # Uses FakeFullPipelineAdapter (defined below) rather than
+    # OPENPRESENT_AI_ADAPTER=null — ADR-072 means "null" now raises
+    # instead of producing output, so a real (fake) AI pipeline is
+    # needed here to actually exercise slide-count survival.
+    fake = FakeFullPipelineAdapter()
+    monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: fake)
     recipe, output_bytes, quality = generate_presentation_from_topic(
         topic="Something", slide_count=3, export_format="pptx",
     )
@@ -199,14 +184,17 @@ def test_engine_passes_requested_language_to_the_closing_slide_fix(monkeypatch):
     assert recipe.outline.slides[-1].title == "Merci"
 
 
-def test_engine_falls_back_to_deterministic_when_ai_pipeline_raises(monkeypatch):
+def test_engine_raises_when_ai_pipeline_fails_every_attempt(monkeypatch):
+    """ADR-072 — a failure mid-pipeline (even after ADR-070's retries
+    are exhausted) used to drop the whole AI attempt back to the
+    deterministic template and silently succeed with a generic deck.
+    Now it raises instead — a real, actionable failure, not a lesser
+    deck the caller doesn't know is lesser."""
     import backend.engines.ai_generate as engine_module
     monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)  # ADR-070 — don't
     # actually wait through 3 real retry attempts just to prove the
-    # eventual fallback still works; that behavior is what
-    # test_engine_still_falls_back_when_a_stage_fails_every_attempt
-    # and test_call_stage_with_retry_gives_up_after_exhausting_attempts
-    # cover directly — this test's job is only the fallback outcome.
+    # eventual failure still surfaces; the retry mechanics themselves
+    # are covered directly by test_call_stage_with_retry_gives_up_after_exhausting_attempts.
 
     class AlwaysFails:
         def is_available(self):
@@ -218,13 +206,8 @@ def test_engine_falls_back_to_deterministic_when_ai_pipeline_raises(monkeypatch)
     monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: AlwaysFails())
     monkeypatch.setattr(registry, "get_research_adapter", lambda: registry.NullResearchAdapter())
 
-    recipe, output_bytes, quality = generate_presentation_from_topic(
-        topic="Something", slide_count=4, export_format="pptx",
-    )
-    # A failure mid-pipeline drops the WHOLE AI attempt — never a
-    # partially-AI, partially-broken deck.
-    assert recipe.outline.structure_source == StructureSource.DETERMINISTIC_TOPIC
-    assert len(output_bytes) > 0
+    with pytest.raises(AIGenerationUnavailableError, match="AI generation failed after retries"):
+        generate_presentation_from_topic(topic="Something", slide_count=4, export_format="pptx")
 
 
 # -- on_stage progress reporting (ADR-040) ------------------------------
@@ -246,25 +229,42 @@ def test_on_stage_reports_all_six_stages_in_order_on_full_ai_path(monkeypatch):
     ]
 
 
-def test_on_stage_still_reports_bookend_stages_on_deterministic_fallback(monkeypatch):
+def test_on_stage_reports_only_the_first_bookend_before_raising_with_no_ai(monkeypatch):
+    """ADR-072 — with no AI configured, generation now raises instead
+    of falling back. The "understanding_request" bookend stage (set
+    unconditionally before _run_ai_pipeline is even called) still
+    reports — but the 3 mid-pipeline AI-only stages, and the LATER
+    bookend stages (selecting_visuals, applying_design, which only run
+    after a real outline exists) never fire, since the exception
+    propagates out of generate_presentation_from_topic before reaching
+    them. Before this, the later bookends still fired because a
+    deterministic outline always existed to build a deck from — now
+    there's nothing to build, so the function exits via exception
+    partway through, not via a completed (if generic) deck."""
     monkeypatch.setenv("OPENPRESENT_AI_ADAPTER", "null")
     registry._ai_adapter_instance = None
 
     reported = []
-    generate_presentation_from_topic(
-        topic="Volcanoes", slide_count=4, export_format="pptx",
-        on_stage=reported.append,
-    )
+    with pytest.raises(AIGenerationUnavailableError):
+        generate_presentation_from_topic(
+            topic="Volcanoes", slide_count=4, export_format="pptx",
+            on_stage=reported.append,
+        )
 
-    # No AI adapter available -> the 3 mid-pipeline AI-only stages never
-    # fire, but the bookend stages (set unconditionally by the engine,
-    # not from inside _run_ai_pipeline) still report, in order.
-    assert reported == ["understanding_request", "selecting_visuals", "applying_design"]
+    assert reported == ["understanding_request"]
 
 
 def test_on_stage_callback_raising_never_breaks_generation(monkeypatch):
-    monkeypatch.setenv("OPENPRESENT_AI_ADAPTER", "null")
-    registry._ai_adapter_instance = None
+    """A broken progress-reporting callback must never take down an
+    otherwise-successful generation. Uses FakeFullPipelineAdapter, not
+    OPENPRESENT_AI_ADAPTER=null (ADR-072 made "null" raise before ever
+    reaching the callback meaningfully, which would test the wrong
+    thing) — this needs a generation that actually SUCCEEDS despite the
+    broken callback, to prove the callback's own failure is what's
+    being tolerated, not AI unavailability."""
+    fake = FakeFullPipelineAdapter()
+    monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: fake)
+    monkeypatch.setattr(registry, "get_research_adapter", lambda: registry.NullResearchAdapter())
 
     def broken_callback(stage):
         raise RuntimeError("simulated broken progress sink")
@@ -316,19 +316,6 @@ def test_engine_theme_variety_actually_takes_effect(monkeypatch):
 
 
 # -- ADR-070: bounded retry around each AI stage call --------------------
-
-def test_deterministic_closing_slide_bullet_references_the_topic():
-    """The closing slide's TITLE stays "Thank You" (so
-    CLOSING_TITLE_HINTS still recognizes it and doesn't append a
-    redundant second one) but the bullet beneath it used to be the
-    completely topic-blind literal string "Questions?" — the one slide
-    in this whole fallback template that didn't reference the topic at
-    all, which read as the most obviously-generic slide in an
-    otherwise at-least-topic-aware deck."""
-    req = GenerationRequest(topic="Renewable Energy", slide_count=5)
-    outline = build_deterministic_outline(req)
-    assert outline.slides[-1].title == "Thank You"
-    assert "Renewable Energy" in outline.slides[-1].content_blocks[0].text
 
 
 def test_call_stage_with_retry_succeeds_immediately_without_retrying(monkeypatch):
@@ -419,13 +406,16 @@ def test_engine_recovers_when_one_stage_fails_once_then_succeeds(monkeypatch):
     assert len(output_bytes) > 0
 
 
-def test_engine_still_falls_back_when_a_stage_fails_every_attempt(monkeypatch):
-    """The all-or-nothing fallback boundary itself is unchanged — a
-    GENUINELY down provider (fails all STAGE_RETRY_ATTEMPTS attempts,
-    not just a transient blip) must still land on the deterministic
-    template, exactly as before ADR-070. Retries make transient
-    failures resilient; they don't (and shouldn't) mask a hard,
-    persistent failure."""
+def test_engine_raises_when_a_stage_fails_every_attempt(monkeypatch):
+    """ADR-072 — the all-or-nothing boundary itself is unchanged in
+    spirit: a GENUINELY down provider (fails all STAGE_RETRY_ATTEMPTS
+    attempts, not just a transient blip) must still fail the whole
+    generation rather than silently return a partial or fabricated
+    result. What changed (ADR-072) is WHAT happens at that boundary —
+    it used to land on the deterministic template and succeed
+    silently; it now raises instead. Retries make transient failures
+    resilient; they don't (and shouldn't) mask a hard, persistent
+    failure as if it were a success."""
     import backend.engines.ai_generate as engine_module
     monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)
 
@@ -439,8 +429,5 @@ def test_engine_still_falls_back_when_a_stage_fails_every_attempt(monkeypatch):
     monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: AlwaysFailsAdapter())
     monkeypatch.setattr(registry, "get_research_adapter", lambda: registry.NullResearchAdapter())
 
-    recipe, output_bytes, quality = generate_presentation_from_topic(
-        topic="Ebola", slide_count=4, export_format="pptx",
-    )
-    assert recipe.outline.structure_source == StructureSource.DETERMINISTIC_TOPIC
-    assert len(output_bytes) > 0
+    with pytest.raises(AIGenerationUnavailableError):
+        generate_presentation_from_topic(topic="Ebola", slide_count=4, export_format="pptx")
