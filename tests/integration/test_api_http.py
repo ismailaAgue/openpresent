@@ -48,6 +48,56 @@ SAMPLE_TEXT_DOC = (
 ).encode("utf-8")
 
 
+class FakeTopicPipelineAdapter:
+    """ADR-072 — a minimal, realistic, deterministic (in the "same
+    fixed output every call" sense, not the "no AI" sense this test
+    file used to rely on) stand-in for a real AI pipeline. Every test
+    in this file gets one by default via reset_all_registry_singletons
+    — topic generation now requires AI to succeed at all, and most
+    tests in this file were never actually testing AI behavior, just
+    using "AI disabled -> deterministic fallback" as a convenient way
+    to get SOME real output to check other things (zip contents, job
+    polling, headers, project saving...). No live network, no API key,
+    same fixed output every time — hermetic, same as the rest of this
+    fixture."""
+
+    def is_available(self):
+        return True
+
+    def generate_strategy(self, request, research=None):
+        from backend.ports.ai_pipeline import PresentationStrategy
+        return PresentationStrategy(narrative_style="Classic Narrative", title_angle="Angle",
+                                     key_themes=["t1"], tone_notes="")
+
+    def generate_outline_structure(self, request, strategy):
+        from backend.ports.ai_pipeline import SlideOutlineItem
+        items = [SlideOutlineItem(title=f"Slide {i + 1}", purpose="purpose")
+                 for i in range(request.slide_count)]
+        items[-1] = SlideOutlineItem(title="Thank You", purpose="closing")  # matches
+        # CLOSING_TITLE_HINTS — avoids the quality validator appending a
+        # second closing slide, which would change len(slides).
+        return items
+
+    def generate_slide_content(self, request, strategy, structure):
+        from backend.models.recipe import Outline, Slide, ContentBlock, BlockType, StructureSource
+        slides = [
+            Slide(order=i + 1, title=item.title, content_blocks=[
+                ContentBlock(type=BlockType.BULLET, text="a point"),
+            ])
+            for i, item in enumerate(structure)
+        ]
+        return Outline(structure_source=StructureSource.AI_GENERATED, slides=slides)
+
+    def plan_layout(self, outline, request):
+        for slide in outline.slides:
+            slide.layout_type = "bullet_list"
+            slide.image_query = None  # keeps every test here $0/offline
+        return outline
+
+    def review_and_revise(self, outline, report, request):
+        return outline
+
+
 def _make_minimal_pdf(text_lines: list[str]) -> bytes:
     """A hand-written, valid, minimal single-page PDF with real,
     extractable text — used instead of a PDF-generation library (e.g.
@@ -101,13 +151,27 @@ SAMPLE_PDF_DOC = _make_minimal_pdf([
 def reset_all_registry_singletons(monkeypatch):
     """Every registry-cached adapter reset to None before each test —
     fresh in-memory SQLite queue/storage/auth per test (no cross-test
-    pollution), and AI/media/research forced to the deterministic/off
+    pollution), and media/research forced to the deterministic/off
     default so these tests never depend on live network or real API
-    keys. Individual tests that need an AI adapter wire up their own
-    fake via monkeypatch, same pattern used throughout this suite."""
+    keys.
+
+    ADR-072 — AI is no longer optional for topic generation (it used
+    to fall back to a deterministic template with OPENPRESENT_AI_ADAPTER
+    unset/"null"; that fallback is gone, and "null" now makes topic
+    generation raise). Every test in this file that calls
+    /generate/topic* needs AI to actually succeed for reasons that have
+    nothing to do with AI itself (checking zip bundling, job polling,
+    workspace assignment, project saving, docx/pdf export...) — so
+    get_ai_pipeline_adapter() is wired to a shared, realistic fake here,
+    by default, for the whole file, the same hermetic-by-construction
+    principle as everything else in this fixture: no live network, no
+    real API key, deterministic (fixed, not random) output. A test that
+    specifically wants to exercise "no AI configured" (there's exactly
+    one: test_generate_topic_returns_503_when_no_ai_configured) opts
+    OUT by re-patching get_ai_pipeline_adapter itself in its own body."""
     for attr in ("_ai_adapter_instance", "_queue_adapter_instance", "_storage_adapter_instance",
                  "_auth_adapter_instance", "_analytics_adapter_instance", "_media_adapter_instance",
-                 "_research_adapter_instance", "_quota_adapter_instance", "_workspace_adapter_instance", "_brand_adapter_instance"):
+                 "_research_adapter_instance", "_workspace_adapter_instance", "_brand_adapter_instance"):
         setattr(registry, attr, None)
     monkeypatch.setenv("OPENPRESENT_AI_ADAPTER", "null")
     monkeypatch.setenv("OPENPRESENT_RESEARCH_ADAPTER", "null")
@@ -115,10 +179,11 @@ def reset_all_registry_singletons(monkeypatch):
     monkeypatch.delenv("OPENPRESENT_UNSPLASH_ACCESS_KEY", raising=False)
     monkeypatch.delenv("OPENPRESENT_PEXELS_API_KEY", raising=False)
     monkeypatch.delenv("OPENPRESENT_PIXABAY_API_KEY", raising=False)
+    monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: FakeTopicPipelineAdapter())
     yield
     for attr in ("_ai_adapter_instance", "_queue_adapter_instance", "_storage_adapter_instance",
                  "_auth_adapter_instance", "_analytics_adapter_instance", "_media_adapter_instance",
-                 "_research_adapter_instance", "_quota_adapter_instance", "_workspace_adapter_instance", "_brand_adapter_instance"):
+                 "_research_adapter_instance", "_workspace_adapter_instance", "_brand_adapter_instance"):
         setattr(registry, attr, None)
 
 
@@ -254,11 +319,25 @@ def test_generate_topic_sync_returns_zip_with_quality_headers(client):
     assert resp.headers["content-type"] == "application/zip"
     assert "X-Structure-Source" in resp.headers
     assert "X-Quality-Score" in resp.headers
-    assert resp.headers["X-Structure-Source"] == "deterministic-topic"  # AI disabled in this fixture
+    assert resp.headers["X-Structure-Source"] == "ai-generated"  # ADR-072 — FakeTopicPipelineAdapter by default now
 
     zf = zipfile.ZipFile(io.BytesIO(resp.content))
     assert "presentation.pptx" in zf.namelist()
     assert "speaker_notes.docx" in zf.namelist()
+
+
+def test_generate_topic_returns_503_when_no_ai_configured(client, monkeypatch):
+    """ADR-072 — the one test in this file that deliberately opts OUT
+    of the file-wide FakeTopicPipelineAdapter default, to check the
+    real behavior an actual deployer with no AI provider configured
+    would hit: a clear 503, not a 200 with a generic deck (the old
+    behavior, removed), and not an unhandled 500 either."""
+    from backend.adapters.ai.null_adapter import NullAdapter
+    monkeypatch.setattr(registry, "get_ai_pipeline_adapter", lambda: NullAdapter())
+
+    resp = client.post("/generate/topic", json={"topic": "Photosynthesis", "slide_count": 4})
+    assert resp.status_code == 503
+    assert "AI provider" in resp.json()["detail"]
 
 
 def test_generate_topic_empty_topic_returns_400(client):
@@ -304,7 +383,7 @@ def test_generate_topic_async_full_round_trip(client):
     job_id = enqueue_resp.json()["job_id"]
 
     result = _poll_job_until_done(client, job_id)
-    assert result["structure_source"] == "deterministic-topic"
+    assert result["structure_source"] == "ai-generated"  # ADR-072 — FakeTopicPipelineAdapter by default now
     assert "quality_score" in result
 
     download_resp = client.get(f"/jobs/{job_id}/download")
@@ -315,55 +394,11 @@ def test_generate_topic_async_full_round_trip(client):
 
 # -- Documents as a second output type (ADR-041, v3 Phase 3) -------------
 
-# -- Cost circuit breaker (ADR-043) --------------------------------------
-
-def test_anonymous_generation_blocked_after_daily_limit(client, monkeypatch):
-    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "2")
-    for _ in range(2):
-        resp = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4})
-        assert resp.status_code == 200
-    blocked = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4})
-    assert blocked.status_code == 429
-    assert "daily limit" in blocked.json()["detail"].lower()
-
-
-def test_quota_gate_runs_before_any_generation_work(client, monkeypatch):
-    """The 429 must come from the gate itself, not from generation
-    happening and then being discarded — proven by setting the limit to
-    zero and confirming the very first request is blocked, with no
-    generation-specific side effect (no X-Project-Id etc.) ever occurring."""
-    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "0")
-    resp = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4})
-    assert resp.status_code == 429
-
-
-def test_async_enqueue_is_also_gated_not_just_the_sync_path(client, monkeypatch):
-    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_ANON", "0")
-    resp = client.post("/generate/topic/async", json={"topic": "Volcanoes", "slide_count": 4})
-    assert resp.status_code == 429
-
-
-def test_quota_is_keyed_separately_per_user(client, monkeypatch):
-    """Two different accounts must not share a quota bucket — this test
-    would fail if the key were something global like just "user" instead
-    of including the actual user id."""
-    monkeypatch.setenv("OPENPRESENT_DAILY_GENERATION_LIMIT_USER", "1")
-    client.post("/auth/register", json={"email": "a@example.com", "password": "password123"})
-    token_a = client.post("/auth/login", json={"email": "a@example.com", "password": "password123"}).json()["session_token"]
-    client.post("/auth/register", json={"email": "b@example.com", "password": "password123"})
-    token_b = client.post("/auth/login", json={"email": "b@example.com", "password": "password123"}).json()["session_token"]
-
-    resp_a1 = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4},
-                           headers={"Authorization": f"Bearer {token_a}"})
-    assert resp_a1.status_code == 200
-    resp_a2 = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4},
-                           headers={"Authorization": f"Bearer {token_a}"})
-    assert resp_a2.status_code == 429  # user A is now over their limit of 1
-
-    resp_b1 = client.post("/generate/topic", json={"topic": "Volcanoes", "slide_count": 4},
-                           headers={"Authorization": f"Bearer {token_b}"})
-    assert resp_b1.status_code == 200  # user B's own limit is untouched by A's usage
-
+# ADR-072 removed the cost circuit breaker (ADR-043) — see
+# ARCHITECTURE_DECISIONS.md. The tests that lived in this section
+# (daily-limit blocking, gate-runs-before-work, per-user keying) tested
+# a mechanism that no longer exists; removed along with it rather than
+# left disabled/skipped.
 
 # -- Workspaces (ADR-044, v3 Phase 4) -------------------------------------
 
@@ -579,11 +614,11 @@ def test_delete_brand_profile(client):
 def test_generation_into_a_branded_workspace_still_succeeds(client):
     """End-to-end proof that setting a brand profile and then
     generating into that workspace doesn't break anything — the
-    actual prompt content isn't observable from the HTTP layer (no
-    real AI provider is configured in this hermetic suite), but the
-    whole request path (fetch brand -> thread into GenerationRequest
-    -> deterministic fallback since no AI configured) must complete
-    normally end to end."""
+    actual prompt content isn't observable from the HTTP layer (this
+    suite's AI pipeline is FakeTopicPipelineAdapter, not a real
+    provider), but the whole request path (fetch brand -> thread into
+    GenerationRequest -> AI pipeline) must complete normally end to
+    end."""
     token = _register_and_login(client)
     headers = {"Authorization": f"Bearer {token}"}
     workspace_id = client.post("/workspaces", json={"name": "Branded"}, headers=headers).json()["workspace_id"]
@@ -624,7 +659,7 @@ def test_generation_into_branded_workspace_async_full_round_trip(client):
     assert enqueue_resp.status_code == 200
     job_id = enqueue_resp.json()["job_id"]
     result = _poll_job_until_done(client, job_id)
-    assert result["structure_source"] == "deterministic-topic"
+    assert result["structure_source"] == "ai-generated"  # ADR-072 — FakeTopicPipelineAdapter by default now
 
 
 def test_document_upload_generation_into_branded_workspace_succeeds(client):
@@ -737,7 +772,7 @@ def test_generate_topic_document_docx_async_full_round_trip(client):
     job_id = enqueue_resp.json()["job_id"]
 
     result = _poll_job_until_done(client, job_id)
-    assert result["structure_source"] == "deterministic-topic"
+    assert result["structure_source"] == "ai-generated"  # ADR-072 — FakeTopicPipelineAdapter by default now
 
     download_resp = client.get(f"/jobs/{job_id}/download")
     assert download_resp.status_code == 200
@@ -785,7 +820,7 @@ def test_generate_topic_document_pdf_async_full_round_trip(client):
     job_id = enqueue_resp.json()["job_id"]
 
     result = _poll_job_until_done(client, job_id)
-    assert result["structure_source"] == "deterministic-topic"
+    assert result["structure_source"] == "ai-generated"  # ADR-072 — FakeTopicPipelineAdapter by default now
 
     download_resp = client.get(f"/jobs/{job_id}/download")
     assert download_resp.status_code == 200

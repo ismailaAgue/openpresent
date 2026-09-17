@@ -43,8 +43,6 @@ from backend.adapters.export.pptx_adapter import PptxExportAdapter
 from backend.adapters.export.docx_notes_adapter import SpeakerNotesDocxExportAdapter
 from backend.adapters.export.document_docx_adapter import DocumentDocxExportAdapter
 from backend.adapters.export.document_pdf_adapter import DocumentPdfExportAdapter
-from backend.adapters.quota.sqlite_adapter import SqliteQuotaAdapter
-from backend.adapters.quota.postgres_quota import PostgresQuotaAdapter
 from backend.adapters.workspace.sqlite_adapter import SqliteWorkspaceAdapter
 from backend.adapters.workspace.postgres_workspace import PostgresWorkspaceAdapter
 from backend.adapters.brand.sqlite_adapter import SqliteBrandAdapter
@@ -87,7 +85,6 @@ _auth_adapter_instance = None
 _analytics_adapter_instance = None
 _media_adapter_instance = None
 _research_adapter_instance = None
-_quota_adapter_instance = None
 _workspace_adapter_instance = None
 _brand_adapter_instance = None
 
@@ -106,10 +103,8 @@ _brand_adapter_instance = None
 # caller ever creates adapters from more than one thread, worth
 # revisiting then rather than guessing at the shape of that now.
 _queue_adapter_lock = threading.Lock()
-# ADR-043 — same lazy-singleton race the queue getter had (ADR-042),
-# guarded from the start this time instead of discovered via a flaky
-# test, since it's the same pattern with the same known failure mode.
-_quota_adapter_lock = threading.Lock()
+# ADR-042 — lazy-singleton race for the queue getter, guarded with a
+# lock rather than discovered via a flaky test.
 _workspace_adapter_lock = threading.Lock()
 _brand_adapter_lock = threading.Lock()
 
@@ -194,11 +189,10 @@ def _build_local_model_adapter():
 def get_ai_pipeline_adapter():
     """The AIPipelinePort view of whatever get_ai_adapter() resolved to
     (GeminiAdapter and LocalModelAdapter both implement it). NullAdapter
-    doesn't — topic-first generation without any AI adapter configured
-    falls back to the deterministic template
-    (backend/pipeline/deterministic_topic_outline.py), handled by the
-    engine, not by a Null implementation of this port, to keep
-    NullAdapter itself a pure no-op/pass-through (see its docstring)."""
+    doesn't — ADR-072 removed the deterministic-template fallback that
+    used to handle this case, so topic-first generation without a real
+    AI adapter configured now raises AIGenerationUnavailableError (see
+    backend/engines/ai_generate.py) instead of silently degrading."""
     adapter = get_ai_adapter()
     # Structural check rather than isinstance(adapter, AIPipelinePort):
     # Protocol isinstance checks require @runtime_checkable, which only
@@ -355,23 +349,6 @@ def get_research_adapter():
 
             _research_adapter_instance = CompositeResearchAdapter(providers)
     return _research_adapter_instance
-
-
-def get_quota_adapter():
-    """ADR-043 — cost circuit breaker. Same Postgres-if-DATABASE_URL-set,
-    SQLite-otherwise pattern as get_queue_adapter(), including the
-    double-checked-locking fix from ADR-042 applied from the start here."""
-    global _quota_adapter_instance
-    if _quota_adapter_instance is None:
-        with _quota_adapter_lock:
-            if _quota_adapter_instance is None:
-                db_url = _database_url()
-                if db_url:
-                    _quota_adapter_instance = PostgresQuotaAdapter(db_url)
-                else:
-                    db_path = os.environ.get("OPENPRESENT_QUOTA_DB", ":memory:")
-                    _quota_adapter_instance = SqliteQuotaAdapter(db_path)
-    return _quota_adapter_instance
 
 
 def get_workspace_adapter():

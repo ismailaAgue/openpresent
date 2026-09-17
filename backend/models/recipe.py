@@ -21,9 +21,13 @@ class StructureSource(str, Enum):
     # by the AI pipeline (no source document to enhance) rather than a
     # rule-based baseline that AI merely touched up.
     AI_GENERATED = "ai-generated"
-    # The topic-mode fallback when no AI pipeline adapter is available —
-    # distinct from RULE_BASED (document-derived) so analytics can tell
-    # the two "no AI" paths apart.
+    # ADR-072 removed the code path that produced this value
+    # (build_deterministic_outline, deleted) — topic-first generation
+    # now requires a real AI provider and raises instead of falling
+    # back. Kept as an enum value, not deleted, purely for backward
+    # compatibility: any project saved before this change may still
+    # have this literal string persisted as its structure_source, and
+    # removing the value would break deserializing that old data.
     DETERMINISTIC_TOPIC = "deterministic-topic"
 
 

@@ -19,21 +19,32 @@ Pipeline (spec Section 3), mapped to what actually runs now:
     -> Renderer (ExportPort)
     -> Export
 
-Every AI stage degrades gracefully, per Constitution Principle 3 — any
-failure anywhere in the multi-call chain (network error, malformed
-JSON, provider outage on every configured provider) drops the WHOLE
-AI attempt back to the deterministic topic template, never a
-half-AI/half-broken deck. This is a deliberate all-or-nothing boundary
-around the AI portion of the pipeline: partially trusting an outline
-that failed partway through validation would be worse than a clean,
-fully-deterministic fallback.
+Every AI stage degrades gracefully within itself (a failed research
+call just proceeds without research, for instance), but ADR-072
+removed the old top-level safety net: previously, ANY failure
+anywhere in the 4-call strategy/outline/content/layout chain (network
+error, malformed JSON, provider outage, or simply no AI provider
+configured at all) silently dropped the whole AI attempt back to a
+fully generic, topic-blind deterministic template
+(build_deterministic_outline, now deleted). That fallback was
+explicitly the product's original "works with zero AI configured"
+design principle — and it was also the direct cause of a real,
+reported bug: decks whose closing slide (and often much more) kept
+coming back as bland, generic filler whenever any single AI call
+hiccuped. Topic-first generation is now AI-first in the strict sense:
+no AI provider configured, or the pipeline failing even after ADR-070's
+retries, raises AIGenerationUnavailableError instead of silently
+degrading — a clear, surfaced failure the caller must handle, not a
+silently worse deck.
 
-ADR-070 — each of the 4 sequential calls in that chain now gets a
-bounded retry (3 attempts, short exponential backoff) BEFORE this
-all-or-nothing boundary gives up — see _call_stage_with_retry. A
-single transient failure (a rate limit, a momentary network blip) no
-longer has to discard 3 other calls that already succeeded just
-because the 4th one hiccuped once.
+ADR-070 — each of the 4 sequential calls in that chain still gets a
+bounded retry (3 attempts, short exponential backoff) before this
+raises — see _call_stage_with_retry. A single transient failure (a
+rate limit, a momentary network blip) still doesn't have to throw away
+3 other calls that already succeeded just because the 4th hiccuped
+once — retries remain the right answer for a TRANSIENT failure; a
+persistent one now surfaces honestly instead of masking as a
+low-quality success.
 """
 
 import os
@@ -46,11 +57,22 @@ from backend.models.recipe import Recipe, Theme
 from backend.ports.ai_pipeline import GenerationRequest, QualityReport
 from backend.ports.brand import BrandProfile
 from backend.ports.export import UnsupportedFormatError
-from backend.pipeline.deterministic_topic_outline import build_deterministic_outline
 from backend.pipeline.variety import pick_theme_variant
 from backend.adapters.design.rule_based import get_theme_variant
 from backend.validation.quality_validator import validate_and_fix
 from backend.monitoring.sentry_setup import capture_exception, add_breadcrumb
+
+
+class AIGenerationUnavailableError(Exception):
+    """ADR-072 — raised by topic-first generation when it can't produce
+    a real, AI-generated deck: no AI provider is configured, or every
+    retry attempt at some stage in the strategy/outline/content/layout
+    chain still failed. Before this, either case silently fell back to
+    a fully generic, topic-blind deterministic template instead of
+    surfacing the problem — this exception is that surfacing. Callers
+    (the API layer, the background worker) are expected to turn this
+    into a clear, actionable failure for the person waiting on their
+    deck, not to catch-and-retry into a lesser result."""
 
 MAX_REVISION_PASSES = 1  # bounded — spec Section 13: "allow AN automatic improvement pass"
 
@@ -145,11 +167,8 @@ def generate_presentation_from_topic(
     )
 
     _report(on_stage, STAGE_UNDERSTANDING)
-    outline = _run_ai_pipeline(request, on_stage)
-    ai_layout_planned = outline is not None
-
-    if outline is None:
-        outline = build_deterministic_outline(request)
+    outline = _run_ai_pipeline(request, on_stage)  # raises AIGenerationUnavailableError, never returns None now
+    ai_layout_planned = True  # only reachable when the AI pipeline actually succeeded
 
     _report(on_stage, STAGE_VISUALS)
     outline, quality_report = validate_and_fix(outline, export_format=export_format, language=request.language)
@@ -209,11 +228,19 @@ def _run_ai_pipeline(request: GenerationRequest, on_stage: Callable[[str], None]
     """Runs Research (optional) -> Strategy -> Outline Structure ->
     Slide Content -> Layout Planning as one all-or-nothing attempt.
     Returns a fully-formed Outline with layout_type/image_query already
-    set, or None if AI is unavailable or any stage failed — callers
-    treat None exactly like "fall back to the deterministic template"."""
+    set. ADR-072 — no longer returns None on failure; raises
+    AIGenerationUnavailableError instead, whether the cause is no AI
+    provider configured at all, or every retry attempt at some stage
+    still failing. There is no more "callers treat this as a signal to
+    fall back" — a caller either gets a real outline or an exception,
+    nothing in between."""
     pipeline = registry.get_ai_pipeline_adapter()
     if not pipeline.is_available():
-        return None
+        raise AIGenerationUnavailableError(
+            "No AI provider is configured. Topic-based generation requires "
+            "a configured AI provider (set an API key for a supported "
+            "provider) — it can no longer fall back to a generic template."
+        )
 
     research_brief = None
     research = registry.get_research_adapter()
@@ -249,4 +276,9 @@ def _run_ai_pipeline(request: GenerationRequest, on_stage: Callable[[str], None]
         return outline
     except Exception as e:
         capture_exception(e, tags={"stage": "ai_pipeline", "topic": request.topic[:80]})
-        return None  # any stage failing drops the WHOLE AI attempt — no partial outlines
+        # Every stage already retried (_call_stage_with_retry) before
+        # reaching here — this is a genuinely persistent failure, not a
+        # transient one, so it surfaces as-is rather than being masked.
+        raise AIGenerationUnavailableError(
+            f"AI generation failed after retries: {e}"
+        ) from e

@@ -55,7 +55,6 @@ _KNOWN_THEMES = {
     "editorial_cream": Theme(layout_template_id="standard", color_set_id="editorial_cream", font_set_id="serif"),
 }
 
-_SERIF_DOCUMENT_TYPES = {"academic", "lecture"}
 _IMAGE_ELIGIBLE_LAYOUTS = {"bullet_list"}
 
 
@@ -76,22 +75,17 @@ class RuleBasedDesignAdapter(DesignPort):
         if theme.layout_template_id != "default":
             resolved_theme = theme  # caller explicitly requested a theme — respect it
         else:
-            # ADR-071 — editorial_cream is now the default for the
-            # document-upload path too, not just topic-first generation
-            # (variety.pick_theme_variant). Before this, a document
-            # upload with no theme explicitly requested could ONLY ever
-            # land on "default" (plain neutral) or "academic" (blue) —
-            # none of the 7 other themes added since ADR-030/059/062,
-            # editorial_cream included, were ever reachable here at
-            # all. Confirmed safe: editorial's own renderers
-            # (_render_editorial_content_slide/_title_slide) already
-            # degrade gracefully with no image available (falls back to
-            # a full-width text layout, not a broken half-empty one) —
-            # a real property to check, not assumed, since a document
-            # upload with no media provider configured is a common,
-            # ordinary case, not an edge case.
-            theme_key = "academic" if outline.document_type in _SERIF_DOCUMENT_TYPES else "editorial_cream"
-            resolved_theme = _KNOWN_THEMES[theme_key]
+            # ADR-073 — editorial_cream only, no more branching at all.
+            # ADR-071 kept an "academic" exception here (blue_academic
+            # for academic/lecture document types, since editorial_cream
+            # wasn't yet a serif theme's equal in that context) — that
+            # exception is gone now that "editorial cream only, remove
+            # the other themes" is an explicit, direct instruction, not
+            # an implicit default. Nothing is actually lost for academic
+            # content specifically: editorial_cream's own font_set_id is
+            # "serif" (see _KNOWN_THEMES below), the property the
+            # academic branch existed to guarantee in the first place.
+            resolved_theme = _KNOWN_THEMES["editorial_cream"]
 
         if not ai_layout_planned:
             for i, slide in enumerate(outline.slides):
