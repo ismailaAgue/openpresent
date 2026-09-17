@@ -354,6 +354,70 @@ def test_generate_topic_clamps_extreme_slide_counts(client):
     assert len(list(prs.slides)) <= 30  # MAX_SLIDE_COUNT — clamped, not literally 9999 slides
 
 
+# -- A count mentioned in the topic text itself is respected -------------
+# (ADR-074 — the reported bug: the composer has no dedicated slide-count
+# control, its own placeholder text invites typing a count into the
+# prompt instead, but the frontend always sent a hardcoded
+# slide_count=10 regardless of what was actually typed, and nothing on
+# the backend looked at the topic text either — so "Create a 20-slide
+# deck" silently produced exactly 10 slides, every single time.)
+
+def test_generate_topic_respects_a_slide_count_mentioned_in_the_topic_text(client):
+    """The exact reported bug, reproduced and fixed: the client sends
+    the frontend's hardcoded default (10, same as
+    topicRequestBody's ?? 10) while the topic text itself asks for a
+    different, specific count — the text must win."""
+    resp = client.post("/generate/topic", json={
+        "topic": "Create a 6-slide overview of the water cycle", "slide_count": 10,
+    })
+    assert resp.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    from pptx import Presentation
+    prs = Presentation(io.BytesIO(zf.read("presentation.pptx")))
+    assert len(list(prs.slides)) == 6
+
+
+def test_generate_topic_respects_spaced_slide_count_phrasing_too(client):
+    """Not just the hyphenated "N-slide" form the composer's own
+    placeholder happens to use — "N slides", spaced and plural, is at
+    least as common a way to phrase this."""
+    resp = client.post("/generate/topic", json={
+        "topic": "Make an 8 slide deck about volcanoes", "slide_count": 10,
+    })
+    assert resp.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    from pptx import Presentation
+    prs = Presentation(io.BytesIO(zf.read("presentation.pptx")))
+    assert len(list(prs.slides)) == 8
+
+
+def test_generate_topic_falls_back_to_the_slide_count_field_with_no_text_mention(client):
+    """No regression for the ordinary case: a topic that doesn't
+    mention a count at all still respects whatever slide_count value
+    was actually sent."""
+    resp = client.post("/generate/topic", json={
+        "topic": "The history of the printing press", "slide_count": 5,
+    })
+    assert resp.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    from pptx import Presentation
+    prs = Presentation(io.BytesIO(zf.read("presentation.pptx")))
+    assert len(list(prs.slides)) == 5
+
+
+def test_generate_topic_async_also_respects_a_slide_count_mentioned_in_the_topic(client):
+    """The sync endpoint isn't the only place this bug lived — the
+    async/job-queue endpoint resolves slide_count independently, at
+    enqueue time, and needed the identical fix."""
+    resp = client.post("/generate/topic/async", json={
+        "topic": "Create a 7-slide pitch deck for a solar startup", "slide_count": 10,
+    })
+    assert resp.status_code == 200
+    job_id = resp.json()["job_id"]
+    result = _poll_job_until_done(client, job_id)
+    assert result["slide_count"] == 7
+
+
 # -- Async round trips, real worker thread processing --------------------
 
 def test_generate_async_document_full_round_trip(client):
