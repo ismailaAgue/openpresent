@@ -19,6 +19,7 @@ abstraction means that split is a deployment change, not a code change.
 
 import base64
 import os
+import re
 import threading
 import time
 from backend.adapters import registry
@@ -436,6 +437,37 @@ def _clean_slide_count(n: int) -> int:
     return max(MIN_SLIDE_COUNT, min(n, MAX_SLIDE_COUNT))
 
 
+# Matches "10 slides", "10-slide", "10slides", case-insensitively —
+# not word-based numbers ("ten slides") or ranges ("10-15 slides"), a
+# stated, deliberate simplification (see _resolve_slide_count) rather
+# than a general natural-language quantity parser.
+_SLIDE_COUNT_PATTERN = re.compile(r"(\d{1,3})\s*[-\s]?slides?\b", re.IGNORECASE)
+
+
+def _resolve_slide_count(topic: str, requested: int) -> int:
+    """The composer has no dedicated slide-count control at all — its
+    own placeholder text ("e.g. Create a 10-slide investor pitch
+    deck...") invites people to type a count directly into the topic
+    prompt instead, implying the app understands it. It didn't: the
+    frontend always sent a hardcoded slide_count=10 regardless of what
+    was actually typed (frontend/lib/api-client.ts's
+    topicRequestBody), and nothing on the backend ever looked at the
+    topic text itself. So "Create a 20-slide deck about X" silently
+    produced exactly 10 slides every time — the reported bug. A count
+    mentioned directly in the topic text is a clearer, more specific
+    signal of actual intent than whatever the client sent in the
+    slide_count field, which — given no real UI control for it exists
+    yet — is never itself a deliberate choice; when both are present,
+    the topic text wins. If a dedicated slide-count control is ever
+    added to the composer, this precedence is worth revisiting — an
+    explicit UI choice should probably outrank an incidental text
+    mention at that point, which isn't the situation today."""
+    match = _SLIDE_COUNT_PATTERN.search(topic)
+    if match:
+        return _clean_slide_count(int(match.group(1)))
+    return _clean_slide_count(requested)
+
+
 @app.post("/generate/topic")
 def generate_from_topic(req: TopicGenerateRequest, request: Request,
                          authorization: str | None = Header(default=None)):
@@ -451,7 +483,7 @@ def generate_from_topic(req: TopicGenerateRequest, request: Request,
     try:
         recipe, output_bytes, quality = generate_presentation_from_topic(
             topic=req.topic,
-            slide_count=_clean_slide_count(req.slide_count),
+            slide_count=_resolve_slide_count(req.topic, req.slide_count),
             audience_type=req.audience_type,
             language=req.language,
             tone=req.tone,
@@ -507,7 +539,7 @@ def generate_from_topic_async(req: TopicGenerateRequest, request: Request,
     queue = registry.get_queue_adapter()
     job_id = queue.enqueue("generate_topic", {
         "topic": req.topic,
-        "slide_count": _clean_slide_count(req.slide_count),
+        "slide_count": _resolve_slide_count(req.topic, req.slide_count),
         "audience_type": req.audience_type,
         "language": req.language,
         "tone": req.tone,

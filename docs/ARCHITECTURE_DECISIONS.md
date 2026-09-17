@@ -3780,3 +3780,83 @@ now, not just asserted at the unit level. Full backend suite, 3
 consecutive runs: 505/505 every time.
 
 *Next entry: ADR-074.*
+
+---
+
+## ADR-074 — Slide Count Typed Into the Topic Prompt Was Silently Ignored
+
+**Status:** Accepted.
+
+**Decision:** Reported bug: "the number of slides I ask for when
+building is not respected." Root cause, traced end to end rather than
+patched at a guess: the composer has **no dedicated slide-count
+control at all** — its own placeholder text ("e.g. Create a 10-slide
+investor pitch deck...") invites typing a count directly into the
+topic prompt instead, implying the app understands it. It didn't, on
+either end:
+
+- **Frontend:** `topicRequestBody()` in `frontend/lib/api-client.ts`
+  sent `slide_count: opts.slideCount ?? 10` — and the actual call site
+  in `page.tsx` (`generateFromTopicAsync({ topic, exportFormat,
+  workspaceId, language })`) never passed `slideCount` at all. Every
+  single topic generation sent a hardcoded `10`, regardless of what
+  was actually typed.
+- **Backend:** nothing anywhere read the topic text itself for a
+  count — `_clean_slide_count()` only ever clamped whatever numeric
+  value the request body happened to carry.
+
+Combined: "Create a 20-slide deck about X" silently produced exactly
+10 slides, every time, 100% reproducible — not an occasional AI
+imprecision (that class of issue already has a deliberate, documented
+tolerance one layer down in `json_pipeline_base.py`'s structure-stage
+parser, confirmed unrelated and untouched by this fix).
+
+**Fix:** `_resolve_slide_count(topic, requested)` in `backend/api/main.py`
+— a regex (`(\d{1,3})\s*[-\s]?slides?\b`, case-insensitive) that looks
+for an explicit count mentioned in the topic text itself; when found,
+it takes precedence over whatever the request's `slide_count` field
+carries, then both paths still go through the existing
+`_clean_slide_count()` clamp (3-30). Wired into both `/generate/topic`
+(sync) and `/generate/topic/async` (enqueue-time) — the bug existed
+identically in both.
+
+**Why the text wins over the field, stated explicitly, not just
+implemented:** given no real UI control for this exists today, a
+`slide_count` field value is never itself a deliberate choice — it's
+always just whatever hardcoded default the client happens to send. A
+number mentioned directly in what the person actually typed is a
+clearer, more specific, more trustworthy signal of real intent.
+**Stated, forward-looking caveat:** if a dedicated slide-count picker
+is ever added to the composer, this precedence is worth revisiting —
+at that point an explicit UI choice should probably outrank an
+incidental text mention, which isn't today's situation.
+
+**Deliberately not a general natural-language quantity parser.**
+Recognizes digit-based counts adjacent to the word "slide"/"slides"
+only — not word-numbers ("ten slides"), not ranges ("10-15 slides").
+A stated, deliberate simplification, not an oversight; confirmed it
+doesn't misfire on ordinary topic text containing unrelated numbers
+("The 1969 moon landing," "why 95% of startups fail," "the top 10
+programming languages") — the required word-adjacency to "slide(s)"
+makes false positives very unlikely by construction, verified with
+tests for exactly those cases rather than assumed.
+
+**Document-upload generation was checked and confirmed unaffected.**
+That path takes an explicit, unambiguous `target_slide_count` numeric
+parameter — no free-text topic field for a count to hide inside, so
+this specific failure mode doesn't apply there; confirmed by reading
+the code, not assumed by analogy.
+
+**Verification:** 9 direct unit tests for `_resolve_slide_count`
+(hyphenated/spaced/plural/singular phrasing, case-insensitivity,
+precedence over a conflicting field value, clamping still applies to a
+mentioned count, and the three false-positive checks above). 4 new
+integration tests exercising the real HTTP endpoints end to end —
+generating an actual `.pptx`, opening it with python-pptx, and
+counting real slides, not asserting against a mock — covering both
+sync and async endpoints, a hyphenated and a spaced phrasing, and
+confirming the no-mention case still respects the plain field value
+(no regression). Full backend suite, 3 consecutive runs: 518/518 every
+time.
+
+*Next entry: ADR-075.*
