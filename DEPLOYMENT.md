@@ -103,22 +103,88 @@ branch).
 | `DATABASE_URL` | your Neon connection string from Step 1 | Without this, accounts/projects live in ephemeral SQLite and **vanish on every redeploy**. |
 | `OPENPRESENT_INPROCESS_WORKER` | `true` | Render's free/starter tier is one service -- the worker runs as a background thread inside the API process (ADR-015). Leave this as `true` unless you've provisioned a separate worker service. |
 
-#### AI providers -- add any subset, in this priority order (ADR-030)
+#### AI providers -- add any subset, in this priority order (ADR-030, revised ADR-075)
 
-| Variable | Value | Priority |
-|---|---|---|
-| `GEMINI_API_KEY` | your key from Step 0 | 1st -- default hosted provider |
-| `GROQ_API_KEY` | your key from Step 0 | 2nd -- fallback |
-| `OPENROUTER_API_KEY` | your key from Step 0 | 3rd -- fallback |
-| `HUGGINGFACE_API_KEY` | your key from Step 0 | 4th -- fallback |
+| Variable | Value | Priority | Free tier? |
+|---|---|---|---|
+| `GROQ_API_KEY` | your key from Step 0 | 1st | Yes -- no card, ~14,400 requests/day |
+| `CEREBRAS_API_KEY` | your key from Step 0 | 2nd | Yes -- no card reported, ~1M tokens/day (verify current terms, see note below) |
+| `GEMINI_API_KEY` | your key from Step 0 | 3rd | Yes -- no card, Flash models only |
+| `MISTRAL_API_KEY` | your key from Step 0 | 4th | Yes -- "Experiment" tier, no card, rate-limited |
+| `COHERE_API_KEY` | your key from Step 0 | 5th | Yes -- Trial key, no card, capped at 1,000 calls/month |
+| `OPENROUTER_API_KEY` | your key from Step 0 | 6th | Some models tagged free, others paid |
+| `HUGGINGFACE_API_KEY` | your key from Step 0 | 7th | Yes -- rate-limited |
 
 Add as many as you want -- every one with a key present gets wired
 into the cascading composite automatically; you do NOT need to set
 `OPENPRESENT_AI_ADAPTER` unless you want to force exactly one provider
-(see Section 5 below).
+(see Section 5 below). This is deliberately "add several free ones" by
+design: each provider's free tier has its own daily/monthly cap, so
+configuring more than one directly reduces how often you hit an
+actual capacity wall (ADR-072 removed the deterministic fallback, so
+every provider in your cascade failing now returns a clear error to
+the person generating, not a silent lesser deck -- more configured
+providers is the real mitigation for that).
 
-With **zero** of these set: the app still works, using the
-deterministic (non-AI) topic template -- no error, just a plainer deck.
+**Deliberately not included above: OpenAI and DeepSeek.** Both were
+evaluated and are workable adapters (the pattern is identical --
+see `backend/adapters/ai/openai_compatible_base.py`), but neither has
+an ongoing free tier as of this writing -- OpenAI gives new accounts a
+one-time credit that expires in 30 days, DeepSeek a one-time token
+grant, then both are pay-as-you-go. Left out of this table on purpose
+to keep this a genuinely-free stack; add them yourself the same way
+the others are wired in `backend/adapters/registry.py` if you're happy
+paying for one of them.
+
+**Free-tier terms change without much notice across this whole
+industry** -- concrete examples hit while building this list: OpenAI's
+free-tier terms changed twice in 2026, DeepSeek deprecated its model
+names mid-year, and Cerebras has at least one independent report of
+requiring a card that conflicts with more recent no-card reports.
+Verify current terms for whichever providers you configure at
+deployment time rather than trusting this table indefinitely.
+
+**At least one AI provider (or a self-hosted model, below) is now
+required for topic-based generation to work at all.** ADR-072 removed
+the deterministic (non-AI) fallback topic generation used to have --
+with zero AI providers configured, a topic-generation request now
+returns a clear `503` instead of a plainer deck. Document-upload
+generation is unaffected by this: it still works with zero AI
+configured, falling back to its own rule-based, document-derived
+outline (AI there is an enhancement layer, not a requirement).
+
+#### Self-hosting a model instead (genuinely unlimited, bounded only by your own hardware)
+
+`backend/adapters/ai/local_model.py` talks to any Ollama-compatible
+HTTP server you run yourself -- no per-request cost, no rate limit
+beyond what your own hardware can handle. This is a real option, but
+it requires you to actually run a server somewhere; it isn't something
+Render's free web-service tier can host well (no GPU, and even a small
+model needs more sustained CPU/RAM than that tier gives you).
+Realistic ways to actually use this:
+
+1. **Run OpenPresent's backend on your own machine too**, alongside
+   [Ollama](https://ollama.com) (`ollama pull qwen2.5:3b && ollama serve`)
+   -- both talk over `localhost`, zero network setup. Good for local
+   development or personal use, not for a hosted deployment other
+   people reach over the internet.
+2. **Run Ollama on a machine you already have on 24/7** (a home server,
+   a spare PC) and expose it to your Render deployment with a tunnel
+   (e.g. [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) or
+   [Tailscale](https://tailscale.com/)) -- then set `OPENPRESENT_AI_BASE_URL`
+   to that tunnel's URL from Render's environment variables.
+3. **Rent a small always-on VPS** (a $5-6/month box has enough RAM for
+   a 3B-parameter model) and run Ollama there instead of on Render.
+
+| Variable | Value | Default |
+|---|---|---|
+| `OPENPRESENT_AI_BASE_URL` | your Ollama server's URL | `http://localhost:11434` |
+| `OPENPRESENT_AI_MODEL` | the model name you've pulled in Ollama | `qwen2.5:3b` |
+
+When `OPENPRESENT_AI_BASE_URL` is set, the local model is tried FIRST,
+ahead of every hosted provider above -- it's genuinely free per
+request once it's running, so there's no reason to burn a hosted
+provider's rate-limited quota first.
 
 #### Image providers -- add any subset (ADR-029)
 
@@ -326,10 +392,10 @@ specifically is misbehaving), set:
 OPENPRESENT_AI_ADAPTER=gemini
 ```
 
-Valid values: `local_model`, `gemini`, `groq`, `openrouter`,
-`huggingface`, `null`. This **bypasses the fallback composite
-entirely** -- only use it temporarily for debugging, then unset it to
-restore the full ladder for production.
+Valid values: `local_model`, `gemini`, `groq`, `cerebras`, `mistral`,
+`cohere`, `openrouter`, `huggingface`, `null`. This **bypasses the
+fallback composite entirely** -- only use it temporarily for
+debugging, then unset it to restore the full ladder for production.
 
 ---
 
@@ -340,7 +406,7 @@ path you need to revert:
 
 | To turn off... | Do this |
 |---|---|
-| All AI (revert to deterministic decks) | Remove all `*_API_KEY` AI vars, or set `OPENPRESENT_AI_ADAPTER=null` |
+| All AI (topic generation returns 503 instead; document uploads keep working, rule-based) | Remove all `*_API_KEY` AI vars, or set `OPENPRESENT_AI_ADAPTER=null` |
 | One misbehaving AI provider | Remove just that provider's `*_API_KEY` -- the composite automatically drops it from the ladder |
 | All non-Wikimedia images | Remove `OPENPRESENT_UNSPLASH_ACCESS_KEY`, `OPENPRESENT_PEXELS_API_KEY`, `OPENPRESENT_PIXABAY_API_KEY` |
 | All images including Wikimedia | Also set `OPENPRESENT_DISABLE_WIKIMEDIA=true` |

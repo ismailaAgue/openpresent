@@ -3860,3 +3860,132 @@ confirming the no-mention case still respects the plain field value
 time.
 
 *Next entry: ADR-075.*
+
+---
+
+## ADR-075 — Three More Free AI Providers: Groq's Cascade Gets Wider, Not Deeper
+
+**Status:** Accepted.
+
+**Decision:** Added `MistralAdapter`, `CerebrasAdapter`, and
+`CohereAdapter` — three ~35-line subclasses of the same
+`_OpenAICompatibleBase` Groq and OpenRouter already share. The
+motivating problem, stated directly: ADR-072 removed topic-first
+generation's deterministic fallback, so a request now fails outright
+(`AIGenerationUnavailableError` -> `503`) once every configured
+provider in the cascade is unavailable — meaning a single free
+provider's daily/rate limit is now a hard capacity ceiling on the
+whole product, not just a degraded-quality moment. More free providers
+in the cascade is the direct, structural fix: each has its own
+separate quota, so exhausting one no longer means exhausting all of
+them.
+
+**OpenAI and DeepSeek were evaluated and deliberately NOT added.**
+Both are workable — same pattern, same base class — but neither has an
+ongoing free tier: OpenAI gives new accounts a one-time credit that
+expires in 30 days, DeepSeek a one-time token grant, then both are
+pay-as-you-go. Since the actual goal here is more free capacity, not
+more providers for their own sake, adding either would have worked
+against the point. Left out of the registry, the AUTO cascade, and
+`DEPLOYMENT.md`'s table entirely, with an explicit note in the latter
+for why, rather than added-then-silently-unused.
+
+**All three verified genuinely free (no card required) via live
+search before writing any adapter code, not assumed from memory or
+from provider marketing pages** — this space has proven to change
+fast: while researching this exact change, found that OpenAI's own
+free-tier terms had shifted twice in 2026 and DeepSeek deprecated its
+model names entirely mid-year, both directly relevant to *why* this
+ADR only trusts current, checked information over training-data
+assumptions for anything provider-related.
+
+- **Mistral** — `https://api.mistral.ai/v1`. "Experiment" tier: no
+  card, rate-limited (~1 req/sec, ~1B tokens/month), explicitly
+  intended for evaluation/prototyping rather than production — which a
+  single OpenPresent generation actually is. Default model
+  `mistral-small-latest`.
+- **Cerebras** — `https://api.cerebras.ai/v1`. Independently reported
+  no-card free tier with a generous daily token allowance (~1M
+  tokens/day on their LPU hardware) — one of the more generous
+  standing free tiers found. **Stated caveat, not hidden:** one
+  independent source (dated earlier in 2026) reported a card
+  requirement that conflicts with more recent no-card reports —
+  documented directly in the adapter's own docstring so a future
+  "why is this suddenly unavailable" question starts from the right
+  place instead of assuming a code bug. Default model `llama-3.3-70b`.
+- **Cohere** — `https://api.cohere.ai/compatibility/v1`, Cohere's
+  dedicated OpenAI-Compatibility endpoint, deliberately NOT its native
+  Chat API (different request/response shape this shared base class
+  doesn't translate). Trial key issued automatically on signup, no
+  card. **Stated limitation:** smaller than the others — 1,000 API
+  calls/month (a call cap, not a token cap) and 20 requests/minute —
+  genuinely useful as one more cascade layer, not a primary workhorse
+  the way Groq's or Cerebras's larger daily allowances are. Default
+  model `command-r-08-2024`.
+
+**Priority order in the AUTO cascade reordered around actual free-tier
+generosity, stated as a judgment call, not a permanent ranking:** groq
+-> cerebras -> gemini -> mistral -> cohere -> openrouter -> huggingface
+(local_model still first if `OPENPRESENT_AI_BASE_URL` is explicitly
+set — the only genuinely-unlimited option, bounded solely by the
+person's own hardware). Groq and Cerebras lead because their reported
+daily allowances are the most generous of the group; Cohere sits near
+the end because its 1,000-call/month cap is the tightest. Verified
+this ordering is actually reflected in the constructed composite's
+adapter list, not just described in a docstring — see
+`test_auto_mode_prioritizes_groq_and_cerebras_ahead_of_cohere`.
+
+**Self-hosting clarified honestly in `DEPLOYMENT.md`, not oversold.**
+`backend/adapters/ai/local_model.py` (an Ollama-compatible adapter)
+already existed and is genuinely unlimited-per-request — but it
+requires the person to actually run an inference server somewhere;
+it's not something Render's free web-service tier can host well (no
+GPU, insufficient sustained CPU/RAM even for a small model). Added a
+new `DEPLOYMENT.md` subsection giving three concrete, realistic paths
+(run the whole backend locally alongside Ollama; run Ollama on a
+machine already on 24/7 and tunnel to it; rent a small always-on VPS)
+rather than implying "self-host for free unlimited tokens" is a
+checkbox with no infrastructure cost of its own.
+
+**A real, pre-existing test gap found and closed while touching this
+code, not left for later:** `registry.get_ai_adapter()`'s own env-var
+branching logic had no direct test coverage anywhere before this
+(confirmed by search — `test_conftest_hermeticity.py` only checks the
+all-unset default). Closed with a new, dedicated test file
+(`test_ai_provider_registry_selection.py`), which also required
+working around a real trap: the root `conftest.py`'s autouse
+`_hermetic_registry_defaults` fixture (ADR-037) replaces
+`registry.get_ai_adapter` itself with a lambda that always returns
+`NullAdapter`, for every test by default. A test whose entire point is
+exercising the real selection logic has to explicitly restore the true
+function first (captured at module-import time, before any test-time
+monkeypatching, then restored via this file's own autouse fixture,
+which runs after the parent conftest's per pytest's fixture ordering)
+or it's just testing the hermeticity lambda instead of anything real.
+
+**Documentation kept accurate, not left to drift:** `DEPLOYMENT.md`
+still claimed "with zero AI providers configured, the app still works
+using the deterministic (non-AI) topic template" — exactly the
+fallback ADR-072 removed, several ADRs ago in this same project's
+history, never actually corrected until now. Fixed to state the real
+current behavior (topic generation needs at least one provider or a
+self-hosted model, and returns a `503` without one; document-upload
+generation is unaffected either way). Also updated the
+`OPENPRESENT_AI_ADAPTER` valid-values list and the rollback table's
+"turn off all AI" row to match.
+
+**Verification:** Live search confirmed every base URL, OpenAI-format
+compatibility claim, and current free-tier status before writing any
+adapter code. 10 new unit tests (a successful generation call plus an
+`is_available()` check per provider, and a shared model-override
+check across all three). 9 new registry-selection tests (explicit
+selection ×3, auto-cascade inclusion ×3, combining new and
+pre-existing providers in one composite, confirming the stated
+priority order is actually reflected in construction order, and the
+nothing-configured/no-crash-without-a-key cases). A real end-to-end
+generation run through the new `CerebrasAdapter` (not just isolated
+unit mocks) — all 4 core pipeline stages genuinely succeeded through
+the shared base, producing a real, non-empty `.pptx`. Full backend
+suite, 3 consecutive runs: 535/535 every time.
+
+*Next entry: ADR-076.*

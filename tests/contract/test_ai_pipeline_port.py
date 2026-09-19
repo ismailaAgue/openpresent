@@ -3,6 +3,9 @@ import pytest
 from backend.adapters.ai.gemini_adapter import GeminiAdapter
 from backend.adapters.ai.local_model import LocalModelAdapter
 from backend.adapters.ai.groq_adapter import GroqAdapter
+from backend.adapters.ai.mistral_adapter import MistralAdapter
+from backend.adapters.ai.cerebras_adapter import CerebrasAdapter
+from backend.adapters.ai.cohere_adapter import CohereAdapter
 from backend.adapters.ai.composite_adapter import CompositeAIAdapter
 from backend.ports.ai_pipeline import (
     GenerationRequest, PresentationStrategy, SlideOutlineItem, QualityReport,
@@ -386,6 +389,61 @@ def test_groq_generates_strategy():
 
 def test_groq_unavailable_without_key():
     assert GroqAdapter(api_key="").is_available() is False
+
+
+# -- MistralAdapter, CerebrasAdapter, CohereAdapter (ADR-075) ---------------
+# Each is a ~15-line subclass of the same _OpenAICompatibleBase Groq and
+# OpenRouter already share — these tests confirm each subclass's own
+# unique wiring (base_url, model default, is_available) works end to
+# end through the shared base, not the base class's behavior a fourth/
+# fifth/sixth time (already covered above via Groq).
+
+def test_mistral_generates_strategy():
+    def fake_post(url, api_key, body, timeout):
+        assert url == "https://api.mistral.ai/v1/chat/completions"
+        return {"choices": [{"message": {"content": strategy_json()}}]}
+    adapter = MistralAdapter(api_key="fake-key", http_post=fake_post)
+    strategy = adapter.generate_strategy(make_request(3))
+    assert strategy.narrative_style == "Classic Narrative"
+
+
+def test_mistral_unavailable_without_key():
+    assert MistralAdapter(api_key="").is_available() is False
+
+
+def test_cerebras_generates_strategy():
+    def fake_post(url, api_key, body, timeout):
+        assert url == "https://api.cerebras.ai/v1/chat/completions"
+        return {"choices": [{"message": {"content": strategy_json()}}]}
+    adapter = CerebrasAdapter(api_key="fake-key", http_post=fake_post)
+    strategy = adapter.generate_strategy(make_request(3))
+    assert strategy.narrative_style == "Classic Narrative"
+
+
+def test_cerebras_unavailable_without_key():
+    assert CerebrasAdapter(api_key="").is_available() is False
+
+
+def test_cohere_generates_strategy():
+    def fake_post(url, api_key, body, timeout):
+        # Cohere's dedicated OpenAI-Compatibility API, NOT its native
+        # Chat API shape — see cohere_adapter.py's docstring for why
+        # this specific base URL, not api.cohere.ai/v1/chat.
+        assert url == "https://api.cohere.ai/compatibility/v1/chat/completions"
+        return {"choices": [{"message": {"content": strategy_json()}}]}
+    adapter = CohereAdapter(api_key="fake-key", http_post=fake_post)
+    strategy = adapter.generate_strategy(make_request(3))
+    assert strategy.narrative_style == "Classic Narrative"
+
+
+def test_cohere_unavailable_without_key():
+    assert CohereAdapter(api_key="").is_available() is False
+
+
+def test_new_provider_model_overrides_via_constructor():
+    assert MistralAdapter(api_key="fake-key", model="mistral-large-latest").model == "mistral-large-latest"
+    assert CerebrasAdapter(api_key="fake-key", model="llama-4-scout-17b-16e-instruct").model == "llama-4-scout-17b-16e-instruct"
+    assert CohereAdapter(api_key="fake-key", model="command-a-03-2025").model == "command-a-03-2025"
 
 
 # -- CompositeAIAdapter cascading (ADR-030) ----------------------------------

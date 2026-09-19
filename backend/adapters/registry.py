@@ -31,6 +31,9 @@ from backend.adapters.ai.gemini_adapter import GeminiAdapter
 from backend.adapters.ai.groq_adapter import GroqAdapter
 from backend.adapters.ai.openrouter_adapter import OpenRouterAdapter
 from backend.adapters.ai.huggingface_adapter import HuggingFaceAdapter
+from backend.adapters.ai.mistral_adapter import MistralAdapter
+from backend.adapters.ai.cerebras_adapter import CerebrasAdapter
+from backend.adapters.ai.cohere_adapter import CohereAdapter
 from backend.adapters.ai.composite_adapter import CompositeAIAdapter
 from backend.adapters.research.null_research import NullResearchAdapter
 from backend.adapters.research.duckduckgo_research import DuckDuckGoResearchAdapter
@@ -130,19 +133,54 @@ def get_ai_adapter():
     """Config-driven selection, revised ADR-030 (multi-provider
     composite with cascading fallback):
 
-    - OPENPRESENT_AI_ADAPTER=<local_model|gemini|groq|openrouter|
-      huggingface|null> forces exactly that single provider — useful
-      for testing/debugging one provider in isolation.
+    - OPENPRESENT_AI_ADAPTER=<local_model|gemini|groq|cerebras|mistral|
+      cohere|openrouter|huggingface|null> forces exactly that single
+      provider — useful for testing/debugging one provider in
+      isolation.
     - Left unset (the default) -> AUTO: every provider with credentials
       configured is wired into a CompositeAIAdapter, in priority order
       local_model (only if OPENPRESENT_AI_BASE_URL is explicitly set —
-      never assumed present) -> gemini -> groq -> openrouter ->
+      never assumed present, since it's "unlimited" but only exists if
+      you're actually running your own inference server) -> groq ->
+      cerebras -> gemini -> mistral -> cohere -> openrouter ->
       huggingface. A stage failing on one provider cascades to the
-      next configured one before falling back to the fully
-      deterministic path (spec Section 6: "changing inference backends
+      next configured one (spec Section 6: "changing inference backends
       should not require application rewrites" — this is what makes
       that concretely true operationally, not just architecturally).
+      ADR-072 removed the final fallback this list used to have below
+      itself (the fully deterministic path) for topic-first generation
+      specifically — see backend/engines/ai_generate.py — so for THAT
+      caller, every provider in this list failing now raises
+      AIGenerationUnavailableError; the document-upload caller (AIPort)
+      still degrades to its rule-based baseline on total AI failure,
+      unchanged.
     - No provider configured at all -> NullAdapter ($0, no dependency).
+
+    ADR-075 — priority order here is deliberately "most generous
+    ongoing free-tier capacity first," not alphabetical or
+    capability-ranked: this cascade exists specifically to reduce how
+    often a single provider's free-tier rate limit gets hit before
+    another configured provider can pick up the request (the "AI
+    shortage" a person can otherwise run into with only one free
+    provider configured, especially now that ADR-072 means topic
+    generation has no lower fallback at all). Groq and Cerebras both
+    have generous, no-card, daily-reset free tiers (30 RPM/14,400
+    req/day and reportedly ~1M tokens/day respectively) and are placed
+    first; Gemini next (free but Flash-model-only since mid-2026);
+    Mistral and Cohere have real but smaller/stricter free allowances
+    (Mistral's "Experiment" tier explicitly for prototyping, not
+    production; Cohere capped at 1,000 calls/month) so they sit later
+    in the ladder; OpenRouter and HuggingFace last, as meta-providers/
+    aggregators rather than a first choice. This is a judgment call
+    about typical free-tier generosity as of when it was written, not
+    a permanent ranking — free-tier terms across this entire industry
+    have changed without much notice multiple times in 2026 alone
+    (concrete examples turned up while adding these adapters: OpenAI's
+    free-tier terms changed, DeepSeek deprecated model names,
+    Cerebras's own no-card policy has at least one conflicting report)
+    — override with OPENPRESENT_AI_ADAPTER for a specific single
+    provider if this default ordering stops matching reality for your
+    accounts.
 
     Same instance is used for both AIPort (document-upload enhancement)
     and AIPipelinePort (topic-first generation) — see
@@ -158,6 +196,12 @@ def get_ai_adapter():
             _ai_adapter_instance = GeminiAdapter(api_key=os.environ.get("GEMINI_API_KEY", ""))
         elif choice == "groq":
             _ai_adapter_instance = GroqAdapter(api_key=os.environ.get("GROQ_API_KEY", ""))
+        elif choice == "cerebras":
+            _ai_adapter_instance = CerebrasAdapter(api_key=os.environ.get("CEREBRAS_API_KEY", ""))
+        elif choice == "mistral":
+            _ai_adapter_instance = MistralAdapter(api_key=os.environ.get("MISTRAL_API_KEY", ""))
+        elif choice == "cohere":
+            _ai_adapter_instance = CohereAdapter(api_key=os.environ.get("COHERE_API_KEY", ""))
         elif choice == "openrouter":
             _ai_adapter_instance = OpenRouterAdapter(api_key=os.environ.get("OPENROUTER_API_KEY", ""))
         elif choice == "huggingface":
@@ -168,10 +212,16 @@ def get_ai_adapter():
             configured = []
             if os.environ.get("OPENPRESENT_AI_BASE_URL"):
                 configured.append(_build_local_model_adapter())
-            if os.environ.get("GEMINI_API_KEY"):
-                configured.append(GeminiAdapter(api_key=os.environ["GEMINI_API_KEY"]))
             if os.environ.get("GROQ_API_KEY"):
                 configured.append(GroqAdapter(api_key=os.environ["GROQ_API_KEY"]))
+            if os.environ.get("CEREBRAS_API_KEY"):
+                configured.append(CerebrasAdapter(api_key=os.environ["CEREBRAS_API_KEY"]))
+            if os.environ.get("GEMINI_API_KEY"):
+                configured.append(GeminiAdapter(api_key=os.environ["GEMINI_API_KEY"]))
+            if os.environ.get("MISTRAL_API_KEY"):
+                configured.append(MistralAdapter(api_key=os.environ["MISTRAL_API_KEY"]))
+            if os.environ.get("COHERE_API_KEY"):
+                configured.append(CohereAdapter(api_key=os.environ["COHERE_API_KEY"]))
             if os.environ.get("OPENROUTER_API_KEY"):
                 configured.append(OpenRouterAdapter(api_key=os.environ["OPENROUTER_API_KEY"]))
             if os.environ.get("HUGGINGFACE_API_KEY"):
